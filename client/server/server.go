@@ -21,6 +21,7 @@ import (
 	gstatus "google.golang.org/grpc/status"
 
 	"github.com/netbirdio/netbird/client/internal/auth"
+	"github.com/netbirdio/netbird/client/internal/expose"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	sleephandler "github.com/netbirdio/netbird/client/internal/sleep/handler"
 	"github.com/netbirdio/netbird/client/system"
@@ -1314,6 +1315,60 @@ func (s *Server) WaitJWTToken(
 		TokenType: tokenInfo.TokenType,
 		ExpiresIn: int64(tokenInfo.ExpiresIn),
 	}, nil
+}
+
+// ExposeService exposes a local port via the NetBird reverse proxy.
+func (s *Server) ExposeService(req *proto.ExposeServiceRequest, srv proto.DaemonService_ExposeServiceServer) error {
+	s.mutex.Lock()
+	if !s.clientRunning {
+		s.mutex.Unlock()
+		return gstatus.Errorf(codes.FailedPrecondition, "client is not running, run 'netbird up' first")
+	}
+	connectClient := s.connectClient
+	s.mutex.Unlock()
+
+	if connectClient == nil {
+		return gstatus.Errorf(codes.FailedPrecondition, "client not initialized")
+	}
+
+	engine := connectClient.Engine()
+	if engine == nil {
+		return gstatus.Errorf(codes.FailedPrecondition, "engine not initialized")
+	}
+
+	mgr := engine.GetExposeManager()
+	if mgr == nil {
+		return gstatus.Errorf(codes.Internal, "expose manager not available")
+	}
+
+	ctx := srv.Context()
+
+	exposeCtx, exposeCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer exposeCancel()
+
+	mgmReq := expose.NewRequest(req)
+	result, err := mgr.Expose(exposeCtx, *mgmReq)
+	if err != nil {
+		return err
+	}
+
+	if err := srv.Send(&proto.ExposeServiceEvent{
+		Event: &proto.ExposeServiceEvent_Ready{
+			Ready: &proto.ExposeServiceReady{
+				ServiceName: result.ServiceName,
+				ServiceUrl:  result.ServiceURL,
+				Domain:      result.Domain,
+			},
+		},
+	}); err != nil {
+		return err
+	}
+
+	err = mgr.KeepAlive(ctx, result.Domain)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func isUnixRunningDesktop() bool {
