@@ -847,6 +847,32 @@ func TestValidate_TLSSubnetValid(t *testing.T) {
 	require.NoError(t, rp.Validate())
 }
 
+func TestValidate_L4DomainTargetValid(t *testing.T) {
+	modes := []struct {
+		mode  string
+		port  uint16
+		proto string
+	}{
+		{"tcp", 5432, "tcp"},
+		{"tls", 443, "tcp"},
+		{"udp", 5432, "udp"},
+	}
+	for _, m := range modes {
+		t.Run(m.mode, func(t *testing.T) {
+			rp := &Service{
+				Name:       m.mode + "-domain",
+				Mode:       m.mode,
+				Domain:     "cluster.test",
+				ListenPort: m.port,
+				Targets: []*Target{
+					{TargetId: "resource-1", TargetType: TargetTypeDomain, Protocol: m.proto, Port: m.port, Enabled: true},
+				},
+			}
+			require.NoError(t, rp.Validate())
+		})
+	}
+}
+
 func TestValidate_HTTPProxyProtocolRejected(t *testing.T) {
 	rp := validProxy()
 	rp.Targets[0].ProxyProtocol = true

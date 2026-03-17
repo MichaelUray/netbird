@@ -14,6 +14,8 @@ import (
 
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 
+	resourcetypes "github.com/netbirdio/netbird/management/server/networks/resources/types"
+
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/proxy"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/sessionkey"
@@ -636,22 +638,49 @@ func validateTargetReferences(ctx context.Context, transaction store.Store, acco
 	for _, target := range targets {
 		switch target.TargetType {
 		case service.TargetTypePeer:
-			if _, err := transaction.GetPeerByID(ctx, store.LockingStrengthShare, accountID, target.TargetId); err != nil {
-				if sErr, ok := status.FromError(err); ok && sErr.Type() == status.NotFound {
-					return status.Errorf(status.InvalidArgument, "peer target %q not found in account", target.TargetId)
-				}
-				return fmt.Errorf("look up peer target %q: %w", target.TargetId, err)
+			if err := validatePeerTarget(ctx, transaction, accountID, target); err != nil {
+				return err
 			}
 		case service.TargetTypeHost, service.TargetTypeSubnet, service.TargetTypeDomain:
-			if _, err := transaction.GetNetworkResourceByID(ctx, store.LockingStrengthShare, accountID, target.TargetId); err != nil {
-				if sErr, ok := status.FromError(err); ok && sErr.Type() == status.NotFound {
-					return status.Errorf(status.InvalidArgument, "resource target %q not found in account", target.TargetId)
-				}
-				return fmt.Errorf("look up resource target %q: %w", target.TargetId, err)
+			if err := validateResourceTarget(ctx, transaction, accountID, target); err != nil {
+				return err
 			}
 		default:
 			return status.Errorf(status.InvalidArgument, "unknown target type %q for target %q", target.TargetType, target.TargetId)
 		}
+	}
+	return nil
+}
+
+func validatePeerTarget(ctx context.Context, transaction store.Store, accountID string, target *service.Target) error {
+	if _, err := transaction.GetPeerByID(ctx, store.LockingStrengthShare, accountID, target.TargetId); err != nil {
+		if sErr, ok := status.FromError(err); ok && sErr.Type() == status.NotFound {
+			return status.Errorf(status.InvalidArgument, "peer target %q not found in account", target.TargetId)
+		}
+		return fmt.Errorf("look up peer target %q: %w", target.TargetId, err)
+	}
+	return nil
+}
+
+func validateResourceTarget(ctx context.Context, transaction store.Store, accountID string, target *service.Target) error {
+	resource, err := transaction.GetNetworkResourceByID(ctx, store.LockingStrengthShare, accountID, target.TargetId)
+	if err != nil {
+		if sErr, ok := status.FromError(err); ok && sErr.Type() == status.NotFound {
+			return status.Errorf(status.InvalidArgument, "resource target %q not found in account", target.TargetId)
+		}
+		return fmt.Errorf("look up resource target %q: %w", target.TargetId, err)
+	}
+	return validateResourceTargetType(target, resource)
+}
+
+// validateResourceTargetType checks that target_type matches the actual network resource type.
+func validateResourceTargetType(target *service.Target, resource *resourcetypes.NetworkResource) error {
+	expected := resourcetypes.NetworkResourceType(target.TargetType)
+	if resource.Type != expected {
+		return status.Errorf(status.InvalidArgument,
+			"target %q has target_type %q but resource is of type %q",
+			target.TargetId, target.TargetType, resource.Type,
+		)
 	}
 	return nil
 }
