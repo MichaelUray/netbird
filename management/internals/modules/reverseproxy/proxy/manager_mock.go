@@ -109,17 +109,17 @@ func (mr *MockManagerMockRecorder) GetActiveClusters(ctx interface{}) *gomock.Ca
 }
 
 // Heartbeat mocks base method.
-func (m *MockManager) Heartbeat(ctx context.Context, proxyID string) error {
+func (m *MockManager) Heartbeat(ctx context.Context, proxyID, clusterAddress, ipAddress string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Heartbeat", ctx, proxyID)
+	ret := m.ctrl.Call(m, "Heartbeat", ctx, proxyID, clusterAddress, ipAddress)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Heartbeat indicates an expected call of Heartbeat.
-func (mr *MockManagerMockRecorder) Heartbeat(ctx, proxyID interface{}) *gomock.Call {
+func (mr *MockManagerMockRecorder) Heartbeat(ctx, proxyID, clusterAddress, ipAddress interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Heartbeat", reflect.TypeOf((*MockManager)(nil).Heartbeat), ctx, proxyID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Heartbeat", reflect.TypeOf((*MockManager)(nil).Heartbeat), ctx, proxyID, clusterAddress, ipAddress)
 }
 
 // MockController is a mock of Controller interface.
