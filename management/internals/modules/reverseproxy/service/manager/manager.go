@@ -236,6 +236,10 @@ func (m *Manager) initializeServiceForCreate(ctx context.Context, accountID stri
 			return status.Errorf(status.PreconditionFailed, "could not derive cluster from domain %s: %v", service.Domain, err)
 		}
 		service.ProxyCluster = proxyCluster
+
+		if err := m.validateSubdomainRequirement(service.Domain, proxyCluster); err != nil {
+			return err
+		}
 	}
 
 	service.AccountID = accountID
@@ -258,6 +262,20 @@ func (m *Manager) initializeServiceForCreate(ctx context.Context, accountID stri
 	service.SessionPrivateKey = keyPair.PrivateKey
 	service.SessionPublicKey = keyPair.PublicKey
 
+	return nil
+}
+
+// validateSubdomainRequirement checks whether the domain can be used bare
+// (without a subdomain label) on the given cluster. If the cluster reports
+// require_subdomain=true and the domain equals the cluster domain, it rejects.
+func (m *Manager) validateSubdomainRequirement(domain, cluster string) error {
+	if domain != cluster {
+		return nil
+	}
+	requireSub := m.proxyController.ClusterRequireSubdomain(cluster)
+	if requireSub != nil && *requireSub {
+		return status.Errorf(status.InvalidArgument, "domain %s requires a subdomain label", domain)
+	}
 	return nil
 }
 
@@ -489,51 +507,59 @@ func (m *Manager) persistServiceUpdate(ctx context.Context, accountID string, se
 	var updateInfo serviceUpdateInfo
 
 	err := m.store.ExecuteInTransaction(ctx, func(transaction store.Store) error {
-		existingService, err := transaction.GetServiceByID(ctx, store.LockingStrengthUpdate, accountID, service.ID)
-		if err != nil {
-			return err
-		}
-
-		if err := validateProtocolChange(existingService.Mode, service.Mode); err != nil {
-			return err
-		}
-
-		updateInfo.oldCluster = existingService.ProxyCluster
-		updateInfo.domainChanged = existingService.Domain != service.Domain
-
-		if updateInfo.domainChanged {
-			if err := m.handleDomainChange(ctx, transaction, accountID, service); err != nil {
-				return err
-			}
-		} else {
-			service.ProxyCluster = existingService.ProxyCluster
-		}
-
-		m.preserveExistingAuthSecrets(service, existingService)
-		if err := validateHeaderAuthValues(service.Auth.HeaderAuths); err != nil {
-			return err
-		}
-		m.preserveServiceMetadata(service, existingService)
-		m.preserveListenPort(service, existingService)
-		updateInfo.serviceEnabledChanged = existingService.Enabled != service.Enabled
-
-		if err := m.ensureL4Port(ctx, transaction, service); err != nil {
-			return err
-		}
-		if err := m.checkPortConflict(ctx, transaction, service); err != nil {
-			return err
-		}
-		if err := validateTargetReferences(ctx, transaction, accountID, service.Targets); err != nil {
-			return err
-		}
-		if err := transaction.UpdateService(ctx, service); err != nil {
-			return fmt.Errorf("update service: %w", err)
-		}
-
-		return nil
+		return m.executeServiceUpdate(ctx, transaction, accountID, service, &updateInfo)
 	})
 
 	return &updateInfo, err
+}
+
+func (m *Manager) executeServiceUpdate(ctx context.Context, transaction store.Store, accountID string, service *service.Service, updateInfo *serviceUpdateInfo) error {
+	existingService, err := transaction.GetServiceByID(ctx, store.LockingStrengthUpdate, accountID, service.ID)
+	if err != nil {
+		return err
+	}
+
+	if err := validateProtocolChange(existingService.Mode, service.Mode); err != nil {
+		return err
+	}
+
+	updateInfo.oldCluster = existingService.ProxyCluster
+	updateInfo.domainChanged = existingService.Domain != service.Domain
+
+	if updateInfo.domainChanged {
+		if err := m.handleDomainChange(ctx, transaction, accountID, service); err != nil {
+			return err
+		}
+	} else {
+		service.ProxyCluster = existingService.ProxyCluster
+	}
+
+	if err := m.validateSubdomainRequirement(service.Domain, service.ProxyCluster); err != nil {
+		return err
+	}
+
+	m.preserveExistingAuthSecrets(service, existingService)
+	if err := validateHeaderAuthValues(service.Auth.HeaderAuths); err != nil {
+		return err
+	}
+	m.preserveServiceMetadata(service, existingService)
+	m.preserveListenPort(service, existingService)
+	updateInfo.serviceEnabledChanged = existingService.Enabled != service.Enabled
+
+	if err := m.ensureL4Port(ctx, transaction, service); err != nil {
+		return err
+	}
+	if err := m.checkPortConflict(ctx, transaction, service); err != nil {
+		return err
+	}
+	if err := validateTargetReferences(ctx, transaction, accountID, service.Targets); err != nil {
+		return err
+	}
+	if err := transaction.UpdateService(ctx, service); err != nil {
+		return fmt.Errorf("update service: %w", err)
+	}
+
+	return nil
 }
 
 func (m *Manager) handleDomainChange(ctx context.Context, transaction store.Store, accountID string, svc *service.Service) error {
