@@ -221,6 +221,7 @@ func (a *Auth) getPKCEFlow(client *mgm.GrpcClient) (*PKCEAuthorizationFlow, erro
 	config := &PKCEAuthProviderConfig{
 		Audience:              protoConfig.GetAudience(),
 		ClientID:              protoConfig.GetClientID(),
+		ClientSecret:          protoConfig.GetClientSecret(), //nolint:staticcheck
 		TokenEndpoint:         protoConfig.GetTokenEndpoint(),
 		AuthorizationEndpoint: protoConfig.GetAuthorizationEndpoint(),
 		Scope:                 protoConfig.GetScope(),
@@ -265,6 +266,7 @@ func (a *Auth) getDeviceFlow(client *mgm.GrpcClient) (*DeviceAuthorizationFlow, 
 	config := &DeviceAuthProviderConfig{
 		Audience:           protoConfig.GetAudience(),
 		ClientID:           protoConfig.GetClientID(),
+		ClientSecret:       protoConfig.GetClientSecret(), //nolint:staticcheck
 		Domain:             protoConfig.Domain,
 		TokenEndpoint:      protoConfig.GetTokenEndpoint(),
 		DeviceAuthEndpoint: protoConfig.GetDeviceAuthEndpoint(),
