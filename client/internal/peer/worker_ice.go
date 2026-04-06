@@ -106,6 +106,17 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 			w.log.Debugf("agent already exists and session ID matches, skipping the offer: %s", remoteOfferAnswer.SessionIDString())
 			return
 		}
+
+		// If ICE agent is actively connecting (gathering candidates, dialing),
+		// don't cancel it for a new offer - let the current attempt finish.
+		// This prevents a reconnection loop where guards on both sides keep
+		// sending new offers that cancel each other's ICE negotiations,
+		// particularly when both peers are behind the same NAT (same public IP).
+		if w.agentConnecting {
+			w.log.Infof("ICE agent is actively connecting, skipping new offer with different session: %s", remoteOfferAnswer.SessionIDString())
+			return
+		}
+
 		w.log.Debugf("agent already exists, recreate the connection")
 		w.remoteSessionChanged = true
 		w.agentDialerCancel()
