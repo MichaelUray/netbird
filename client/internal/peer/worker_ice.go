@@ -59,6 +59,9 @@ type WorkerICE struct {
 	localUfrag string
 	localPwd   string
 
+	// pendingCandidates buffers remote candidates that arrive before the ICE agent is initialized
+	pendingCandidates []ice.Candidate
+
 	// we record the last known state of the ICE agent to avoid duplicate on disconnected events
 	lastKnownState ice.ConnectionState
 }
@@ -159,6 +162,17 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 		w.remoteSessionID = ""
 	}
 
+	// Flush any candidates that were buffered before the agent was ready
+	if len(w.pendingCandidates) > 0 {
+		w.log.Infof("flushing %d buffered remote candidates", len(w.pendingCandidates))
+		for _, c := range w.pendingCandidates {
+			if err := agent.AddRemoteCandidate(c); err != nil {
+				w.log.Warnf("failed to add buffered candidate: %s", err)
+			}
+		}
+		w.pendingCandidates = nil
+	}
+
 	go w.connect(dialerCtx, agent, remoteOfferAnswer)
 }
 
@@ -168,7 +182,11 @@ func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HA
 	defer w.muxAgent.Unlock()
 	w.log.Debugf("OnRemoteCandidate from peer %s -> %s", w.config.Key, candidate.String())
 	if w.agent == nil {
-		w.log.Warnf("ICE Agent is not initialized yet")
+		// Buffer candidates that arrive before the ICE agent is created.
+		// This happens when the remote peer sends candidates with the answer
+		// before our OnNewOffer has created the local agent.
+		w.log.Infof("ICE Agent not ready, buffering remote candidate: %s", candidate.Type())
+		w.pendingCandidates = append(w.pendingCandidates, candidate)
 		return
 	}
 
@@ -339,6 +357,7 @@ func (w *WorkerICE) closeAgent(agent *icemaker.ThreadSafeAgent, cancel context.C
 		}
 		w.sessionID = sessionID
 		w.agent = nil
+		w.pendingCandidates = nil
 		w.agentConnecting = false
 		w.remoteSessionID = ""
 	}
