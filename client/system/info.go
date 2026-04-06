@@ -146,14 +146,14 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 }
 
 func networkAddresses() ([]NetworkAddress, error) {
-	interfaces, err := net.Interfaces()
+	interfaces, err := getNetInterfaces()
 	if err != nil {
 		return nil, err
 	}
 
 	var netAddresses []NetworkAddress
 	for _, iface := range interfaces {
-		addrs, err := iface.Addrs()
+		addrs, err := getInterfaceAddrs(&iface)
 		if err != nil {
 			continue
 		}
