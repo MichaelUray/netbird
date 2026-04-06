@@ -16,7 +16,6 @@ import (
 	"github.com/netbirdio/netbird/client/iface/udpmux"
 	"github.com/netbirdio/netbird/client/iface/wgaddr"
 	nbnet "github.com/netbirdio/netbird/client/net"
-	"github.com/netbirdio/netbird/sharedsock"
 )
 
 type TunKernelDevice struct {
@@ -96,13 +95,19 @@ func (t *TunKernelDevice) Up() (*udpmux.UniversalUDPMuxDefault, error) {
 		return nil, err
 	}
 
-	rawSock, err := sharedsock.Listen(t.wgPort, sharedsock.NewIncomingSTUNFilter(), t.mtu)
+	// Use a dedicated UDP socket for ICE instead of sharing the WireGuard port
+	// via raw sockets. The kernel WireGuard module owns port 51820 exclusively;
+	// attempting to share it via sharedsock causes ICE packets to never be sent
+	// on some platforms (confirmed on OpenWrt/ARM64).
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listen udp for ICE: %w", err)
 	}
+	log.Infof("ICE using dedicated UDP port: %d (WireGuard kernel owns port %d)",
+		udpConn.LocalAddr().(*net.UDPAddr).Port, t.wgPort)
 
 	bindParams := udpmux.UniversalUDPMuxParams{
-		UDPConn:   nbnet.WrapPacketConn(rawSock),
+		UDPConn:   nbnet.WrapPacketConn(udpConn),
 		Net:       t.transportNet,
 		FilterFn:  t.filterFn,
 		WGAddress: t.address,
@@ -110,7 +115,7 @@ func (t *TunKernelDevice) Up() (*udpmux.UniversalUDPMuxDefault, error) {
 	}
 	mux := udpmux.NewUniversalUDPMuxDefault(bindParams)
 	go mux.ReadFromConn(t.ctx)
-	t.udpMuxConn = rawSock
+	t.udpMuxConn = udpConn
 	t.udpMux = mux
 
 	log.Debugf("device is ready to use: %s", t.name)
