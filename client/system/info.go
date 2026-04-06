@@ -153,13 +153,12 @@ func networkAddresses() ([]NetworkAddress, error) {
 
 	var netAddresses []NetworkAddress
 	for _, iface := range interfaces {
-		if iface.HardwareAddr.String() == "" {
-			continue
-		}
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
+
+		mac := iface.HardwareAddr.String()
 
 		for _, address := range addrs {
 			ipNet, ok := address.(*net.IPNet)
@@ -173,7 +172,7 @@ func networkAddresses() ([]NetworkAddress, error) {
 
 			netAddr := NetworkAddress{
 				NetIP: netip.MustParsePrefix(ipNet.String()),
-				Mac:   iface.HardwareAddr.String(),
+				Mac:   mac,
 			}
 
 			if isDuplicated(netAddresses, netAddr) {
