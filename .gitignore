@@ -34,3 +34,4 @@ vendor/
 /netbird
 client/netbird-electron/
 build/
+docs/superpowers/

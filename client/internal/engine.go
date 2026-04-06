@@ -210,6 +210,10 @@ type Engine struct {
 	// checks are the client-applied posture checks that need to be evaluated on the client
 	checks []*mgmProto.Checks
 
+	// lastNetworkAddresses tracks reported addresses for change detection
+	lastNetworkAddresses    []system.NetworkAddress
+	lastNetworkAddressSync  time.Time
+
 	relayManager *relayClient.Manager
 	stateManager *statemanager.Manager
 	srWatcher    *guard.SRWatcher
@@ -560,6 +564,9 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	e.receiveManagementEvents()
 	e.receiveJobEvents()
 
+	// watch for network address changes (WiFi ↔ mobile) for posture checks
+	go e.startNetworkAddressWatcher()
+
 	// starting network monitor at the very last to avoid disruptions
 	e.startNetworkMonitor()
 
@@ -884,6 +891,10 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return err
 	}
 
+	// Fallback: detect network address changes during periodic sync in case
+	// platform-specific callbacks (e.g., Android NetworkCallback) were missed.
+	e.resyncMetaIfNetworkChanged()
+
 	nm := update.GetNetworkMap()
 	if nm == nil {
 		return nil
@@ -1001,6 +1012,94 @@ func (e *Engine) updateChecksIfNew(checks []*mgmProto.Checks) error {
 		return err
 	}
 	return nil
+}
+
+// ResyncNetworkAddresses can be called externally (e.g., from Android
+// network change callbacks) to immediately re-sync NetworkAddresses.
+func (e *Engine) ResyncNetworkAddresses() {
+	e.resyncMetaIfNetworkChanged()
+}
+
+// startNetworkAddressWatcher polls for network address changes every 10s.
+// This catches cases where platform callbacks are missed or delayed,
+// ensuring posture checks always evaluate the current network state.
+func (e *Engine) startNetworkAddressWatcher() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.resyncMetaIfNetworkChanged()
+		}
+	}
+}
+
+// resyncMetaIfNetworkChanged detects changes in local network addresses
+// (e.g., WiFi reconnect on mobile) and re-syncs meta with the management
+// server so that posture checks evaluate the current network state.
+func (e *Engine) resyncMetaIfNetworkChanged() {
+	// Debounce: don't re-sync more than once per 30 seconds to avoid
+	// flapping during VPN tunnel setup when interfaces are in flux.
+	if time.Since(e.lastNetworkAddressSync) < 30*time.Second {
+		return
+	}
+
+	info := system.GetInfo(e.ctx)
+	if info == nil {
+		return
+	}
+
+	current := info.NetworkAddresses
+	if networkAddressesEqual(e.lastNetworkAddresses, current) {
+		return
+	}
+
+	log.Infof("network addresses changed (%d -> %d addrs), re-syncing meta with management server",
+		len(e.lastNetworkAddresses), len(current))
+	e.lastNetworkAddresses = current
+	e.lastNetworkAddressSync = time.Now()
+
+	info.SetFlags(
+		e.config.RosenpassEnabled,
+		e.config.RosenpassPermissive,
+		&e.config.ServerSSHAllowed,
+		e.config.DisableClientRoutes,
+		e.config.DisableServerRoutes,
+		e.config.DisableDNS,
+		e.config.DisableFirewall,
+		e.config.BlockLANAccess,
+		e.config.BlockInbound,
+		e.config.LazyConnectionEnabled,
+		e.config.EnableSSHRoot,
+		e.config.EnableSSHSFTP,
+		e.config.EnableSSHLocalPortForwarding,
+		e.config.EnableSSHRemotePortForwarding,
+		e.config.DisableSSHAuth,
+	)
+
+	if err := e.mgmClient.SyncMeta(info); err != nil {
+		log.Warnf("failed to re-sync meta after network change: %v", err)
+	}
+}
+
+func networkAddressesEqual(a, b []system.NetworkAddress) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	// Sort-unabhängiger Vergleich: prüfe ob alle IPs aus a in b vorkommen
+	bSet := make(map[string]struct{}, len(b))
+	for _, addr := range b {
+		bSet[addr.NetIP.String()] = struct{}{}
+	}
+	for _, addr := range a {
+		if _, ok := bSet[addr.NetIP.String()]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
