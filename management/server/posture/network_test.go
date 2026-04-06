@@ -73,7 +73,7 @@ func TestPeerNetworkRangeCheck_Check(t *testing.T) {
 				},
 			},
 			peer:    nbpeer.Peer{},
-			wantErr: true,
+			wantErr: false,
 			isValid: false,
 		},
 		{
@@ -122,7 +122,7 @@ func TestPeerNetworkRangeCheck_Check(t *testing.T) {
 			isValid: true,
 		},
 		{
-			name: "Peer with no networks range in the denied range",
+			name: "Peer with no networks range in the denied range is allowed through",
 			check: PeerNetworkRangeCheck{
 				Action: CheckActionDeny,
 				Ranges: []netip.Prefix{
@@ -131,8 +131,8 @@ func TestPeerNetworkRangeCheck_Check(t *testing.T) {
 				},
 			},
 			peer:    nbpeer.Peer{},
-			wantErr: true,
-			isValid: false,
+			wantErr: false,
+			isValid: true,
 		},
 	}
 

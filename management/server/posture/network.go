@@ -19,7 +19,13 @@ var _ Check = (*PeerNetworkRangeCheck)(nil)
 
 func (p *PeerNetworkRangeCheck) Check(ctx context.Context, peer nbpeer.Peer) (bool, error) {
 	if len(peer.Meta.NetworkAddresses) == 0 {
-		return false, fmt.Errorf("peer's does not contain peer network range addresses")
+		// No network address info available from the peer (e.g. older mobile clients).
+		// For "deny" action: allow the peer since we cannot confirm it IS in the denied range.
+		// For "allow" action: deny the peer since we cannot confirm it IS in the allowed range.
+		if p.Action == CheckActionDeny {
+			return true, nil
+		}
+		return false, nil
 	}
 
 	maskedPrefixes := make([]netip.Prefix, 0, len(p.Ranges))
