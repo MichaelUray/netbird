@@ -185,6 +185,22 @@ func (c *Client) RenewTun(fd int) error {
 	return e.RenewTun(fd)
 }
 
+// OnUnderlyingNetworkChanged should be called by the Android layer when the
+// underlying network changes (e.g., WiFi ↔ cellular). It triggers a re-sync
+// of NetworkAddresses with the management server so posture checks evaluate
+// the current network state immediately, without waiting for the next
+// periodic sync cycle.
+func (c *Client) OnUnderlyingNetworkChanged() {
+	if c.connectClient == nil {
+		return
+	}
+	e := c.connectClient.Engine()
+	if e == nil {
+		return
+	}
+	e.ResyncNetworkAddresses()
+}
+
 // SetTraceLogLevel configure the logger to trace level
 func (c *Client) SetTraceLogLevel() {
 	log.SetLevel(log.TraceLevel)

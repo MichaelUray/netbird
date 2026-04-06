@@ -146,7 +146,7 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 }
 
 func networkAddresses() ([]NetworkAddress, error) {
-	interfaces, err := net.Interfaces()
+	interfaces, err := getNetInterfaces()
 	if err != nil {
 		return nil, err
 	}
@@ -159,10 +159,12 @@ func networkAddresses() ([]NetworkAddress, error) {
 		if iface.HardwareAddr.String() == "" {
 			continue
 		}
-		addrs, err := iface.Addrs()
+		addrs, err := getInterfaceAddrs(&iface)
 		if err != nil {
 			continue
 		}
+
+		mac := iface.HardwareAddr.String()
 
 		for _, address := range addrs {
 			ipNet, ok := address.(*net.IPNet)
@@ -176,7 +178,7 @@ func networkAddresses() ([]NetworkAddress, error) {
 
 			netAddr := NetworkAddress{
 				NetIP: netip.MustParsePrefix(ipNet.String()),
-				Mac:   iface.HardwareAddr.String(),
+				Mac:   mac,
 			}
 
 			if isDuplicated(netAddresses, netAddr) {
