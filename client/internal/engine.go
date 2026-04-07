@@ -1061,6 +1061,7 @@ func (e *Engine) startNetworkAddressWatcher() {
 // resyncMetaIfNetworkChanged detects changes in local network addresses
 // (e.g., WiFi reconnect on mobile) and re-syncs meta with the management
 // server so that posture checks evaluate the current network state.
+// Must be called while holding syncMsgMux.
 func (e *Engine) resyncMetaIfNetworkChanged() {
 	// Debounce: don't re-sync more than once per 30 seconds to avoid
 	// flapping during VPN tunnel setup when interfaces are in flux.
@@ -1068,7 +1069,14 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 		return
 	}
 
-	info := system.GetInfo(e.ctx)
+	// Use GetInfoWithChecks so Info.Files is populated for file/process
+	// posture checks — otherwise the management server would evaluate the
+	// peer without the posture-check context after a network change.
+	info, err := system.GetInfoWithChecks(e.ctx, e.checks)
+	if err != nil {
+		log.Warnf("failed to collect system info during network change resync: %v", err)
+		return
+	}
 	if info == nil {
 		return
 	}
@@ -1080,8 +1088,6 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 
 	log.Infof("network addresses changed (%d -> %d addrs), re-syncing meta with management server",
 		len(e.lastNetworkAddresses), len(current))
-	e.lastNetworkAddresses = current
-	e.lastNetworkAddressSync = time.Now()
 
 	info.SetFlags(
 		e.config.RosenpassEnabled,
@@ -1101,16 +1107,21 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 		e.config.DisableSSHAuth,
 	)
 
+	// Only advance lastNetworkAddresses after a successful SyncMeta so a
+	// failed sync during a network handoff is retried on the next poll.
 	if err := e.mgmClient.SyncMeta(info); err != nil {
 		log.Warnf("failed to re-sync meta after network change: %v", err)
+		return
 	}
+	e.lastNetworkAddresses = current
+	e.lastNetworkAddressSync = time.Now()
 }
 
 func networkAddressesEqual(a, b []system.NetworkAddress) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	// Sort-unabhängiger Vergleich: prüfe ob alle IPs aus a in b vorkommen
+	// Order-independent comparison: check that all IPs from a are present in b
 	bSet := make(map[string]struct{}, len(b))
 	for _, addr := range b {
 		bSet[addr.NetIP.String()] = struct{}{}
