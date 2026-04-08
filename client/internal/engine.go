@@ -1000,10 +1000,10 @@ func (e *Engine) updateChecksIfNew(checks []*mgmProto.Checks) error {
 	}
 	e.checks = checks
 
-	info, err := system.GetInfoWithChecks(e.ctx, checks)
+	info, err := system.GetInfoWithChecks(e.systemCtx(), checks)
 	if err != nil {
 		log.Warnf("failed to get system info with checks: %v", err)
-		info = system.GetInfo(e.ctx)
+		info = system.GetInfo(e.systemCtx())
 	}
 	info.SetFlags(
 		e.config.RosenpassEnabled,
@@ -1058,6 +1058,22 @@ func (e *Engine) startNetworkAddressWatcher() {
 	}
 }
 
+// systemCtx returns a context for use with system.GetInfo / GetInfoWithChecks.
+// On mobile platforms it injects the host-supplied ExternalIFaceDiscover so
+// that the system package can collect network interfaces via the Android Java
+// bridge instead of relying on net.Interfaces() (which is broken on Android
+// 11+ due to SELinux restrictions on NETLINK_ROUTE sockets). On other
+// platforms the discoverer is nil and the wrapper is a no-op.
+func (e *Engine) systemCtx() context.Context {
+	if e.mobileDep.IFaceDiscover == nil {
+		return e.ctx
+	}
+	discoverer := e.mobileDep.IFaceDiscover
+	return system.WithIFaceDiscover(e.ctx, func() (string, error) {
+		return discoverer.IFaces()
+	})
+}
+
 // resyncMetaIfNetworkChanged detects changes in local network addresses
 // (e.g., WiFi reconnect on mobile) and re-syncs meta with the management
 // server so that posture checks evaluate the current network state.
@@ -1072,7 +1088,7 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 	// Use GetInfoWithChecks so Info.Files is populated for file/process
 	// posture checks — otherwise the management server would evaluate the
 	// peer without the posture-check context after a network change.
-	info, err := system.GetInfoWithChecks(e.ctx, e.checks)
+	info, err := system.GetInfoWithChecks(e.systemCtx(), e.checks)
 	if err != nil {
 		log.Warnf("failed to collect system info during network change resync: %v", err)
 		return
@@ -1113,7 +1129,10 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 		log.Warnf("failed to re-sync meta after network change: %v", err)
 		return
 	}
-	e.lastNetworkAddresses = current
+	// Defensive clone so we keep our own slice independent of the one
+	// inside info: future changes to networkAddresses() must not be able
+	// to mutate our last-known state through a shared backing array.
+	e.lastNetworkAddresses = slices.Clone(current)
 	e.lastNetworkAddressSync = time.Now()
 }
 
@@ -1244,10 +1263,10 @@ func (e *Engine) receiveManagementEvents() {
 	e.shutdownWg.Add(1)
 	go func() {
 		defer e.shutdownWg.Done()
-		info, err := system.GetInfoWithChecks(e.ctx, e.checks)
+		info, err := system.GetInfoWithChecks(e.systemCtx(), e.checks)
 		if err != nil {
 			log.Warnf("failed to get system info with checks: %v", err)
-			info = system.GetInfo(e.ctx)
+			info = system.GetInfo(e.systemCtx())
 		}
 		info.SetFlags(
 			e.config.RosenpassEnabled,
@@ -1843,7 +1862,7 @@ func (e *Engine) readInitialSettings() ([]*route.Route, *nbdns.Config, bool, err
 		return nil, nil, false, nil
 	}
 
-	info := system.GetInfo(e.ctx)
+	info := system.GetInfo(e.systemCtx())
 	info.SetFlags(
 		e.config.RosenpassEnabled,
 		e.config.RosenpassPermissive,

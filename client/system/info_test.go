@@ -35,7 +35,7 @@ func Test_CustomHostname(t *testing.T) {
 }
 
 func Test_NetAddresses(t *testing.T) {
-	addr, err := networkAddresses()
+	addr, err := networkAddresses(context.Background())
 	if err != nil {
 		t.Errorf("failed to discover network addresses: %s", err)
 	}
@@ -45,7 +45,7 @@ func Test_NetAddresses(t *testing.T) {
 }
 
 func Test_networkAddresses(t *testing.T) {
-	addrs, err := networkAddresses()
+	addrs, err := networkAddresses(context.Background())
 	assert.NoError(t, err)
 	assert.NotEmpty(t, addrs, "should discover at least one network address")
 
@@ -56,7 +56,7 @@ func Test_networkAddresses(t *testing.T) {
 }
 
 func Test_networkAddresses_noDuplicates(t *testing.T) {
-	addrs, err := networkAddresses()
+	addrs, err := networkAddresses(context.Background())
 	assert.NoError(t, err)
 
 	seen := make(map[string]struct{})

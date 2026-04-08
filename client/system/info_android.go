@@ -30,7 +30,7 @@ func GetInfo(ctx context.Context) *Info {
 		kernelVersion = osInfo[2]
 	}
 
-	addrs, err := networkAddresses()
+	addrs, err := networkAddresses(ctx)
 	if err != nil {
 		log.Warnf("failed to discover network addresses: %s", err)
 	}

@@ -24,6 +24,20 @@ const OsNameCtxKey = "OsName"
 // UiVersionCtxKey context key for user UI version
 const UiVersionCtxKey = "user-agent"
 
+// IFaceDiscoverCtxKey context key for an external network interface
+// discoverer (used on mobile platforms where net.Interfaces() is broken).
+// The value must implement the same string-format contract as
+// stdnet.ExternalIFaceDiscover, but to avoid an import cycle we accept a
+// minimal interface here and let the caller adapt.
+const IFaceDiscoverCtxKey = "iFaceDiscover"
+
+// IFaceDiscoverFunc is a callback that returns the same newline-separated
+// interface description string used by stdnet.ExternalIFaceDiscover.IFaces().
+// Each line has the format:
+//
+//	name index mtu up broadcast loopback pointToPoint multicast|addr1 addr2 ...
+type IFaceDiscoverFunc func() (string, error)
+
 type NetworkAddress struct {
 	NetIP netip.Prefix
 	Mac   string
@@ -145,21 +159,30 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 	return v
 }
 
-func networkAddresses() ([]NetworkAddress, error) {
-	interfaces, err := getNetInterfaces()
+func networkAddresses(ctx context.Context) ([]NetworkAddress, error) {
+	interfaces, err := getNetInterfaces(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var netAddresses []NetworkAddress
+	// On Android (and any other platform where we received interfaces via
+	// an external discoverer) the Java host application has already
+	// filtered the list to "real" administrative interfaces and may not
+	// expose the hardware MAC. Skip the no-MAC filter in that case so
+	// posture checks see the actual addresses; on platforms where we
+	// went through the standard library we keep the upstream behaviour
+	// of dropping virtual interfaces without MAC.
+	skipNoMacFilter := ctx.Value(IFaceDiscoverCtxKey) != nil
+
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
-		if iface.HardwareAddr.String() == "" {
+		if !skipNoMacFilter && iface.HardwareAddr.String() == "" {
 			continue
 		}
-		addrs, err := getInterfaceAddrs(&iface)
+		addrs, err := getInterfaceAddrs(ctx, &iface)
 		if err != nil {
 			continue
 		}
