@@ -111,6 +111,16 @@ func (c *Client) Run(platformFiles PlatformFiles, urlOpener URLOpener, isAndroid
 	//nolint
 	ctxWithValues = context.WithValue(ctxWithValues, system.UiVersionCtxKey, c.uiVersion)
 
+	// Inject the host-supplied IFaceDiscover so system.GetInfo can collect
+	// network addresses on Android (net.Interfaces() is broken under SELinux
+	// since Android 11). Used by login, posture-check meta resync, and the
+	// engine's network-change detection.
+	if c.iFaceDiscover != nil {
+		ctxWithValues = system.WithIFaceDiscover(ctxWithValues, func() (string, error) {
+			return c.iFaceDiscover.IFaces()
+		})
+	}
+
 	c.ctxCancelLock.Lock()
 	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
 	defer c.ctxCancel()
@@ -150,6 +160,14 @@ func (c *Client) RunWithoutLogin(platformFiles PlatformFiles, dns *DNSList, dnsR
 	var ctx context.Context
 	//nolint
 	ctxWithValues := context.WithValue(context.Background(), system.DeviceNameCtxKey, c.deviceName)
+
+	// See Run() above for rationale.
+	if c.iFaceDiscover != nil {
+		ctxWithValues = system.WithIFaceDiscover(ctxWithValues, func() (string, error) {
+			return c.iFaceDiscover.IFaces()
+		})
+	}
+
 	c.ctxCancelLock.Lock()
 	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
 	defer c.ctxCancel()

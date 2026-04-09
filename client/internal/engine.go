@@ -74,9 +74,10 @@ import (
 // if not successful then it will retry the connection attempt.
 // Todo pass timeout at EnginConfig
 const (
-	PeerConnectionTimeoutMax = 45000 // ms
-	PeerConnectionTimeoutMin = 30000 // ms
-	disableAutoUpdate        = "disabled"
+	PeerConnectionTimeoutMax       = 45000 // ms
+	PeerConnectionTimeoutMin       = 30000 // ms
+	disableAutoUpdate              = "disabled"
+	networkAddressResyncDebounce   = 30 * time.Second
 )
 
 var ErrResetConnection = fmt.Errorf("reset connection")
@@ -1081,7 +1082,7 @@ func (e *Engine) systemCtx() context.Context {
 func (e *Engine) resyncMetaIfNetworkChanged() {
 	// Debounce: don't re-sync more than once per 30 seconds to avoid
 	// flapping during VPN tunnel setup when interfaces are in flux.
-	if time.Since(e.lastNetworkAddressSync) < 30*time.Second {
+	if time.Since(e.lastNetworkAddressSync) < networkAddressResyncDebounce {
 		return
 	}
 
