@@ -108,52 +108,69 @@ func parseExternalIfaces(raw string) ([]net.Interface, map[string][]net.Addr) {
 			continue
 		}
 
-		var name string
-		var index, mtu int
-		var up, broadcast, loopback, pointToPoint, multicast bool
-		_, err := fmt.Sscanf(fields[0], "%s %d %d %t %t %t %t %t",
-			&name, &index, &mtu, &up, &broadcast, &loopback, &pointToPoint, &multicast)
+		ni, err := parseIfaceHeader(fields[0])
 		if err != nil {
-			log.Warnf("network_addresses_android: cannot parse iface header %q: %v", fields[0], err)
+			log.Warnf("network_addresses_android: %v", err)
 			continue
 		}
-
-		ni := net.Interface{
-			Name:  name,
-			Index: index,
-			MTU:   mtu,
-		}
-		if up {
-			ni.Flags |= net.FlagUp
-		}
-		if broadcast {
-			ni.Flags |= net.FlagBroadcast
-		}
-		if loopback {
-			ni.Flags |= net.FlagLoopback
-		}
-		if pointToPoint {
-			ni.Flags |= net.FlagPointToPoint
-		}
-		if multicast {
-			ni.Flags |= net.FlagMulticast
-		}
 		ifaces = append(ifaces, ni)
-
-		var addrs []net.Addr
-		for _, addr := range strings.Split(strings.Trim(fields[1], " \n"), " ") {
-			if addr == "" || strings.Contains(addr, "%") {
-				continue
-			}
-			ip, ipNet, err := net.ParseCIDR(addr)
-			if err != nil {
-				log.Warnf("network_addresses_android: cannot parse addr %q: %v", addr, err)
-				continue
-			}
-			ipNet.IP = ip
-			addrs = append(addrs, ipNet)
-		}
-		addrMap[name] = addrs
+		addrMap[ni.Name] = parseIfaceAddrs(fields[1])
 	}
 	return ifaces, addrMap
+}
+
+// parseIfaceHeader parses the header portion of an external interface line
+// (everything before the "|") into a net.Interface with the correct flags.
+func parseIfaceHeader(header string) (net.Interface, error) {
+	var name string
+	var index, mtu int
+	var up, broadcast, loopback, pointToPoint, multicast bool
+	_, err := fmt.Sscanf(header, "%s %d %d %t %t %t %t %t",
+		&name, &index, &mtu, &up, &broadcast, &loopback, &pointToPoint, &multicast)
+	if err != nil {
+		return net.Interface{}, fmt.Errorf("cannot parse iface header %q: %v", header, err)
+	}
+
+	ni := net.Interface{
+		Name:  name,
+		Index: index,
+		MTU:   mtu,
+	}
+
+	type flagEntry struct {
+		set  bool
+		flag net.Flags
+	}
+	for _, f := range []flagEntry{
+		{up, net.FlagUp},
+		{broadcast, net.FlagBroadcast},
+		{loopback, net.FlagLoopback},
+		{pointToPoint, net.FlagPointToPoint},
+		{multicast, net.FlagMulticast},
+	} {
+		if f.set {
+			ni.Flags |= f.flag
+		}
+	}
+
+	return ni, nil
+}
+
+// parseIfaceAddrs parses the address portion of an external interface line
+// (everything after the "|") into a slice of net.Addr.
+func parseIfaceAddrs(raw string) []net.Addr {
+	var addrs []net.Addr
+	for _, addr := range strings.Split(strings.Trim(raw, " \n"), " ") {
+		if addr == "" || strings.Contains(addr, "%") {
+			continue
+		}
+		ip, ipNet, err := net.ParseCIDR(addr)
+		if err != nil {
+			log.Warnf("network_addresses_android: cannot parse addr %q: %v", addr, err)
+			continue
+		}
+		ipNet.IP = ip
+		addrs = append(addrs, ipNet)
+	}
+	return addrs
 }

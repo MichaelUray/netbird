@@ -77,6 +77,7 @@ const (
 	PeerConnectionTimeoutMax       = 45000 // ms
 	PeerConnectionTimeoutMin       = 30000 // ms
 	disableAutoUpdate              = "disabled"
+	networkAddressWatchInterval    = 10 * time.Second
 	networkAddressResyncDebounce   = 30 * time.Second
 )
 
@@ -1044,7 +1045,7 @@ func (e *Engine) ResyncNetworkAddresses() {
 // ensuring posture checks always evaluate the current network state.
 func (e *Engine) startNetworkAddressWatcher() {
 	defer e.shutdownWg.Done()
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(networkAddressWatchInterval)
 	defer ticker.Stop()
 
 	for {
