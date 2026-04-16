@@ -30,6 +30,10 @@ import (
 // than typical STUN round-trips.
 const agentLoopProtectionWindow = 3 * time.Second
 
+// maxPendingCandidates is the maximum number of remote ICE candidates that
+// can be buffered before the local agent is initialized.
+const maxPendingCandidates = 50
+
 type ICEConnInfo struct {
 	RemoteConn                 net.Conn
 	RosenpassPubKey            []byte
@@ -72,6 +76,10 @@ type WorkerICE struct {
 
 	// we record the last known state of the ICE agent to avoid duplicate on disconnected events
 	lastKnownState ice.ConnectionState
+
+	// pendingCandidates buffers remote candidates that arrive before the ICE agent is initialized.
+	// They are flushed through the normal candidate pipeline once the agent is ready.
+	pendingCandidates []ice.Candidate
 
 	// portForwardAttempted tracks if we've already tried port forwarding this session
 	portForwardAttempted bool
@@ -160,8 +168,10 @@ func (w *WorkerICE) handleExistingAgent(remoteOfferAnswer *OfferAnswer) (skip bo
 	sessionID, err := NewICESessionID()
 	if err != nil {
 		w.log.Errorf("failed to create new session ID: %s", err)
+		w.sessionID = ""
+	} else {
+		w.sessionID = sessionID
 	}
-	w.sessionID = sessionID
 	w.agent = nil
 
 	return false
@@ -202,6 +212,8 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 		w.remoteSessionID = ""
 	}
 
+	w.flushPendingCandidates(agent)
+
 	go w.connect(dialerCtx, agent, remoteOfferAnswer)
 }
 
@@ -210,16 +222,31 @@ func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HA
 	w.muxAgent.Lock()
 	defer w.muxAgent.Unlock()
 	w.log.Debugf("OnRemoteCandidate from peer %s -> %s", w.config.Key, candidate.String())
-	if w.agent == nil {
-		w.log.Warnf("ICE Agent is not initialized yet")
-		return
-	}
 
+	// Filter routed candidates before buffering or adding, so both paths
+	// behave identically regardless of arrival timing.
 	if candidateViaRoutes(candidate, haRoutes) {
 		return
 	}
 
-	if err := w.agent.AddRemoteCandidate(candidate); err != nil {
+	if w.agent == nil {
+		if len(w.pendingCandidates) >= maxPendingCandidates {
+			w.log.Warnf("pending candidate buffer full (%d), dropping candidate: %s", maxPendingCandidates, candidate.Type())
+			return
+		}
+		w.log.Infof("ICE Agent not ready, buffering remote candidate: %s", candidate.Type())
+		w.pendingCandidates = append(w.pendingCandidates, candidate)
+		return
+	}
+
+	w.addRemoteCandidate(w.agent, candidate)
+}
+
+// addRemoteCandidate adds a remote candidate to the agent and, when applicable,
+// also generates and adds the synthetic extra server-reflexive candidate.
+// This is the single code path for both live and buffered candidates.
+func (w *WorkerICE) addRemoteCandidate(agent *icemaker.ThreadSafeAgent, candidate ice.Candidate) {
+	if err := agent.AddRemoteCandidate(candidate); err != nil {
 		w.log.Errorf("error while handling remote candidate")
 		return
 	}
@@ -233,11 +260,25 @@ func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HA
 			return
 		}
 
-		if err := w.agent.AddRemoteCandidate(extraSrflx); err != nil {
+		if err := agent.AddRemoteCandidate(extraSrflx); err != nil {
 			w.log.Errorf("error while handling remote candidate")
 			return
 		}
 	}
+}
+
+// flushPendingCandidates drains the buffered candidates through the normal
+// candidate pipeline once the ICE agent is ready. The caller must hold w.muxAgent.
+func (w *WorkerICE) flushPendingCandidates(agent *icemaker.ThreadSafeAgent) {
+	if len(w.pendingCandidates) == 0 {
+		return
+	}
+
+	w.log.Infof("flushing %d buffered remote candidates", len(w.pendingCandidates))
+	for _, c := range w.pendingCandidates {
+		w.addRemoteCandidate(agent, c)
+	}
+	w.pendingCandidates = nil
 }
 
 func (w *WorkerICE) GetLocalUserCredentials() (frag string, pwd string) {
@@ -381,11 +422,14 @@ func (w *WorkerICE) closeAgent(agent *icemaker.ThreadSafeAgent, cancel context.C
 		sessionID, err := NewICESessionID()
 		if err != nil {
 			w.log.Errorf("failed to create new session ID: %s", err)
+			w.sessionID = ""
+		} else {
+			w.sessionID = sessionID
 		}
-		w.sessionID = sessionID
 		w.agent = nil
 		w.agentConnecting = false
 		w.remoteSessionID = ""
+		w.pendingCandidates = nil
 	}
 	return sessionChanged
 }
