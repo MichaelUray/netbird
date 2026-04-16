@@ -213,7 +213,10 @@ type Engine struct {
 	// checks are the client-applied posture checks that need to be evaluated on the client
 	checks []*mgmProto.Checks
 
-	// lastNetworkAddresses tracks reported addresses for change detection
+	// lastNetworkAddresses tracks reported addresses for change detection.
+	// Protected by networkAddrMu; always acquire networkAddrMu before
+	// reading or writing these fields.
+	networkAddrMu          sync.Mutex
 	lastNetworkAddresses   []system.NetworkAddress
 	lastNetworkAddressSync time.Time
 
@@ -911,7 +914,7 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 
 	// Fallback: detect network address changes during periodic sync in case
 	// platform-specific callbacks (e.g., Android NetworkCallback) were missed.
-	e.resyncMetaIfNetworkChanged()
+	e.resyncMetaIfNetworkChanged(false)
 
 	nm := update.GetNetworkMap()
 	if nm == nil {
@@ -1034,10 +1037,12 @@ func (e *Engine) updateChecksIfNew(checks []*mgmProto.Checks) error {
 
 // ResyncNetworkAddresses can be called externally (e.g., from Android
 // network change callbacks) to immediately re-sync NetworkAddresses.
+// It bypasses the debounce window because platform callbacks indicate a
+// real network change that should not be suppressed.
 func (e *Engine) ResyncNetworkAddresses() {
 	e.syncMsgMux.Lock()
 	defer e.syncMsgMux.Unlock()
-	e.resyncMetaIfNetworkChanged()
+	e.resyncMetaIfNetworkChanged(true)
 }
 
 // startNetworkAddressWatcher polls for network address changes every 10s.
@@ -1054,7 +1059,7 @@ func (e *Engine) startNetworkAddressWatcher() {
 			return
 		case <-ticker.C:
 			e.syncMsgMux.Lock()
-			e.resyncMetaIfNetworkChanged()
+			e.resyncMetaIfNetworkChanged(false)
 			e.syncMsgMux.Unlock()
 		}
 	}
@@ -1080,16 +1085,42 @@ func (e *Engine) systemCtx() context.Context {
 // (e.g., WiFi reconnect on mobile) and re-syncs meta with the management
 // server so that posture checks evaluate the current network state.
 // Must be called while holding syncMsgMux.
-func (e *Engine) resyncMetaIfNetworkChanged() {
+//
+// When force is true (explicit platform callbacks such as Android
+// NetworkCallback), the debounce window is bypassed because the OS already
+// told us the network changed. When force is false (periodic polling /
+// handleSync fallback), we debounce to avoid flapping during VPN tunnel
+// setup.
+func (e *Engine) resyncMetaIfNetworkChanged(force bool) {
+	e.networkAddrMu.Lock()
+	defer e.networkAddrMu.Unlock()
+
 	// Debounce: don't re-sync more than once per 30 seconds to avoid
 	// flapping during VPN tunnel setup when interfaces are in flux.
-	if time.Since(e.lastNetworkAddressSync) < networkAddressResyncDebounce {
+	// Explicit platform callbacks (force=true) bypass this.
+	if !force && time.Since(e.lastNetworkAddressSync) < networkAddressResyncDebounce {
 		return
 	}
 
-	// Use GetInfoWithChecks so Info.Files is populated for file/process
-	// posture checks — otherwise the management server would evaluate the
-	// peer without the posture-check context after a network change.
+	// Lightweight address-only check first: avoid running posture-check
+	// file/process scans (GetInfoWithChecks) on every 10s watcher tick
+	// when the address set has not changed.
+	current, err := system.NetworkAddresses(e.systemCtx())
+	if err != nil {
+		log.Warnf("failed to collect network addresses during resync check: %v", err)
+		return
+	}
+
+	if networkAddressesEqual(e.lastNetworkAddresses, current) {
+		return
+	}
+
+	log.Infof("network addresses changed (%d -> %d addrs), re-syncing meta with management server",
+		len(e.lastNetworkAddresses), len(current))
+
+	// Addresses actually changed — now gather full system info including
+	// posture-check file/process data so the management server can
+	// evaluate posture checks with up-to-date context.
 	info, err := system.GetInfoWithChecks(e.systemCtx(), e.checks)
 	if err != nil {
 		log.Warnf("failed to collect system info during network change resync: %v", err)
@@ -1098,14 +1129,6 @@ func (e *Engine) resyncMetaIfNetworkChanged() {
 	if info == nil {
 		return
 	}
-
-	current := info.NetworkAddresses
-	if networkAddressesEqual(e.lastNetworkAddresses, current) {
-		return
-	}
-
-	log.Infof("network addresses changed (%d -> %d addrs), re-syncing meta with management server",
-		len(e.lastNetworkAddresses), len(current))
 
 	info.SetFlags(
 		e.config.RosenpassEnabled,

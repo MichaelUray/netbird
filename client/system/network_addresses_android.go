@@ -104,13 +104,13 @@ func parseExternalIfaces(raw string) ([]net.Interface, map[string][]net.Addr) {
 		}
 		fields := strings.Split(line, "|")
 		if len(fields) != 2 {
-			log.Warnf("network_addresses_android: cannot split iface line %q", line)
+			log.Warn("network_addresses_android: cannot split interface line from external discoverer (expected '|' separator)")
 			continue
 		}
 
 		ni, err := parseIfaceHeader(fields[0])
 		if err != nil {
-			log.Warnf("network_addresses_android: %v", err)
+			log.Warn("network_addresses_android: failed to parse interface header from external discoverer")
 			continue
 		}
 		ifaces = append(ifaces, ni)
@@ -128,7 +128,7 @@ func parseIfaceHeader(header string) (net.Interface, error) {
 	_, err := fmt.Sscanf(header, "%s %d %d %t %t %t %t %t",
 		&name, &index, &mtu, &up, &broadcast, &loopback, &pointToPoint, &multicast)
 	if err != nil {
-		return net.Interface{}, fmt.Errorf("cannot parse iface header %q: %v", header, err)
+		return net.Interface{}, fmt.Errorf("cannot parse interface header from external discoverer: %v", err)
 	}
 
 	ni := net.Interface{
@@ -166,7 +166,7 @@ func parseIfaceAddrs(raw string) []net.Addr {
 		}
 		ip, ipNet, err := net.ParseCIDR(addr)
 		if err != nil {
-			log.Warnf("network_addresses_android: cannot parse addr %q: %v", addr, err)
+			log.Warn("network_addresses_android: skipping unparseable address from external discoverer")
 			continue
 		}
 		ipNet.IP = ip

@@ -159,6 +159,13 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 	return v
 }
 
+// NetworkAddresses returns the current set of non-loopback network addresses.
+// It is intentionally lightweight (no posture-check file/process scanning) so
+// callers can poll for address changes without the overhead of GetInfoWithChecks.
+func NetworkAddresses(ctx context.Context) ([]NetworkAddress, error) {
+	return networkAddresses(ctx)
+}
+
 func networkAddresses(ctx context.Context) ([]NetworkAddress, error) {
 	interfaces, err := getNetInterfaces(ctx)
 	if err != nil {
