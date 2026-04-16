@@ -1625,7 +1625,7 @@ func (e *Engine) receiveSignalEvents() {
 					return err
 				}
 
-				go conn.OnRemoteCandidate(candidate, e.routeManager.GetClientRoutes())
+				conn.OnRemoteCandidate(candidate, e.routeManager.GetClientRoutes())
 			case sProto.Body_MODE:
 			case sProto.Body_GO_IDLE:
 				e.connMgr.DeactivatePeer(conn)
