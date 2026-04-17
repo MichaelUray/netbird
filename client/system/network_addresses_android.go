@@ -166,7 +166,7 @@ func parseIfaceAddrs(raw string) []net.Addr {
 		}
 		ip, ipNet, err := net.ParseCIDR(addr)
 		if err != nil {
-			log.Warn("network_addresses_android: skipping unparseable address from external discoverer")
+			log.Warn("network_addresses_android: skipping unparsable address from external discoverer")
 			continue
 		}
 		ipNet.IP = ip
