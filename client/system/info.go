@@ -2,7 +2,6 @@ package system
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"strings"
 
@@ -157,77 +156,6 @@ func extractDeviceName(ctx context.Context, defaultName string) string {
 		return defaultName
 	}
 	return v
-}
-
-// NetworkAddresses returns the current set of non-loopback network addresses.
-// It is intentionally lightweight (no posture-check file/process scanning) so
-// callers can poll for address changes without the overhead of GetInfoWithChecks.
-func NetworkAddresses(ctx context.Context) ([]NetworkAddress, error) {
-	return networkAddresses(ctx)
-}
-
-func networkAddresses(ctx context.Context) ([]NetworkAddress, error) {
-	interfaces, err := getNetInterfaces(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var netAddresses []NetworkAddress
-	// On Android (and any other platform where we received interfaces via
-	// an external discoverer) the Java host application has already
-	// filtered the list to "real" administrative interfaces and may not
-	// expose the hardware MAC. Skip the no-MAC filter in that case so
-	// posture checks see the actual addresses; on platforms where we
-	// went through the standard library we keep the upstream behaviour
-	// of dropping virtual interfaces without MAC.
-	skipNoMacFilter := ctx.Value(IFaceDiscoverCtxKey) != nil
-
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		if !skipNoMacFilter && iface.HardwareAddr.String() == "" {
-			continue
-		}
-		addrs, err := getInterfaceAddrs(ctx, &iface)
-		if err != nil {
-			continue
-		}
-
-		mac := iface.HardwareAddr.String()
-
-		for _, address := range addrs {
-			ipNet, ok := address.(*net.IPNet)
-			if !ok {
-				continue
-			}
-
-			if ipNet.IP.IsLoopback() {
-				continue
-			}
-
-			netAddr := NetworkAddress{
-				NetIP: netip.MustParsePrefix(ipNet.String()),
-				Mac:   mac,
-			}
-
-			if isDuplicated(netAddresses, netAddr) {
-				continue
-			}
-
-			netAddresses = append(netAddresses, netAddr)
-		}
-	}
-	return netAddresses, nil
-}
-
-func isDuplicated(addresses []NetworkAddress, addr NetworkAddress) bool {
-	for _, duplicated := range addresses {
-		if duplicated.NetIP == addr.NetIP {
-			return true
-		}
-	}
-	return false
 }
 
 // GetInfoWithChecks retrieves and parses the system information with applied checks.
