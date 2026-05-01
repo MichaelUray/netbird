@@ -393,20 +393,35 @@ func (c *NetworkMapComponents) getPeerFromResource(resource Resource, peerID str
 	return []*nbpeer.Peer{peerInfo}, false
 }
 
+// filterPeersByLoginExpiration separates ACL-allowed peers into peers that
+// should be advertised as reachable (peersToConnect) and peers that should
+// only be reported as offline (offlinePeers).
+//
+// A peer is moved to offlinePeers when either:
+//   - its login is expired (and PeerLoginExpirationEnabled is set), or
+//   - it is currently not connected to the management server.
+//
+// The second case avoids that the receiving peer's daemon repeatedly tries
+// to ICE/STUN/Relay-connect to peers that are known to be offline. On
+// metered uplinks (LTE, mobile) those probes can dominate the daily volume.
 func (c *NetworkMapComponents) filterPeersByLoginExpiration(aclPeers []*nbpeer.Peer) ([]*nbpeer.Peer, []*nbpeer.Peer) {
 	peersToConnect := make([]*nbpeer.Peer, 0, len(aclPeers))
-	var expiredPeers []*nbpeer.Peer
+	var offlinePeers []*nbpeer.Peer
 
 	for _, p := range aclPeers {
 		expired, _ := p.LoginExpired(c.AccountSettings.PeerLoginExpiration)
 		if c.AccountSettings.PeerLoginExpirationEnabled && expired {
-			expiredPeers = append(expiredPeers, p)
+			offlinePeers = append(offlinePeers, p)
+			continue
+		}
+		if p.Status != nil && !p.Status.Connected {
+			offlinePeers = append(offlinePeers, p)
 			continue
 		}
 		peersToConnect = append(peersToConnect, p)
 	}
 
-	return peersToConnect, expiredPeers
+	return peersToConnect, offlinePeers
 }
 
 func (c *NetworkMapComponents) getPeerDNSManagementStatusFromGroups(peerGroups map[string]struct{}) bool {
