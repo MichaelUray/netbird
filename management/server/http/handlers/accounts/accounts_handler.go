@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/netip"
 	"time"
@@ -20,6 +21,25 @@ import (
 	"github.com/netbirdio/netbird/shared/management/http/util"
 	"github.com/netbirdio/netbird/shared/management/status"
 )
+
+// validateUint32Timeout converts a request-side *int64 timeout into the
+// internal *uint32 representation, rejecting negative values and values
+// that would silently wrap when narrowed. Used for the Phase 1
+// p2p_timeout_seconds and relay_timeout_seconds fields.
+func validateUint32Timeout(field string, ptr *int64) (*uint32, error) {
+	if ptr == nil {
+		return nil, nil
+	}
+	v := *ptr
+	if v < 0 {
+		return nil, fmt.Errorf("%s must be >= 0, got %d", field, v)
+	}
+	if v > int64(math.MaxUint32) {
+		return nil, fmt.Errorf("%s must be <= %d, got %d", field, uint32(math.MaxUint32), v)
+	}
+	out := uint32(v)
+	return &out, nil
+}
 
 const (
 	// PeerBufferPercentage is the percentage of peers to add as buffer for network range calculations
@@ -220,19 +240,29 @@ func (h *handler) updateAccountRequestSettings(req api.PutApiAccountsAccountIdJS
 		if !req.Settings.ConnectionMode.Valid() {
 			return nil, fmt.Errorf("invalid connection_mode %q", modeStr)
 		}
-		// Persist as the canonical string. Clients clear an override by
-		// sending JSON null (which lands here as a nil pointer and skips
-		// this whole block, leaving the existing value untouched).
+		// Persist as the canonical string. Note: the request type uses a
+		// non-pointer `*api.AccountSettingsConnectionMode` and JSON null
+		// is indistinguishable from an absent field at this layer -- both
+		// land here as a nil pointer and skip this whole block, leaving
+		// the existing value untouched. There is currently no API path
+		// that lets a client *clear* an explicit override; the next
+		// settings revision should switch to a sentinel-aware wrapper.
 		s := modeStr
 		returnSettings.ConnectionMode = &s
 	}
 	if req.Settings.P2pTimeoutSeconds != nil {
-		v := uint32(*req.Settings.P2pTimeoutSeconds)
-		returnSettings.P2pTimeoutSeconds = &v
+		v, err := validateUint32Timeout("p2p_timeout_seconds", req.Settings.P2pTimeoutSeconds)
+		if err != nil {
+			return nil, err
+		}
+		returnSettings.P2pTimeoutSeconds = v
 	}
 	if req.Settings.RelayTimeoutSeconds != nil {
-		v := uint32(*req.Settings.RelayTimeoutSeconds)
-		returnSettings.RelayTimeoutSeconds = &v
+		v, err := validateUint32Timeout("relay_timeout_seconds", req.Settings.RelayTimeoutSeconds)
+		if err != nil {
+			return nil, err
+		}
+		returnSettings.RelayTimeoutSeconds = v
 	}
 	if req.Settings.AutoUpdateVersion != nil {
 		_, err := goversion.NewSemver(*req.Settings.AutoUpdateVersion)
