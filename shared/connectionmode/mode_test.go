@@ -13,6 +13,9 @@ func TestParseString(t *testing.T) {
 		wantErr bool
 	}{
 		{"relay-forced", ModeRelayForced, false},
+		{"relay", ModeRelayForced, false},   // forgiving alias for older docs / dashboard label
+		{"RELAY", ModeRelayForced, false},   // case-insensitive
+		{" relay ", ModeRelayForced, false}, // whitespace-tolerant
 		{"p2p", ModeP2P, false},
 		{"p2p-lazy", ModeP2PLazy, false},
 		{"p2p-dynamic", ModeP2PDynamic, false},
