@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -333,6 +334,44 @@ func TestAccounts_AccountsHandler(t *testing.T) {
 
 			assert.Equal(t, tc.expectedID, actual.Id)
 			assert.Equal(t, tc.expectedSettings, actual.Settings)
+		})
+	}
+}
+
+func TestValidateUint32Timeout(t *testing.T) {
+	pi := func(v int64) *int64 { return &v }
+
+	tests := []struct {
+		name    string
+		in      *int64
+		want    *uint32
+		wantErr bool
+	}{
+		{"nil passes through", nil, nil, false},
+		{"zero is allowed", pi(0), func() *uint32 { v := uint32(0); return &v }(), false},
+		{"common positive", pi(86400), func() *uint32 { v := uint32(86400); return &v }(), false},
+		{"max uint32 boundary", pi(int64(math.MaxUint32)), func() *uint32 { v := uint32(math.MaxUint32); return &v }(), false},
+		{"negative rejected", pi(-1), nil, true},
+		{"over max uint32 rejected", pi(int64(math.MaxUint32) + 1), nil, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateUint32Timeout("test_field", tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if (got == nil) != (tc.want == nil) {
+				t.Fatalf("nil-ness mismatch: got=%v want=%v", got, tc.want)
+			}
+			if got != nil && *got != *tc.want {
+				t.Fatalf("value mismatch: got=%d want=%d", *got, *tc.want)
+			}
 		})
 	}
 }
