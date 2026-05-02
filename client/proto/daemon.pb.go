@@ -1220,8 +1220,19 @@ type GetConfigResponse struct {
 	EnableSSHRemotePortForwarding bool   `protobuf:"varint,23,opt,name=enableSSHRemotePortForwarding,proto3" json:"enableSSHRemotePortForwarding,omitempty"`
 	DisableSSHAuth                bool   `protobuf:"varint,25,opt,name=disableSSHAuth,proto3" json:"disableSSHAuth,omitempty"`
 	SshJWTCacheTTL                int32  `protobuf:"varint,26,opt,name=sshJWTCacheTTL,proto3" json:"sshJWTCacheTTL,omitempty"`
-	unknownFields                 protoimpl.UnknownFields
-	sizeCache                     protoimpl.SizeCache
+	// Phase 1 (#5989): peer-connection mode and idle timeouts.
+	// connection_mode is the canonical lower-kebab-case name
+	// (relay-forced, p2p, p2p-lazy, p2p-dynamic, follow-server) or
+	// empty string when no local override is set.
+	ConnectionMode      string `protobuf:"bytes,27,opt,name=connection_mode,json=connectionMode,proto3" json:"connection_mode,omitempty"`
+	P2PTimeoutSeconds   uint32 `protobuf:"varint,28,opt,name=p2p_timeout_seconds,json=p2pTimeoutSeconds,proto3" json:"p2p_timeout_seconds,omitempty"`
+	RelayTimeoutSeconds uint32 `protobuf:"varint,29,opt,name=relay_timeout_seconds,json=relayTimeoutSeconds,proto3" json:"relay_timeout_seconds,omitempty"`
+	// Phase 3 (#5989): cap on the ICE-failure backoff schedule. 0 = no
+	// local override (daemon falls back to server-pushed value or built-in
+	// 15-min default).
+	P2PRetryMaxSeconds uint32 `protobuf:"varint,30,opt,name=p2p_retry_max_seconds,json=p2pRetryMaxSeconds,proto3" json:"p2p_retry_max_seconds,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetConfigResponse) Reset() {
@@ -1432,6 +1443,34 @@ func (x *GetConfigResponse) GetDisableSSHAuth() bool {
 func (x *GetConfigResponse) GetSshJWTCacheTTL() int32 {
 	if x != nil {
 		return x.SshJWTCacheTTL
+	}
+	return 0
+}
+
+func (x *GetConfigResponse) GetConnectionMode() string {
+	if x != nil {
+		return x.ConnectionMode
+	}
+	return ""
+}
+
+func (x *GetConfigResponse) GetP2PTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.P2PTimeoutSeconds
+	}
+	return 0
+}
+
+func (x *GetConfigResponse) GetRelayTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.RelayTimeoutSeconds
+	}
+	return 0
+}
+
+func (x *GetConfigResponse) GetP2PRetryMaxSeconds() uint32 {
+	if x != nil {
+		return x.P2PRetryMaxSeconds
 	}
 	return 0
 }
@@ -6117,7 +6156,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\fDownResponse\"P\n" +
 	"\x10GetConfigRequest\x12 \n" +
 	"\vprofileName\x18\x01 \x01(\tR\vprofileName\x12\x1a\n" +
-	"\busername\x18\x02 \x01(\tR\busername\"\xdb\b\n" +
+	"\busername\x18\x02 \x01(\tR\busername\"\x9b\n" +
+	"\n" +
 	"\x11GetConfigResponse\x12$\n" +
 	"\rmanagementUrl\x18\x01 \x01(\tR\rmanagementUrl\x12\x1e\n" +
 	"\n" +
@@ -6148,7 +6188,11 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1cenableSSHLocalPortForwarding\x18\x16 \x01(\bR\x1cenableSSHLocalPortForwarding\x12D\n" +
 	"\x1denableSSHRemotePortForwarding\x18\x17 \x01(\bR\x1denableSSHRemotePortForwarding\x12&\n" +
 	"\x0edisableSSHAuth\x18\x19 \x01(\bR\x0edisableSSHAuth\x12&\n" +
-	"\x0esshJWTCacheTTL\x18\x1a \x01(\x05R\x0esshJWTCacheTTL\"\xae\a\n" +
+	"\x0esshJWTCacheTTL\x18\x1a \x01(\x05R\x0esshJWTCacheTTL\x12'\n" +
+	"\x0fconnection_mode\x18\x1b \x01(\tR\x0econnectionMode\x12.\n" +
+	"\x13p2p_timeout_seconds\x18\x1c \x01(\rR\x11p2pTimeoutSeconds\x122\n" +
+	"\x15relay_timeout_seconds\x18\x1d \x01(\rR\x13relayTimeoutSeconds\x121\n" +
+	"\x15p2p_retry_max_seconds\x18\x1e \x01(\rR\x12p2pRetryMaxSeconds\"\xae\a\n" +
 	"\tPeerState\x12\x0e\n" +
 	"\x02IP\x18\x01 \x01(\tR\x02IP\x12\x16\n" +
 	"\x06pubKey\x18\x02 \x01(\tR\x06pubKey\x12\x1e\n" +
