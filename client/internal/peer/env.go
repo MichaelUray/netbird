@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -72,11 +73,17 @@ func ResolveModeFromEnv() (connectionmode.Mode, uint32) {
 
 	timeoutSecs := uint32(0)
 	if raw := os.Getenv(envInactivityThreshold); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil {
+		d, err := time.ParseDuration(raw)
+		switch {
+		case err != nil:
+			log.Warnf("ignoring %s=%q: %v", envInactivityThreshold, raw, err)
+		case d < 0:
+			log.Warnf("ignoring %s=%q: must be >= 0", envInactivityThreshold, raw)
+		case d.Seconds() > float64(math.MaxUint32):
+			log.Warnf("ignoring %s=%q: %d s exceeds the supported range", envInactivityThreshold, raw, int64(d.Seconds()))
+		default:
 			timeoutSecs = uint32(d.Seconds())
 			warnDeprecated(envInactivityThreshold, "the relay_timeout setting on the management server")
-		} else {
-			log.Warnf("ignoring %s=%q: %v", envInactivityThreshold, raw, err)
 		}
 	}
 
