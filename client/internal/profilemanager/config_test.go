@@ -2,6 +2,7 @@ package profilemanager
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -299,6 +300,54 @@ func TestUpdateOldManagementURL(t *testing.T) {
 				require.Equal(t, string(previousContent), string(newContent), "file should not change")
 			} else {
 				require.NotEqual(t, string(previousContent), string(newContent), "file should have changed")
+			}
+		})
+	}
+}
+
+// TestProfileTimeoutsNullableRoundtrip verifies that the *uint32 typing
+// of RelayTimeoutSeconds and P2pTimeoutSeconds preserves an explicit
+// zero across JSON marshal/unmarshal. With the previous `uint32 +
+// omitempty` shape a user-set 0 would be dropped on save and rehydrate
+// as the default 0, indistinguishable from "no override".
+func TestProfileTimeoutsNullableRoundtrip(t *testing.T) {
+	zero := uint32(0)
+	val := uint32(43200)
+
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"both nil (no override)", Config{}},
+		{"explicit zero relay only", Config{RelayTimeoutSeconds: &zero}},
+		{"explicit zero p2p only", Config{P2pTimeoutSeconds: &zero}},
+		{"both explicit zero", Config{RelayTimeoutSeconds: &zero, P2pTimeoutSeconds: &zero}},
+		{"non-zero values", Config{RelayTimeoutSeconds: &val, P2pTimeoutSeconds: &val}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data, err := json.Marshal(c.cfg)
+			require.NoError(t, err)
+
+			var out Config
+			require.NoError(t, json.Unmarshal(data, &out))
+
+			// Compare via the same nil/value rules.
+			if (c.cfg.RelayTimeoutSeconds == nil) != (out.RelayTimeoutSeconds == nil) {
+				t.Fatalf("RelayTimeoutSeconds nil-ness changed: in=%v out=%v",
+					c.cfg.RelayTimeoutSeconds, out.RelayTimeoutSeconds)
+			}
+			if c.cfg.RelayTimeoutSeconds != nil && *c.cfg.RelayTimeoutSeconds != *out.RelayTimeoutSeconds {
+				t.Fatalf("RelayTimeoutSeconds value lost: in=%d out=%d",
+					*c.cfg.RelayTimeoutSeconds, *out.RelayTimeoutSeconds)
+			}
+			if (c.cfg.P2pTimeoutSeconds == nil) != (out.P2pTimeoutSeconds == nil) {
+				t.Fatalf("P2pTimeoutSeconds nil-ness changed: in=%v out=%v",
+					c.cfg.P2pTimeoutSeconds, out.P2pTimeoutSeconds)
+			}
+			if c.cfg.P2pTimeoutSeconds != nil && *c.cfg.P2pTimeoutSeconds != *out.P2pTimeoutSeconds {
+				t.Fatalf("P2pTimeoutSeconds value lost: in=%d out=%d",
+					*c.cfg.P2pTimeoutSeconds, *out.P2pTimeoutSeconds)
 			}
 		})
 	}

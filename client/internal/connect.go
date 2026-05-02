@@ -568,8 +568,8 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 		LazyConnectionEnabled: config.LazyConnectionEnabled,
 
 		ConnectionMode:      parseConnectionMode(config.ConnectionMode),
-		RelayTimeoutSeconds: config.RelayTimeoutSeconds,
-		P2pTimeoutSeconds:   config.P2pTimeoutSeconds,
+		RelayTimeoutSeconds: derefUint32(config.RelayTimeoutSeconds),
+		P2pTimeoutSeconds:   derefUint32(config.P2pTimeoutSeconds),
 
 		MTU:     selectMTU(config.MTU, peerConfig.Mtu),
 		LogPath: logPath,
@@ -712,4 +712,14 @@ func parseConnectionMode(s string) connectionmode.Mode {
 		return connectionmode.ModeUnspecified
 	}
 	return m
+}
+
+// derefUint32 returns 0 when ptr is nil, otherwise the dereferenced
+// value. Used to flatten the nullable persisted timeouts into the
+// uint32 fields the resolve chain currently expects.
+func derefUint32(ptr *uint32) uint32 {
+	if ptr == nil {
+		return 0
+	}
+	return *ptr
 }
