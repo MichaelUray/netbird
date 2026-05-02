@@ -2064,6 +2064,102 @@ func TestDefaultAccountManager_UpdateAccountSettings(t *testing.T) {
 	require.Error(t, err, "expecting to fail when providing PeerLoginExpiration more than 180 days")
 }
 
+// TestDefaultAccountManager_UpdateAccountSettings_ConnectionModeIncrementsSerial
+// verifies that changes to ConnectionMode, RelayTimeoutSeconds, or
+// P2pTimeoutSeconds bump the account network serial so connected peers
+// receive the new values via the next push instead of waiting for an
+// unrelated change or reconnect. Regression guard for the original
+// gating omission noted on PR #6047.
+func TestDefaultAccountManager_UpdateAccountSettings_ConnectionModeIncrementsSerial(t *testing.T) {
+	manager, _, err := createManager(t)
+	require.NoError(t, err, "unable to create account manager")
+
+	accountID, err := manager.GetAccountIDByUserID(context.Background(), auth.UserAuth{UserId: userID})
+	require.NoError(t, err, "unable to get account by user id")
+
+	baseAccount, err := manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err, "unable to load account")
+
+	// Establish a stable baseline by passing the existing settings back
+	// unchanged. Some default initialisation paths in UpdateAccountSettings
+	// can flip booleans on the very first call, so we burn that here.
+	settingsCopy := *baseAccount.Settings
+	if baseAccount.Settings.Extra != nil {
+		extraCopy := *baseAccount.Settings.Extra
+		settingsCopy.Extra = &extraCopy
+	}
+	_, err = manager.UpdateAccountSettings(context.Background(), accountID, userID, &settingsCopy)
+	require.NoError(t, err, "settings echo should succeed")
+
+	a, err := manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err)
+	baseSerial := a.Network.CurrentSerial()
+
+	// 1. Re-applying the same settings must NOT bump the serial again.
+	settingsCopy2 := *a.Settings
+	if a.Settings.Extra != nil {
+		extraCopy := *a.Settings.Extra
+		settingsCopy2.Extra = &extraCopy
+	}
+	_, err = manager.UpdateAccountSettings(context.Background(), accountID, userID, &settingsCopy2)
+	require.NoError(t, err, "second echo should succeed")
+
+	a, err = manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err)
+	require.Equal(t, baseSerial, a.Network.CurrentSerial(),
+		"identical settings update must not increment network serial")
+
+	// 2. ConnectionMode change must bump serial.
+	mode := "p2p-dynamic"
+	settingsWithMode := *a.Settings
+	if a.Settings.Extra != nil {
+		extraCopy := *a.Settings.Extra
+		settingsWithMode.Extra = &extraCopy
+	}
+	settingsWithMode.ConnectionMode = &mode
+	_, err = manager.UpdateAccountSettings(context.Background(), accountID, userID, &settingsWithMode)
+	require.NoError(t, err)
+
+	a, err = manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err)
+	afterMode := a.Network.CurrentSerial()
+	require.Greater(t, afterMode, baseSerial,
+		"ConnectionMode change must increment network serial so peers receive the push")
+
+	// 3. RelayTimeoutSeconds change must bump serial.
+	relay := uint32(43200)
+	settingsWithRelay := *a.Settings
+	if a.Settings.Extra != nil {
+		extraCopy := *a.Settings.Extra
+		settingsWithRelay.Extra = &extraCopy
+	}
+	settingsWithRelay.RelayTimeoutSeconds = &relay
+	_, err = manager.UpdateAccountSettings(context.Background(), accountID, userID, &settingsWithRelay)
+	require.NoError(t, err)
+
+	a, err = manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err)
+	afterRelay := a.Network.CurrentSerial()
+	require.Greater(t, afterRelay, afterMode,
+		"RelayTimeoutSeconds change must increment network serial")
+
+	// 4. P2pTimeoutSeconds change must bump serial.
+	p2p := uint32(5400)
+	settingsWithP2p := *a.Settings
+	if a.Settings.Extra != nil {
+		extraCopy := *a.Settings.Extra
+		settingsWithP2p.Extra = &extraCopy
+	}
+	settingsWithP2p.P2pTimeoutSeconds = &p2p
+	_, err = manager.UpdateAccountSettings(context.Background(), accountID, userID, &settingsWithP2p)
+	require.NoError(t, err)
+
+	a, err = manager.Store.GetAccount(context.Background(), accountID)
+	require.NoError(t, err)
+	require.Greater(t, a.Network.CurrentSerial(), afterRelay,
+		"P2pTimeoutSeconds change must increment network serial")
+}
+
 func TestDefaultAccountManager_UpdateAccountSettings_PeerApproval(t *testing.T) {
 	manager, _, account, peer1, peer2, peer3 := setupNetworkMapTest(t)
 

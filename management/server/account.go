@@ -333,7 +333,10 @@ func (am *DefaultAccountManager) UpdateAccountSettings(ctx context.Context, acco
 			oldSettings.LazyConnectionEnabled != newSettings.LazyConnectionEnabled ||
 			oldSettings.DNSDomain != newSettings.DNSDomain ||
 			oldSettings.AutoUpdateVersion != newSettings.AutoUpdateVersion ||
-			oldSettings.AutoUpdateAlways != newSettings.AutoUpdateAlways {
+			oldSettings.AutoUpdateAlways != newSettings.AutoUpdateAlways ||
+			!equalStringPtr(oldSettings.ConnectionMode, newSettings.ConnectionMode) ||
+			!equalUint32Ptr(oldSettings.RelayTimeoutSeconds, newSettings.RelayTimeoutSeconds) ||
+			!equalUint32Ptr(oldSettings.P2pTimeoutSeconds, newSettings.P2pTimeoutSeconds) {
 			updateAccountPeers = true
 		}
 
