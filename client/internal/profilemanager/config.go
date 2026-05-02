@@ -174,9 +174,16 @@ type Config struct {
 
 	LazyConnectionEnabled bool
 
-	ConnectionMode      string `json:",omitempty"`
-	RelayTimeoutSeconds uint32 `json:",omitempty"`
-	P2pTimeoutSeconds   uint32 `json:",omitempty"`
+	ConnectionMode string `json:",omitempty"`
+	// RelayTimeoutSeconds and P2pTimeoutSeconds are pointer-typed so the
+	// profile JSON can distinguish "no local override -> follow server"
+	// (nil / absent) from an explicit zero (a future "disable" sentinel).
+	// The current resolve chain in conn_mgr.go still flattens to uint32
+	// and treats 0 as "fall through", so explicit zero is not yet honored
+	// at runtime; persisting the user's intent here keeps the profile
+	// data honest for when that resolve gets nullable-aware.
+	RelayTimeoutSeconds *uint32 `json:",omitempty"`
+	P2pTimeoutSeconds   *uint32 `json:",omitempty"`
 
 	MTU uint16
 }
@@ -606,14 +613,16 @@ func (config *Config) apply(input ConfigInput) (updated bool, err error) {
 		config.ConnectionMode = *input.ConnectionMode
 		updated = true
 	}
-	if input.RelayTimeoutSeconds != nil && *input.RelayTimeoutSeconds != config.RelayTimeoutSeconds {
+	if input.RelayTimeoutSeconds != nil && (config.RelayTimeoutSeconds == nil || *input.RelayTimeoutSeconds != *config.RelayTimeoutSeconds) {
 		log.Infof("switching relay timeout to %d seconds", *input.RelayTimeoutSeconds)
-		config.RelayTimeoutSeconds = *input.RelayTimeoutSeconds
+		v := *input.RelayTimeoutSeconds
+		config.RelayTimeoutSeconds = &v
 		updated = true
 	}
-	if input.P2pTimeoutSeconds != nil && *input.P2pTimeoutSeconds != config.P2pTimeoutSeconds {
+	if input.P2pTimeoutSeconds != nil && (config.P2pTimeoutSeconds == nil || *input.P2pTimeoutSeconds != *config.P2pTimeoutSeconds) {
 		log.Infof("switching p2p timeout to %d seconds", *input.P2pTimeoutSeconds)
-		config.P2pTimeoutSeconds = *input.P2pTimeoutSeconds
+		v := *input.P2pTimeoutSeconds
+		config.P2pTimeoutSeconds = &v
 		updated = true
 	}
 
