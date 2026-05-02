@@ -55,7 +55,11 @@ func ParseString(s string) (Mode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "":
 		return ModeUnspecified, nil
-	case "relay-forced":
+	case "relay-forced", "relay":
+		// "relay" is accepted as a forgiving alias for "relay-forced":
+		// older docs / CLI examples used the shorter form and the
+		// dashboard label is "Relay". The canonical persisted form is
+		// always "relay-forced" via Mode.String() (see RoundTripString).
 		return ModeRelayForced, nil
 	case "p2p":
 		return ModeP2P, nil
