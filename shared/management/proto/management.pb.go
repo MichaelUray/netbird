@@ -4571,8 +4571,16 @@ type PeerConnectionMap struct {
 	FullSnapshot      bool                   `protobuf:"varint,2,opt,name=full_snapshot,json=fullSnapshot,proto3" json:"full_snapshot,omitempty"`
 	Entries           []*PeerConnectionEntry `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`
 	InResponseToNonce uint64                 `protobuf:"varint,4,opt,name=in_response_to_nonce,json=inResponseToNonce,proto3" json:"in_response_to_nonce,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Phase 3.7i lifecycle hardening (Codex follow-up): random uint64
+	// generated once per daemon process. Lets mgmt detect a daemon
+	// restart even if a stale unary RPC from the previous process
+	// arrives AFTER the new process's full snapshot. Mgmt drops any
+	// delta whose session_id doesn't match the cached entry's.
+	// Legacy clients send 0 (Phase 3.7i shipped without this field);
+	// mgmt falls back to seq-only behaviour for those.
+	SessionId     uint64 `protobuf:"varint,5,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PeerConnectionMap) Reset() {
@@ -4629,6 +4637,13 @@ func (x *PeerConnectionMap) GetEntries() []*PeerConnectionEntry {
 func (x *PeerConnectionMap) GetInResponseToNonce() uint64 {
 	if x != nil {
 		return x.InResponseToNonce
+	}
+	return 0
+}
+
+func (x *PeerConnectionMap) GetSessionId() uint64 {
+	if x != nil {
+		return x.SessionId
 	}
 	return 0
 }
@@ -5191,12 +5206,14 @@ const file_shared_management_proto_management_proto_rawDesc = "" +
 	"\x13RenewExposeResponse\"+\n" +
 	"\x11StopExposeRequest\x12\x16\n" +
 	"\x06domain\x18\x01 \x01(\tR\x06domain\"\x14\n" +
-	"\x12StopExposeResponse\"\xb6\x01\n" +
+	"\x12StopExposeResponse\"\xd5\x01\n" +
 	"\x11PeerConnectionMap\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12#\n" +
 	"\rfull_snapshot\x18\x02 \x01(\bR\ffullSnapshot\x129\n" +
 	"\aentries\x18\x03 \x03(\v2\x1f.management.PeerConnectionEntryR\aentries\x12/\n" +
-	"\x14in_response_to_nonce\x18\x04 \x01(\x04R\x11inResponseToNonce\"\xc4\x02\n" +
+	"\x14in_response_to_nonce\x18\x04 \x01(\x04R\x11inResponseToNonce\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x05 \x01(\x04R\tsessionId\"\xc4\x02\n" +
 	"\x13PeerConnectionEntry\x12#\n" +
 	"\rremote_pubkey\x18\x01 \x01(\tR\fremotePubkey\x121\n" +
 	"\tconn_type\x18\x02 \x01(\x0e2\x14.management.ConnTypeR\bconnType\x12A\n" +
