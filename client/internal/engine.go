@@ -268,6 +268,9 @@ type Engine struct {
 	// Phase 3.7i (#5989): track last-pushed effective config to detect changes.
 	lastPushedEff     mgm.EffectiveConnConfig
 	syncMetaDebouncer *debouncer.Debouncer
+
+	// Phase 3.7i (#5989): per-peer connection-state pusher.
+	connStatePusher *connStatePusher
 }
 
 // Peer is an instance of the Connection Peer
@@ -342,6 +345,11 @@ func (e *Engine) Stop() error {
 
 	if e.connMgr != nil {
 		e.connMgr.Close()
+	}
+
+	if e.connStatePusher != nil {
+		e.connStatePusher.Stop()
+		e.connStatePusher = nil
 	}
 
 	// stopping network monitor first to avoid starting the engine again
@@ -611,6 +619,18 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 
 	e.connMgr = NewConnMgr(e.config, e.statusRecorder, e.peerStore, wgIface)
 	e.connMgr.Start(e.ctx)
+
+	// Phase 3.7i (#5989): start the per-peer connection-state pusher.
+	e.connStatePusher = newConnStatePusher(
+		&enginePushSink{engine: e},
+		&enginePeerStateSource{engine: e},
+	)
+	e.statusRecorder.SetConnStateListener(func(pubkey string, st peer.State) {
+		e.connStatePusher.OnPeerStateChange(peerStateToEvent(pubkey, st))
+	})
+	e.mgmClient.SetSnapshotRequestHandler(func(nonce uint64) {
+		e.connStatePusher.OnSnapshotRequest(nonce)
+	})
 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
 	e.srWatcher.Start(peer.IsForceRelayed())
