@@ -93,6 +93,12 @@ type State struct {
 	// counter widget to distinguish "online" from "offline" in the
 	// user-intuitive sense, independent of the login-expiration split.
 	RemoteLiveOnline bool
+	// RemoteServerLivenessKnown is the explicit "I authoritatively know
+	// this peer's liveness" marker from a phase-3.7i+ management server.
+	// Old servers leave this false and the counter falls back to its
+	// LastSeenAtServer-zero heuristic; new servers set it true so the
+	// counter trusts RemoteLiveOnline directly.
+	RemoteServerLivenessKnown bool
 }
 
 // AddRoute add a single route to routes map
@@ -457,6 +463,7 @@ type RemoteMeta struct {
 	Groups                     []string
 	LastSeenAtServer           time.Time
 	LiveOnline                 bool
+	ServerLivenessKnown        bool
 }
 
 // UpdatePeerRemoteMeta sets the RemotePeerConfig-derived fields on the
@@ -479,6 +486,7 @@ func (d *Status) UpdatePeerRemoteMeta(pubKey string, meta RemoteMeta) error {
 		st.RemoteGroups = meta.Groups
 		st.RemoteLastSeenAtServer = meta.LastSeenAtServer
 		st.RemoteLiveOnline = meta.LiveOnline
+		st.RemoteServerLivenessKnown = meta.ServerLivenessKnown
 		d.peers[pubKey] = st
 		return nil
 	}
@@ -495,6 +503,7 @@ func (d *Status) UpdatePeerRemoteMeta(pubKey string, meta RemoteMeta) error {
 			d.offlinePeers[i].RemoteGroups = meta.Groups
 			d.offlinePeers[i].RemoteLastSeenAtServer = meta.LastSeenAtServer
 			d.offlinePeers[i].RemoteLiveOnline = meta.LiveOnline
+			d.offlinePeers[i].RemoteServerLivenessKnown = meta.ServerLivenessKnown
 			return nil
 		}
 	}
@@ -585,8 +594,8 @@ func (d *Status) updatePeerICEStateLocked(receivedState State) (func(), error) {
 		return func() {}, errors.New("peer doesn't exist")
 	}
 
-	oldState := peerState.ConnStatus
-	oldIsRelayed := peerState.Relayed
+	oldSnapshot := peerState
+	oldStatus := peerState.ConnStatus
 
 	peerState.ConnStatus = receivedState.ConnStatus
 	peerState.ConnStatusUpdate = receivedState.ConnStatusUpdate
@@ -599,15 +608,12 @@ func (d *Status) updatePeerICEStateLocked(receivedState State) (func(), error) {
 
 	d.peers[receivedState.PubKey] = peerState
 
-	if hasConnStatusChanged(oldState, receivedState.ConnStatus) {
+	if hasConnStatusChanged(oldStatus, receivedState.ConnStatus) {
 		d.notifyPeerListChanged()
 	}
 
-	if hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, receivedState.Relayed) {
+	if hasMaterialICEChange(oldSnapshot, peerState) {
 		d.notifyPeerStateChangeListeners(receivedState.PubKey)
-	}
-
-	if hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, receivedState.Relayed) {
 		return d.notifyConnStateChange(receivedState.PubKey, peerState), nil
 	}
 	return func() {}, nil
@@ -631,8 +637,8 @@ func (d *Status) updatePeerRelayedStateLocked(receivedState State) (func(), erro
 		return func() {}, errors.New("peer doesn't exist")
 	}
 
-	oldState := peerState.ConnStatus
-	oldIsRelayed := peerState.Relayed
+	oldSnapshot := peerState
+	oldStatus := peerState.ConnStatus
 
 	peerState.ConnStatus = receivedState.ConnStatus
 	peerState.ConnStatusUpdate = receivedState.ConnStatusUpdate
@@ -642,15 +648,12 @@ func (d *Status) updatePeerRelayedStateLocked(receivedState State) (func(), erro
 
 	d.peers[receivedState.PubKey] = peerState
 
-	if hasConnStatusChanged(oldState, receivedState.ConnStatus) {
+	if hasConnStatusChanged(oldStatus, receivedState.ConnStatus) {
 		d.notifyPeerListChanged()
 	}
 
-	if hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, receivedState.Relayed) {
+	if hasMaterialRelayChange(oldSnapshot, peerState) {
 		d.notifyPeerStateChangeListeners(receivedState.PubKey)
-	}
-
-	if hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, receivedState.Relayed) {
 		return d.notifyConnStateChange(receivedState.PubKey, peerState), nil
 	}
 	return func() {}, nil
@@ -768,6 +771,47 @@ func hasStatusOrRelayedChange(oldConnStatus, newConnStatus ConnStatus, oldRelaye
 
 func hasConnStatusChanged(oldStatus, newStatus ConnStatus) bool {
 	return newStatus != oldStatus
+}
+
+// hasMaterialICEChange returns true when any field that the management
+// server's "endpoint flips immediate" UX promise depends on has moved.
+// Beyond the status/relayed flip already covered by hasStatusOrRelayedChange,
+// this catches:
+//   - Local/remote ICE candidate endpoint changes (NAT-traversal roaming)
+//   - Local/remote ICE candidate type changes (host -> srflx -> relay)
+//
+// Without this an in-place endpoint flip would only surface to the
+// dashboard at the next 60 s heartbeat tick.
+func hasMaterialICEChange(oldState, newState State) bool {
+	if hasStatusOrRelayedChange(oldState.ConnStatus, newState.ConnStatus, oldState.Relayed, newState.Relayed) {
+		return true
+	}
+	if oldState.LocalIceCandidateEndpoint != newState.LocalIceCandidateEndpoint {
+		return true
+	}
+	if oldState.RemoteIceCandidateEndpoint != newState.RemoteIceCandidateEndpoint {
+		return true
+	}
+	if oldState.LocalIceCandidateType != newState.LocalIceCandidateType {
+		return true
+	}
+	if oldState.RemoteIceCandidateType != newState.RemoteIceCandidateType {
+		return true
+	}
+	return false
+}
+
+// hasMaterialRelayChange returns true when relayed-state material fields
+// have changed. Beyond status/relayed, this catches relay-server flips
+// (a peer being moved to a different relay endpoint).
+func hasMaterialRelayChange(oldState, newState State) bool {
+	if hasStatusOrRelayedChange(oldState.ConnStatus, newState.ConnStatus, oldState.Relayed, newState.Relayed) {
+		return true
+	}
+	if oldState.RelayServerAddress != newState.RelayServerAddress {
+		return true
+	}
+	return false
 }
 
 // UpdatePeerFQDN update peer's state fqdn only
@@ -1202,14 +1246,20 @@ func (d *Status) GetFullStatus() FullStatus {
 	//                   check RemoteLiveOnline.
 	//
 	// Backward-compat fallback: if the management server pre-dates
-	// Phase 3.7i, RemoteLastSeenAtServer is zero AND RemoteLiveOnline is
-	// false (zero values for the never-populated proto fields). In that
-	// case we cannot tell live vs not — fall back to legacy behaviour
-	// (assume online). Only treat a peer as offline when LastSeen IS set
-	// AND LiveOnline is explicitly false.
+	// Phase 3.7i, RemoteServerLivenessKnown is false (zero value of the
+	// never-populated proto field). In that case we cannot trust
+	// LiveOnline so we fall back to the legacy heuristic: assume online
+	// unless LastSeenAtServer is set AND LiveOnline is explicitly false.
+	// Phase-3.7i+ servers set ServerLivenessKnown=true and we then trust
+	// LiveOnline directly — both for "yes online" and "no offline".
 	for _, status := range d.peers {
-		mgmtKnowsLiveness := !status.RemoteLastSeenAtServer.IsZero()
-		isLive := status.RemoteLiveOnline || !mgmtKnowsLiveness
+		var isLive bool
+		if status.RemoteServerLivenessKnown {
+			isLive = status.RemoteLiveOnline
+		} else {
+			mgmtKnowsLiveness := !status.RemoteLastSeenAtServer.IsZero()
+			isLive = status.RemoteLiveOnline || !mgmtKnowsLiveness
+		}
 		if isLive {
 			status.ServerOnline = true
 			switch {
