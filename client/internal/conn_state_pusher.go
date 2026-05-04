@@ -132,7 +132,18 @@ func (p *connStatePusher) Stop() {
 
 // OnPeerStateChange enqueues a state-change event. Non-blocking — drops
 // if the buffer is full (the next bulk tick will catch up via delta).
+//
+// Belt-and-suspenders nil-guard: the engine's listener closure already
+// nil-checks e.connStatePusher before calling, but the listener is
+// registered with the status recorder via a closure that captures `e`.
+// On daemon shutdown the listener can still fire after Engine.Stop has
+// nulled e.connStatePusher (the field is read non-atomically), and
+// at least one platform observed a SIGSEGV at this entry point. Defending
+// the receiver here is cheap and makes the lifecycle obvious.
 func (p *connStatePusher) OnPeerStateChange(ev PeerStateChangeEvent) {
+	if p == nil {
+		return
+	}
 	select {
 	case p.events <- ev:
 	default:
@@ -141,8 +152,12 @@ func (p *connStatePusher) OnPeerStateChange(ev PeerStateChangeEvent) {
 
 // OnSnapshotRequest enqueues a snapshot-request nonce. Non-blocking,
 // coalescing — multiple requests in flight result in a single full
-// snapshot with the latest nonce echoed.
+// snapshot with the latest nonce echoed. Same nil-guard rationale as
+// OnPeerStateChange.
 func (p *connStatePusher) OnSnapshotRequest(nonce uint64) {
+	if p == nil {
+		return
+	}
 	select {
 	case p.snapshotReq <- nonce:
 	default:
