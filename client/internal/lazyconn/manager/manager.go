@@ -20,6 +20,15 @@ const (
 	watcherInactivity
 )
 
+// userInitiatedAttachICECooldown bounds how often a real lazyconn activity
+// edge can drive a fresh ICE attempt while ICE backoff is suspended.
+// Phase 3.7i (#5989): user-traffic is allowed to bypass the long
+// failure-retry-suspend at most once per cooldown so a steady packet
+// stream (e.g. a VNC session) does not produce continuous SendOffer
+// storms. Tuned to half-a-minute to roughly match the 13-15 s pion ICE
+// pair-check budget plus a small grace gap.
+const userInitiatedAttachICECooldown = 30 * time.Second
+
 type watcherType int
 
 type managedPeer struct {
@@ -578,8 +587,6 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 
 	m.activateHAGroupPeers(mp.peerCfg)
 
-	m.peerStore.PeerConnOpen(m.engineCtx, mp.peerCfg.PublicKey)
-
 	// Phase 3.7i (#5989): the signal-trigger and activity-trigger paths
 	// must be symmetric. Signal-trigger goes through
 	// ConnMgr.ActivatePeer which calls conn.AttachICE for p2p-dynamic.
@@ -591,22 +598,16 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 	// every offer with "will re-attach on real traffic" — but the
 	// only re-attach path is here, so we'd loop forever.
 	//
-	// AttachICE is mode-safe: a no-op for ModeP2P / ModeP2PLazy
-	// (listener already attached via Open) and an error for
-	// ModeRelayForced (workerICE nil) which we ignore.
-	//
-	// Reset iceBackoff first (Codex review 2026-05-05): the lazy-mgr
-	// activity-listener fires on a >32-byte type-4 outbound packet to
-	// a peer that's been fully Idle (Open=false, conn closed by relay-
-	// timeout). That's the strongest possible "user wants to talk to
-	// this peer" signal -- much stronger than the existing 3-tries-then-
-	// hourly retry policy. Without the reset, a previous transient
-	// ICE failure would keep the conn relay-only for an hour even
-	// after explicit user activity. We reset ONLY here in the lazy-mgr
-	// activity path; the relay-state activity path (engine wires
-	// ActivityRecorder.OnActivity -> Conn.AttachICEOnRelayActivity) does
-	// NOT reset, deliberately respecting the failure backoff because
-	// every relay payload packet would otherwise reset it.
+	// Merge note (build/production-v2): the 0ca25fe4c base does a hard
+	// ResetIceBackoff + AttachICE + NotifyGuardActivity on every activity
+	// wake (strong "user wants this peer back" semantics). Fix #3 added a
+	// rate-limited AttachICEUserInitiated path via PeerConnOpenUserInitiated.
+	// We keep the stronger reset path here (tested in production APK), but
+	// the PeerConnOpenUserInitiated / AttachICEUserInitiated APIs are kept
+	// in the codebase as additional, more explicit hooks for callers that
+	// want the bypass-without-reset semantics.
+	m.peerStore.PeerConnOpen(m.engineCtx, mp.peerCfg.PublicKey)
+
 	if conn, ok := m.peerStore.PeerConn(mp.peerCfg.PublicKey); ok {
 		conn.ResetIceBackoff()
 		if err := conn.AttachICE(); err != nil {
