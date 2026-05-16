@@ -3,18 +3,27 @@ package peer
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	"github.com/netbirdio/netbird/client/iface/wgproxy"
+	"github.com/netbirdio/netbird/client/internal/peer/conntype"
 	"github.com/netbirdio/netbird/client/internal/peer/dispatcher"
 	"github.com/netbirdio/netbird/client/internal/peer/guard"
 	"github.com/netbirdio/netbird/client/internal/peer/ice"
+	"github.com/netbirdio/netbird/client/internal/peer/worker"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	"github.com/netbirdio/netbird/util"
 )
@@ -613,5 +622,216 @@ func TestConn_presharedKey_RosenpassManaged(t *testing.T) {
 	conn.rosenpassInitializedPresharedKeyValidator = func(peerKey string) bool { return false }
 	if k := conn.presharedKey([]byte("remote")); k == nil {
 		t.Fatalf("expected non-nil presharedKey before Rosenpass manages PSK")
+	}
+}
+
+// --- Fix #2 (Phase 3.7i): WG-handshake-watchdog endpoint fallback ----------
+
+// stubWGIface is the minimum WGIface implementation needed by the
+// endpoint-fallback tests. It only records UpdatePeer calls.
+type stubWGIface struct {
+	updatePeerCalls atomic.Int32
+	lastEndpoint    atomic.Pointer[net.UDPAddr]
+	updatePeerErr   error
+}
+
+func (s *stubWGIface) UpdatePeer(_ string, _ []netip.Prefix, _ time.Duration, endpoint *net.UDPAddr, _ *wgtypes.Key) error {
+	s.updatePeerCalls.Add(1)
+	if endpoint != nil {
+		ep := *endpoint
+		s.lastEndpoint.Store(&ep)
+	}
+	return s.updatePeerErr
+}
+func (s *stubWGIface) RemovePeer(_ string) error                            { return nil }
+func (s *stubWGIface) GetStats() (map[string]configurer.WGStats, error)     { return nil, nil }
+func (s *stubWGIface) GetProxy() wgproxy.Proxy                              { return nil }
+func (s *stubWGIface) Address() wgaddr.Address                              { return wgaddr.Address{} }
+func (s *stubWGIface) RemoveEndpointAddress(_ string) error                 { return nil }
+
+// stubRelayProxy implements wgproxy.Proxy for tests. It records Work/Pause/
+// CloseConn calls and reports a fixed EndpointAddr.
+type stubRelayProxy struct {
+	endpoint      *net.UDPAddr
+	connected     atomic.Bool
+	workCalls     atomic.Int32
+	pauseCalls    atomic.Int32
+	closeCalls    atomic.Int32
+	redirectCalls atomic.Int32
+}
+
+func newStubRelayProxy(ep *net.UDPAddr, connected bool) *stubRelayProxy {
+	p := &stubRelayProxy{endpoint: ep}
+	p.connected.Store(connected)
+	return p
+}
+
+func (p *stubRelayProxy) AddTurnConn(_ context.Context, _ *net.UDPAddr, _ net.Conn) error {
+	return nil
+}
+func (p *stubRelayProxy) EndpointAddr() *net.UDPAddr     { return p.endpoint }
+func (p *stubRelayProxy) Work()                          { p.workCalls.Add(1) }
+func (p *stubRelayProxy) Pause()                         { p.pauseCalls.Add(1) }
+func (p *stubRelayProxy) RedirectAs(_ *net.UDPAddr)      { p.redirectCalls.Add(1) }
+func (p *stubRelayProxy) CloseConn() error               { p.closeCalls.Add(1); return nil }
+func (p *stubRelayProxy) SetDisconnectListener(_ func()) {}
+
+// newOnWGDisconnectedTestConn builds a Conn primed for the onWGDisconnected
+// fallback tests:
+//   - currentConnPriority=ICEP2P so the ICE branch runs
+//   - non-nil workerICE is intentionally omitted (the production guard makes
+//     workerICE.Close() a no-op when nil; the load-bearing behaviour is the
+//     subsequent endpoint switch and backoff bookkeeping)
+//   - working endpointUpdater backed by stubWGIface
+func newOnWGDisconnectedTestConn(t *testing.T, withRelayProxy bool) (*Conn, *stubWGIface, *stubRelayProxy) {
+	t.Helper()
+	iface := &stubWGIface{}
+	wgConfig := WgConfig{
+		RemoteKey:    "remote-peer-key",
+		WgInterface:  iface,
+		AllowedIps:   []netip.Prefix{netip.MustParsePrefix("100.64.0.5/32")},
+		PreSharedKey: nil,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	c := &Conn{
+		Log:                 log.WithField("peer", "wg-disc-test"),
+		ctx:                 ctx,
+		ctxCancel:           cancel,
+		config:              ConnConfig{Key: "remote-peer-key", LocalKey: "local-key", WgConfig: wgConfig},
+		statusRelay:         worker.NewAtomicStatus(),
+		statusICE:           worker.NewAtomicStatus(),
+		currentConnPriority: conntype.ICEP2P,
+		iceBackoff:          newIceBackoff(15 * time.Minute),
+		endpointUpdater:     NewEndpointUpdater(log.WithField("peer", "wg-disc-test"), wgConfig, true),
+	}
+
+	var proxy *stubRelayProxy
+	if withRelayProxy {
+		proxy = newStubRelayProxy(&net.UDPAddr{IP: net.ParseIP("127.1.0.5"), Port: 51820}, true)
+		c.wgProxyRelay = proxy
+	}
+	return c, iface, proxy
+}
+
+// TestConn_OnWGDisconnected_ICEMode_FallbackToRelay verifies the core Fix #2
+// invariant: when the WG watchdog fires while currentConnPriority is ICE
+// and a relay proxy is up, the endpoint is explicitly redirected back to
+// the relay proxy and the failure is counted toward the ICE backoff.
+func TestConn_OnWGDisconnected_ICEMode_FallbackToRelay(t *testing.T) {
+	c, iface, proxy := newOnWGDisconnectedTestConn(t, true)
+
+	c.onWGDisconnected()
+
+	if got := iface.updatePeerCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 UpdatePeer call, got %d", got)
+	}
+	ep := iface.lastEndpoint.Load()
+	if ep == nil {
+		t.Fatal("UpdatePeer must be called with a non-nil endpoint")
+	}
+	if !ep.IP.Equal(proxy.endpoint.IP) || ep.Port != proxy.endpoint.Port {
+		t.Fatalf("UpdatePeer called with wrong endpoint: got %v want %v", ep, proxy.endpoint)
+	}
+	if got := proxy.workCalls.Load(); got != 1 {
+		t.Fatalf("relay proxy.Work() must be called exactly once, got %d", got)
+	}
+	if c.currentConnPriority != conntype.Relay {
+		t.Fatalf("currentConnPriority must switch to Relay, got %v", c.currentConnPriority)
+	}
+	snap := c.iceBackoff.Snapshot()
+	if snap.Failures != 1 {
+		t.Fatalf("ICE backoff must record exactly 1 failure, got %d", snap.Failures)
+	}
+	if !snap.Suspended {
+		t.Fatal("ICE backoff must be suspended after the failure")
+	}
+}
+
+// TestConn_OnWGDisconnected_ICEMode_NoRelayProxy: when no relay proxy is up
+// (e.g. relay-forced disabled or relay torn down), the fallback must be a
+// no-op for the endpoint switch — recovery is left to pion / Guard — but
+// the failure should still be counted.
+func TestConn_OnWGDisconnected_ICEMode_NoRelayProxy(t *testing.T) {
+	c, iface, _ := newOnWGDisconnectedTestConn(t, false)
+
+	c.onWGDisconnected()
+
+	if got := iface.updatePeerCalls.Load(); got != 0 {
+		t.Fatalf("without a relay proxy, no UpdatePeer call expected, got %d", got)
+	}
+	if c.currentConnPriority != conntype.ICEP2P {
+		// Priority is preserved because no successful relay swap occurred.
+		t.Fatalf("currentConnPriority must stay ICEP2P when no relay is up, got %v", c.currentConnPriority)
+	}
+	if c.iceBackoff.Snapshot().Failures != 1 {
+		t.Fatal("ICE backoff must still record the failure even without a relay")
+	}
+}
+
+// TestConn_OnWGDisconnected_Idempotent verifies that the load-bearing
+// helper switchEndpointToRelayLocked is safe to call twice in a row even
+// after currentConnPriority has been moved to Relay by the first call.
+// Calling onWGDisconnected() twice would re-enter the Relay branch which
+// touches subsystems (guard, statusRecorder, metricsStages, workerRelay)
+// that are not wired up in this minimal test fixture — covered by the
+// dedicated relay-disconnect tests elsewhere. The Phase-3.7i fallback
+// itself is fully covered by the switchEndpointToRelayLocked test below.
+func TestConn_OnWGDisconnected_Idempotent(t *testing.T) {
+	c, iface, proxy := newOnWGDisconnectedTestConn(t, true)
+
+	c.onWGDisconnected()
+	firstCalls := iface.updatePeerCalls.Load()
+	firstWork := proxy.workCalls.Load()
+
+	// Second invocation of just the fallback helper: currentConnPriority
+	// is now Relay so the guard inside switchEndpointToRelayLocked must
+	// short-circuit, leaving UpdatePeer and proxy.Work() untouched.
+	c.mu.Lock()
+	c.switchEndpointToRelayLocked()
+	c.mu.Unlock()
+
+	if got := iface.updatePeerCalls.Load(); got != firstCalls {
+		t.Fatalf("second fallback call must not re-issue UpdatePeer: got %d want %d", got, firstCalls)
+	}
+	if got := proxy.workCalls.Load(); got != firstWork {
+		t.Fatalf("second fallback call must not re-issue proxy.Work: got %d want %d", got, firstWork)
+	}
+}
+
+// TestConn_OnWGDisconnected_AfterCtxCancel_NoOp confirms that a stale
+// watchdog callback fired after the Conn was cancelled does not touch
+// anything.
+func TestConn_OnWGDisconnected_AfterCtxCancel_NoOp(t *testing.T) {
+	c, iface, _ := newOnWGDisconnectedTestConn(t, true)
+	c.ctxCancel()
+
+	c.onWGDisconnected()
+
+	if got := iface.updatePeerCalls.Load(); got != 0 {
+		t.Fatalf("post-cancel onWGDisconnected must be a no-op, got %d UpdatePeer calls", got)
+	}
+	if got := c.iceBackoff.Snapshot().Failures; got != 0 {
+		t.Fatalf("post-cancel onWGDisconnected must not bump failure counter, got %d", got)
+	}
+}
+
+// TestConn_SwitchEndpointToRelayLocked_NoOpWhenAlreadyOnRelay: defensive
+// guard against duplicate switches when a concurrent onICEStateDisconnected
+// already restored the relay priority.
+func TestConn_SwitchEndpointToRelayLocked_NoOpWhenAlreadyOnRelay(t *testing.T) {
+	c, iface, proxy := newOnWGDisconnectedTestConn(t, true)
+	c.currentConnPriority = conntype.Relay
+
+	c.mu.Lock()
+	c.switchEndpointToRelayLocked()
+	c.mu.Unlock()
+
+	if got := iface.updatePeerCalls.Load(); got != 0 {
+		t.Fatalf("already-on-relay path must NOT call UpdatePeer, got %d", got)
+	}
+	if got := proxy.workCalls.Load(); got != 0 {
+		t.Fatalf("already-on-relay path must NOT call proxy.Work, got %d", got)
 	}
 }
