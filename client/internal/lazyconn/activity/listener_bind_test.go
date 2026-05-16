@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/netbirdio/netbird/client/iface/bind"
 	"github.com/netbirdio/netbird/client/iface/device"
 	"github.com/netbirdio/netbird/client/iface/wgaddr"
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
@@ -38,6 +39,15 @@ func (m *mockEndpointManager) RemoveEndpoint(fakeIP netip.Addr) {
 
 func (m *mockEndpointManager) GetEndpoint(fakeIP netip.Addr) net.Conn {
 	return m.endpoints[fakeIP]
+}
+
+// ActivityRecorder satisfies the device.EndpointManager interface
+// added in the Phase-3.7i fast-path Relay->P2P wiring (Codex review
+// 2026-05-05). The mock returns nil since these tests don't exercise
+// activity-driven ICE upgrades; the engine code nil-checks the
+// recorder before subscribing.
+func (m *mockEndpointManager) ActivityRecorder() *bind.ActivityRecorder {
+	return nil
 }
 
 // MockWGIfaceBind mocks WgInterface with bind support
