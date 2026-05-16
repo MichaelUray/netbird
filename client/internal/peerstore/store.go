@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.org/x/exp/maps"
 
@@ -93,6 +94,41 @@ func (s *Store) PeerConnOpen(ctx context.Context, pubKey string) {
 		p.Log.Errorf("failed to open peer connection: %v", err)
 	}
 
+}
+
+// PeerConnOpenUserInitiated is the activity-driven counterpart of
+// PeerConnOpen. After Open succeeds it also drives a user-initiated
+// AttachICE bypass so a peer parked on the long ICE-failure backoff
+// gets a fresh ICE attempt when the user actually generates traffic.
+//
+// Phase 3.7i (#5989). userInitiatedCooldown rate-limits the bypass to
+// at most one fresh attempt per window, regardless of how many activity
+// edges fire from the lazyconn manager.
+//
+// Note (build/production-watchdog 2026-05-16): the lazyconn manager's
+// activity-trigger path on the backup base does its own hard
+// ResetIceBackoff + AttachICE + NotifyGuardActivity sequence which is
+// a superset of this bypass, so this entrypoint is currently kept for
+// API completeness / future callers and is not invoked from
+// manager.onPeerActivity.
+func (s *Store) PeerConnOpenUserInitiated(ctx context.Context, pubKey string, userInitiatedCooldown time.Duration) {
+	s.peerConnsMu.RLock()
+	defer s.peerConnsMu.RUnlock()
+
+	p, ok := s.peerConns[pubKey]
+	if !ok {
+		return
+	}
+	if err := p.Open(ctx); err != nil {
+		p.Log.Errorf("failed to open peer connection: %v", err)
+		// Even if Open returned an error (idempotent no-op when already
+		// opened still returns nil), fall through to the AttachICE path
+		// only when Open succeeded. The error path above already logged.
+		return
+	}
+	if err := p.AttachICEUserInitiated(userInitiatedCooldown); err != nil {
+		p.Log.Debugf("AttachICEUserInitiated: %v", err)
+	}
 }
 
 // PeerConnIdle is invoked by the lazy-manager when a peer's idle

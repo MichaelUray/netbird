@@ -184,6 +184,10 @@ const activityOverrideMinInterval = 5 * time.Minute
 // Phase 3.7i (#5989), Codex review 2026-05-05 point 5: "Optional
 // maximal ein sehr bewusstes 'user activity retry override' mit harter
 // Rate-Limitierung". This is that override, gated to once per 5min.
+//
+// Used by the lazyconn activity-trigger wake path (conn.go ~1200).
+// Distinct from markUserInitiatedRetry below, which is used by the
+// AttachICEUserInitiated path with its own caller-supplied cooldown.
 func (s *iceBackoffState) AllowActivityOverride() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,6 +197,43 @@ func (s *iceBackoffState) AllowActivityOverride() bool {
 	if time.Since(s.lastResetAt) < activityOverrideMinInterval {
 		return false // too soon since last reset, respect rate limit
 	}
+	return true
+}
+
+// markUserInitiatedRetry temporarily lifts the suspended gate so a single
+// AttachICEUserInitiated call can drive a fresh ICE attempt while the
+// exponential backoff is otherwise in force.
+//
+// Semantics (Phase 3.7i):
+//   - Returns false if the backoff is disabled (maxBackoff==0) or currently
+//     not suspended — callers should fall through to the normal AttachICE
+//     path in that case, no bypass was needed.
+//   - Returns true and clears s.suspended when a bypass actually happens.
+//     Failures counter and the underlying exponential schedule are NOT
+//     reset: the next markFailure picks up where the previous one left off.
+//     This is the key difference vs. Reset()/markSuccess(): we want a
+//     single targeted retry without losing the long-term backoff state
+//     for chronically broken peers.
+//
+// Coexists with AllowActivityOverride above: that path is for
+// relay-state activity wakeups (rate-limited via lastResetAt), this
+// path is for explicit user-initiated retries (rate-limited via
+// caller's minCooldown bookkeeping in conn.go).
+func (s *iceBackoffState) markUserInitiatedRetry() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxBackoff == 0 {
+		return false
+	}
+	if !s.suspended {
+		return false
+	}
+	if time.Now().After(s.nextRetry) {
+		// Naturally expired; not a true bypass but caller can proceed.
+		s.suspended = false
+		return false
+	}
+	s.suspended = false
 	return true
 }
 

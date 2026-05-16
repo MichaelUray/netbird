@@ -169,6 +169,11 @@ type Conn struct {
 	// Connection stage timestamps for metrics
 	metricsRecorder MetricsRecorder
 	metricsStages   *MetricsStages
+
+	// lastUserInitiatedAttachICE stamps the most recent successful
+	// AttachICEUserInitiated bypass so subsequent user-initiated retries
+	// within minCooldown are rate-limited. Protected by conn.mu.
+	lastUserInitiatedAttachICE time.Time
 }
 
 // NewConn creates a new not opened Conn to the remote peer.
@@ -1293,6 +1298,78 @@ func (conn *Conn) AttachICE() error {
 
 	if err := conn.handshaker.SendOffer(); err != nil {
 		conn.Log.Warnf("AttachICE: SendOffer failed: %v", err)
+	}
+	return nil
+}
+
+// AttachICEUserInitiated is the activity-driven variant of AttachICE used
+// by the lazyconn manager when an actual local Write hits the lazy fake-IP
+// endpoint (= the user is generating traffic).
+//
+// Behaviour vs AttachICE:
+//   - Backoff not suspended → identical to AttachICE.
+//   - Backoff suspended AND last user-initiated bypass < minCooldown ago →
+//     no-op (rate-limit) so repeated re-Writes do not spam fresh ICE
+//     attempts inside a single failure window.
+//   - Backoff suspended AND outside cooldown → bypass the gate ONCE via
+//     iceBackoff.markUserInitiatedRetry, log the failure-count, and run
+//     the normal attach/SendOffer path. failures counter and exponential
+//     schedule are preserved so a still-broken peer eventually falls back
+//     onto the long suspend.
+//
+// Phase 3.7i (#5989): the original hourly-retry behaviour parks a peer on
+// relay for ~1 h even while the user is actively generating traffic. This
+// path lets user activity drive at most one fresh ICE attempt per cooldown
+// without short-circuiting the failure schedule entirely.
+func (conn *Conn) AttachICEUserInitiated(minCooldown time.Duration) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	// Run the user-initiated bypass/cooldown logic BEFORE the nil-checks so
+	// that a hard-relay-forced caller path (workerICE==nil, handshaker==nil)
+	// does not accidentally short-circuit the gate accounting. The gate is
+	// the load-bearing piece of Fix #3; the nil-checks are guard-rails that
+	// only matter once we are about to actually attach.
+	bypassed := false
+	if conn.iceBackoff != nil && conn.iceBackoff.IsSuspended() {
+		now := time.Now()
+		if !conn.lastUserInitiatedAttachICE.IsZero() && now.Sub(conn.lastUserInitiatedAttachICE) < minCooldown {
+			snap := conn.iceBackoff.Snapshot()
+			conn.Log.Debugf("user-initiated AttachICE rate-limited (last attempt %s ago, cooldown %s, backoff failure #%d)",
+				now.Sub(conn.lastUserInitiatedAttachICE).Round(time.Second),
+				minCooldown,
+				snap.Failures)
+			return nil
+		}
+		// Outside cooldown: take a single bypass slot.
+		if conn.iceBackoff.markUserInitiatedRetry() {
+			snap := conn.iceBackoff.Snapshot()
+			conn.Log.Infof("ICE backoff active (failure #%d), but user-initiated activity - attempting fresh ICE",
+				snap.Failures)
+			conn.lastUserInitiatedAttachICE = now
+			bypassed = true
+		}
+	}
+
+	if conn.handshaker == nil {
+		if bypassed {
+			conn.Log.Debugf("AttachICEUserInitiated: bypass succeeded but handshaker not initialized; deferring to next signal-driven attempt")
+		}
+		return fmt.Errorf("AttachICEUserInitiated: handshaker not initialized (Open not called)")
+	}
+	if conn.workerICE == nil {
+		if bypassed {
+			conn.Log.Debugf("AttachICEUserInitiated: bypass succeeded but workerICE is nil; deferring to next signal-driven attempt")
+		}
+		return fmt.Errorf("AttachICEUserInitiated: workerICE is nil (relay-forced mode)")
+	}
+
+	if !conn.attachICEListenerLocked() {
+		return nil
+	}
+
+	if err := conn.handshaker.SendOffer(); err != nil {
+		conn.Log.Warnf("AttachICEUserInitiated: SendOffer failed: %v", err)
 	}
 	return nil
 }

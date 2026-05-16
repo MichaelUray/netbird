@@ -21,6 +21,15 @@ const (
 	watcherInactivity
 )
 
+// userInitiatedAttachICECooldown bounds how often a real lazyconn activity
+// edge can drive a fresh ICE attempt while ICE backoff is suspended.
+// Phase 3.7i (#5989): user-traffic is allowed to bypass the long
+// failure-retry-suspend at most once per cooldown so a steady packet
+// stream (e.g. a VNC session) does not produce continuous SendOffer
+// storms. Tuned to half-a-minute to roughly match the 13-15 s pion ICE
+// pair-check budget plus a small grace gap.
+const userInitiatedAttachICECooldown = 30 * time.Second
+
 type watcherType int
 
 type managedPeer struct {
@@ -608,6 +617,19 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 	// ActivityRecorder.OnActivity -> Conn.AttachICEOnRelayActivity) does
 	// NOT reset, deliberately respecting the failure backoff because
 	// every relay payload packet would otherwise reset it.
+	//
+	// Conflict-resolution 2026-05-16 (build/production-watchdog cherry-
+	// pick of 39a988548 onto backup base): the cherry-pick proposed
+	// replacing this whole block with a single
+	// PeerConnOpenUserInitiated() call that drives the rate-limited
+	// AttachICEUserInitiated bypass path (markUserInitiatedRetry). The
+	// backup base already provides the *stronger* guarantee here -
+	// hard ResetIceBackoff + AttachICE + NotifyGuardActivity - which
+	// fully covers the user-initiated case (a hard reset is a
+	// superset of a bypass). We therefore keep the backup logic for
+	// the lazyconn activity path, but still preserve the
+	// AttachICEUserInitiated / PeerConnOpenUserInitiated symbols
+	// introduced by 39a988548 for any other callers (peerstore).
 	if conn, ok := m.peerStore.PeerConn(mp.peerCfg.PublicKey); ok {
 		conn.ResetIceBackoff()
 		if err := conn.AttachICE(); err != nil {
