@@ -716,6 +716,13 @@ func (conn *Conn) handleRelayDisconnectedLocked() {
 	}
 }
 
+// RemoteEffectiveMode is the public accessor used by ConnMgr.ActivatePeer
+// to gate signal-driven wake-ups against peers the server resolved to
+// p2p-lazy. Delegates to remoteEffectiveMode.
+func (conn *Conn) RemoteEffectiveMode() connectionmode.Mode {
+	return conn.remoteEffectiveMode()
+}
+
 // remoteEffectiveMode returns the connection mode the management server
 // has resolved per-peer for the REMOTE peer (RemotePeerConfig.
 // effective_connection_mode). For peers covered by the server's
