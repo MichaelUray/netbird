@@ -86,7 +86,7 @@ func deriveFakeIP(wgIface WgInterface, allowedIPs []netip.Prefix) (netip.Addr, e
 }
 
 func (d *BindListener) setupLazyConn() error {
-	d.lazyConn = newLazyConn()
+	d.lazyConn = newLazyConnWithLabel(d.peerCfg.PublicKey)
 	d.bind.SetEndpoint(d.fakeIP, d.lazyConn)
 
 	endpoint := &net.UDPAddr{
