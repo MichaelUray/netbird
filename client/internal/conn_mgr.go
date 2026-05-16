@@ -476,26 +476,6 @@ func (e *ConnMgr) ActivatePeer(ctx context.Context, conn *peer.Conn) {
 		return
 	}
 
-	// Respect remote peer's resolved connection mode: when the server
-	// has placed the REMOTE peer in p2p-lazy (legacy clients covered by
-	// LegacyLazyFallback even when the account-wide mode is p2p-dynamic),
-	// the user expectation is strict lazy semantics — only LOCAL user
-	// traffic should ever open the tunnel. Without this gate, a legacy
-	// peer's WG keepalive or stale signal traffic wakes its own lazy
-	// manager, which sends us an unsolicited OFFER; our signal-receive
-	// then drives ActivatePeer -> Open + AttachICE and establishes a
-	// "P2P tunnel without user traffic" -- the exact symptom the user
-	// reported (12 idle P2P tunnels on initial connect).
-	//
-	// Local user traffic remains the only valid trigger: it flows through
-	// lazyconn/manager.onPeerActivity (WG-bind activity), which directly
-	// calls PeerConnOpen + AttachICE on the peer store and does NOT pass
-	// through this method.
-	if conn.RemoteEffectiveMode() == connectionmode.ModeP2PLazy {
-		conn.Log.Tracef("ActivatePeer: skip signal-driven wakeup (remote peer is p2p-lazy; only local traffic activates)")
-		return
-	}
-
 	if found := e.lazyConnMgr.ActivatePeer(conn.GetKey()); found {
 		if err := conn.Open(ctx); err != nil {
 			conn.Log.Errorf("failed to open connection: %v", err)
