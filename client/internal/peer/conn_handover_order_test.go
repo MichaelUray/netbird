@@ -85,6 +85,39 @@ func TestConn_OnGuardEvent_SkipOfferGatedOnEverConnected(t *testing.T) {
 	}
 }
 
+// Codex follow-up regression: onGuardEvent must skip emitting OFFERs
+// when the management server has resolved the REMOTE peer to p2p-lazy
+// (legacy clients covered by LegacyLazyFallback even when the account-
+// wide mode is p2p-dynamic). Without that gate, the local dynamic
+// client bootstraps eager P2P tunnels to dozens of lazy legacy peers
+// the user is not actively communicating with — defeating the lazy
+// semantics that the server explicitly asked us to honor for that peer.
+// Caught after the 13-idle-P2P-tunnels report on 2026-05-16.
+func TestConn_OnGuardEvent_SkipOfferForRemoteLazy(t *testing.T) {
+	src, err := os.ReadFile("conn.go")
+	if err != nil {
+		t.Fatalf("read conn.go: %v", err)
+	}
+	body := extractFunctionBody(t, string(src), "onGuardEvent")
+	const modeCheck = "remoteEffectiveMode() == connectionmode.ModeP2PLazy"
+	const skipTrace = "skip offer (remote peer is p2p-lazy"
+	if !strings.Contains(body, modeCheck) {
+		t.Fatalf("onGuardEvent missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", modeCheck)
+	}
+	if !strings.Contains(body, skipTrace) {
+		t.Fatalf("onGuardEvent missing %q trace — remote p2p-lazy gate trace landmark is gone", skipTrace)
+	}
+	// The gate MUST be the first non-comment guard in onGuardEvent so it
+	// applies before the local-mode-only carve-outs. Verify it appears
+	// before the existing "RemoteServerLivenessKnown" guard which is the
+	// next pre-existing exit branch.
+	idxMode := strings.Index(body, modeCheck)
+	idxLiveness := strings.Index(body, "RemoteServerLivenessKnown")
+	if idxLiveness >= 0 && idxMode > idxLiveness {
+		t.Errorf("remote-lazy gate must appear BEFORE the live-online gate (got %d > %d)", idxMode, idxLiveness)
+	}
+}
+
 // Codex follow-up regression: onWGDisconnected MUST invoke
 // onWGTimeoutRecover after closing the active worker — without it,
 // the peer is stuck in "Connecting" forever because lazy mgr keeps
