@@ -782,10 +782,41 @@ func (conn *Conn) onWGDisconnected() {
 	// Close the active connection based on current priority
 	switch conn.currentConnPriority {
 	case conntype.Relay:
-		conn.workerRelay.CloseConn()
+		if conn.workerRelay != nil {
+			conn.workerRelay.CloseConn()
+		}
 		conn.handleRelayDisconnectedLocked()
 	case conntype.ICEP2P, conntype.ICETurn:
-		conn.workerICE.Close()
+		if conn.workerICE != nil {
+			conn.workerICE.Close()
+		}
+
+		// Phase 3.7i (#5989): pion's ICE state-change handler does not
+		// always re-program the WG endpoint after a handshake timeout —
+		// observed in the field as a peer staying configured with the
+		// stale direct public IP (e.g. 64.52.21.35:55699) while WG
+		// silently drops every outgoing packet. Explicitly redirect the
+		// endpoint to the still-up relay proxy so traffic keeps flowing
+		// while ICE renegotiates from scratch.
+		//
+		// Also marks markFailure on the backoff: a WG-handshake-timeout
+		// after pion reported ICE Connected IS a real connection
+		// failure that should count toward the long-retry schedule.
+		conn.switchEndpointToRelayLocked()
+
+		if conn.iceBackoff != nil {
+			delay := conn.iceBackoff.markFailure()
+			snap := conn.iceBackoff.Snapshot()
+			if delay > 0 {
+				conn.Log.Infof("WG-handshake-timeout counted as ICE failure #%d, suspending for %s, next retry at %s",
+					snap.Failures,
+					delay.Round(time.Second),
+					snap.NextRetry.Format("15:04:05"))
+			}
+			if conn.statusRecorder != nil {
+				conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, snap)
+			}
+		}
 	default:
 		conn.Log.Debugf("No active connection to close on WG timeout")
 	}
@@ -801,6 +832,39 @@ func (conn *Conn) onWGDisconnected() {
 	if cb != nil {
 		go cb()
 	}
+}
+
+// switchEndpointToRelayLocked redirects the WG endpoint back to the
+// already-running relay proxy when an ICE-priority connection has just
+// been torn down by the WG-handshake watchdog. Caller MUST hold conn.mu.
+//
+// No-op when no relay proxy is up — that path leaves recovery to the
+// pion ICE state-change handler / Guard reconnect-loop.
+//
+// Mirrors the relay-fallback half of onICEStateDisconnected (where
+// isReadyToUpgrade() is true) but without the sessionChanged / status
+// bookkeeping that path needs for an ICE-graceful close.
+func (conn *Conn) switchEndpointToRelayLocked() {
+	if conn.wgProxyRelay == nil {
+		conn.Log.Debugf("WG-handshake-timeout on ICE: no relay proxy up, leaving recovery to pion")
+		return
+	}
+	if conn.currentConnPriority == conntype.Relay {
+		// Already on relay (e.g. a concurrent onICEStateDisconnected
+		// already swapped). Nothing to do.
+		return
+	}
+
+	conn.Log.Infof("WG-handshake-timeout on ICE - explicit fallback to relay endpoint %s", conn.wgProxyRelay.EndpointAddr().String())
+	conn.wgProxyRelay.Work()
+
+	presharedKey := conn.presharedKey(conn.rosenpassRemoteKey)
+	if err := conn.endpointUpdater.SwitchWGEndpoint(conn.wgProxyRelay.EndpointAddr(), presharedKey); err != nil {
+		conn.Log.Errorf("WG-handshake-timeout fallback: SwitchWGEndpoint to relay failed: %v", err)
+		return
+	}
+
+	conn.currentConnPriority = conntype.Relay
 }
 
 func (conn *Conn) updateRelayStatus(relayServerAddr string, rosenpassPubKey []byte, updateTime time.Time) {
