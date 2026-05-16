@@ -196,6 +196,44 @@ func (s *iceBackoffState) AllowActivityOverride() bool {
 	return true
 }
 
+// markUserInitiatedRetry temporarily lifts the suspended gate so a single
+// AttachICEUserInitiated call can drive a fresh ICE attempt while the
+// exponential backoff is otherwise in force.
+//
+// Semantics (Phase 3.7i):
+//   - Returns false if the backoff is disabled (maxBackoff==0) or currently
+//     not suspended — callers should fall through to the normal AttachICE
+//     path in that case, no bypass was needed.
+//   - Returns true and clears s.suspended when a bypass actually happens.
+//     Failures counter and the underlying exponential schedule are NOT
+//     reset: the next markFailure picks up where the previous one left off.
+//     This is the key difference vs. Reset()/markSuccess(): we want a
+//     single targeted retry without losing the long-term backoff state
+//     for chronically broken peers.
+//
+// Merge note (build/production-v2): coexists with AllowActivityOverride
+// above. AllowActivityOverride is the relay-state activity path (5min
+// gate, caller expected to call Reset() to fully clear). markUserInitiated
+// Retry is the user-traffic / AttachICEUserInitiated path (per-call
+// cooldown on conn.go, schedule preserved).
+func (s *iceBackoffState) markUserInitiatedRetry() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxBackoff == 0 {
+		return false
+	}
+	if !s.suspended {
+		return false
+	}
+	if time.Now().After(s.nextRetry) {
+		// Naturally expired; not a true bypass but caller can proceed.
+		s.suspended = false
+		return false
+	}
+	s.suspended = false
+	return true
+}
+
 // SetMaxBackoff updates the cap. Called from ConnMgr.UpdatedRemotePeerConfig
 // when the server pushes a new value. Rebuilds the internal backoff with
 // the new schedule but preserves the failure counter.
