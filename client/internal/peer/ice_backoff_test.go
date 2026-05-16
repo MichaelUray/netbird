@@ -163,6 +163,70 @@ func TestIceBackoff_NoGraceWithoutReset(t *testing.T) {
 	}
 }
 
+// TestIceBackoff_MarkUserInitiatedRetry_DisabledNoBypass ensures a 0-cap
+// backoff (= disabled) never reports a successful bypass, mirroring the
+// rest of the state-machine's disabled-mode contract.
+func TestIceBackoff_MarkUserInitiatedRetry_DisabledNoBypass(t *testing.T) {
+	s := newIceBackoff(0)
+	if s.markUserInitiatedRetry() {
+		t.Fatal("disabled backoff must not report a bypass")
+	}
+}
+
+// TestIceBackoff_MarkUserInitiatedRetry_NotSuspendedNoBypass: when the
+// backoff is not currently suspended there is nothing to bypass.
+func TestIceBackoff_MarkUserInitiatedRetry_NotSuspendedNoBypass(t *testing.T) {
+	s := newIceBackoff(15 * time.Minute)
+	if s.markUserInitiatedRetry() {
+		t.Fatal("non-suspended backoff must not report a bypass")
+	}
+}
+
+// TestIceBackoff_MarkUserInitiatedRetry_ExpiredNoBypass: when the suspend
+// already elapsed naturally, mark the gate as un-suspended but report
+// false because no real bypass was needed.
+func TestIceBackoff_MarkUserInitiatedRetry_ExpiredNoBypass(t *testing.T) {
+	s := newIceBackoff(15 * time.Minute)
+	s.markFailure()
+	s.mu.Lock()
+	s.nextRetry = time.Now().Add(-1 * time.Second)
+	s.mu.Unlock()
+
+	if s.markUserInitiatedRetry() {
+		t.Fatal("expired suspend must not count as a bypass")
+	}
+	if s.IsSuspended() {
+		t.Fatal("after markUserInitiatedRetry on expired suspend, must report not suspended")
+	}
+}
+
+// TestIceBackoff_MarkUserInitiatedRetry_SuspendedBypassPreservesFailures:
+// the core invariant — bypassing the suspend gate must not roll back the
+// failure counter or the exponential schedule.
+func TestIceBackoff_MarkUserInitiatedRetry_SuspendedBypassPreservesFailures(t *testing.T) {
+	s := newIceBackoff(15 * time.Minute)
+	for i := 0; i < 3; i++ {
+		s.markFailure()
+	}
+	priorFailures := s.Snapshot().Failures
+
+	if !s.markUserInitiatedRetry() {
+		t.Fatal("suspended backoff with future nextRetry must report bypass=true")
+	}
+	if s.IsSuspended() {
+		t.Fatal("after bypass, IsSuspended must be false")
+	}
+	if got := s.Snapshot().Failures; got != priorFailures {
+		t.Fatalf("bypass must NOT reset failures counter, got %d want %d", got, priorFailures)
+	}
+	// Next markFailure must keep climbing the existing exponential schedule
+	// (3 failures already past the ~1m+~2m+~4m steps -> ~8m next).
+	d := s.markFailure()
+	if d < 5*time.Minute {
+		t.Fatalf("post-bypass markFailure must follow existing schedule (>=5m for 4th failure), got %v", d)
+	}
+}
+
 func TestIceBackoff_FirstFailure(t *testing.T) {
 	s := newIceBackoff(15 * time.Minute)
 	delay := s.markFailure()

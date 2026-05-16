@@ -383,6 +383,184 @@ func TestConn_AttachICE_AfterBackoffExpiry(t *testing.T) {
 	}
 }
 
+// TestConn_AttachICE_NoOpWhenSuspended_RegressionForBackoffSchedule confirms
+// that the plain AttachICE entry point continues to honour the suspend gate
+// without any bypass — this is the regression-fence for Fix #3 so the long
+// failure-retry schedule still parks non-user paths on relay.
+func TestConn_AttachICE_NoOpWhenSuspended_RegressionForBackoffSchedule(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+		iceBackoff: newIceBackoff(15 * time.Minute),
+	}
+	// Three failures => firmly inside the exponential suspend window.
+	c.iceBackoff.markFailure()
+	c.iceBackoff.markFailure()
+	c.iceBackoff.markFailure()
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("precondition: must be suspended after 3 failures")
+	}
+
+	if err := c.AttachICE(); err != nil {
+		t.Fatalf("AttachICE during suspend must return nil, got %v", err)
+	}
+	if c.handshaker.readICEListener() != nil {
+		t.Fatal("AttachICE during suspend MUST NOT attach a listener")
+	}
+	if c.iceBackoff.IsSuspended() != true {
+		t.Fatal("AttachICE must not clear the suspend gate")
+	}
+}
+
+// TestConn_AttachICEUserInitiated_NilHandshaker verifies error-path symmetry
+// with AttachICE.
+func TestConn_AttachICEUserInitiated_NilHandshaker(t *testing.T) {
+	c := &Conn{Log: log.WithField("peer", "test")}
+	if err := c.AttachICEUserInitiated(30 * time.Second); err == nil {
+		t.Fatal("AttachICEUserInitiated with nil handshaker should error")
+	}
+}
+
+// TestConn_AttachICEUserInitiated_NilWorkerICE: relay-forced mode must still
+// reject the user-initiated path with a clear error.
+func TestConn_AttachICEUserInitiated_NilWorkerICE(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+	}
+	if err := c.AttachICEUserInitiated(30 * time.Second); err == nil {
+		t.Fatal("AttachICEUserInitiated with nil workerICE should error (relay-forced)")
+	}
+}
+
+// TestConn_AttachICEUserInitiated_FirstBypassClearsSuspend simulates the
+// real Phase-3.7i scenario: backoff suspended (failure #3, hourly retry),
+// user-initiated activity attempts a bypass. Because workerICE is nil
+// here we cannot drive the full listener-attach path, but we can verify
+// the backoff gate flipped and lastUserInitiatedAttachICE was stamped.
+func TestConn_AttachICEUserInitiated_FirstBypassClearsSuspend(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+		iceBackoff: newIceBackoff(60 * time.Minute), // generous cap so we stay suspended
+	}
+	for i := 0; i < 3; i++ {
+		c.iceBackoff.markFailure()
+	}
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("precondition: suspended after 3 failures")
+	}
+	priorFailures := c.iceBackoff.Snapshot().Failures
+
+	// nil workerICE => the post-bypass attach path returns an error,
+	// which is fine: we only assert the bypass *side-effects*.
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+
+	if c.iceBackoff.IsSuspended() {
+		t.Fatal("after user-initiated bypass, backoff must not be suspended")
+	}
+	if got := c.iceBackoff.Snapshot().Failures; got != priorFailures {
+		t.Fatalf("user-initiated bypass MUST NOT reset failures counter, got %d want %d", got, priorFailures)
+	}
+	if c.lastUserInitiatedAttachICE.IsZero() {
+		t.Fatal("lastUserInitiatedAttachICE must be stamped after a real bypass")
+	}
+}
+
+// TestConn_AttachICEUserInitiated_CooldownBlocksSecondCall: a second call
+// within the cooldown window must be a no-op.
+func TestConn_AttachICEUserInitiated_CooldownBlocksSecondCall(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+		iceBackoff: newIceBackoff(60 * time.Minute),
+	}
+	for i := 0; i < 3; i++ {
+		c.iceBackoff.markFailure()
+	}
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+	first := c.lastUserInitiatedAttachICE
+	if first.IsZero() {
+		t.Fatal("first call must stamp lastUserInitiatedAttachICE")
+	}
+	// Re-suspend so the cooldown path is exercised (not the not-suspended
+	// short-circuit). The real flow does this via a fresh markFailure().
+	c.iceBackoff.markFailure()
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("precondition: re-suspended after extra failure")
+	}
+
+	// Second call inside cooldown — must NOT touch the suspend gate.
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("second call inside cooldown must leave backoff suspended")
+	}
+	if !c.lastUserInitiatedAttachICE.Equal(first) {
+		t.Fatal("second call inside cooldown must NOT re-stamp lastUserInitiatedAttachICE")
+	}
+}
+
+// TestConn_AttachICEUserInitiated_CooldownExpiredAllowsBypass: after the
+// cooldown lapses a fresh bypass goes through.
+func TestConn_AttachICEUserInitiated_CooldownExpiredAllowsBypass(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+		iceBackoff: newIceBackoff(60 * time.Minute),
+	}
+	for i := 0; i < 3; i++ {
+		c.iceBackoff.markFailure()
+	}
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+	// Synthetically age the stamp past the cooldown.
+	c.mu.Lock()
+	c.lastUserInitiatedAttachICE = time.Now().Add(-45 * time.Second)
+	c.mu.Unlock()
+
+	// Re-suspend so the gate is active again.
+	c.iceBackoff.markFailure()
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("precondition: re-suspended")
+	}
+	priorFailures := c.iceBackoff.Snapshot().Failures
+
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+
+	if c.iceBackoff.IsSuspended() {
+		t.Fatal("after cooldown expired, user-initiated bypass must run again")
+	}
+	if got := c.iceBackoff.Snapshot().Failures; got != priorFailures {
+		t.Fatalf("failures counter must be preserved across bypasses, got %d want %d", got, priorFailures)
+	}
+}
+
+// TestConn_AttachICEUserInitiated_AfterFailure_FailuresCounterIncrements:
+// once the bypass leads to a fresh attempt that ALSO fails, the failure
+// counter must keep climbing — not get rolled back by the bypass.
+func TestConn_AttachICEUserInitiated_AfterFailure_FailuresCounterIncrements(t *testing.T) {
+	c := &Conn{
+		Log:        log.WithField("peer", "test"),
+		handshaker: &Handshaker{},
+		iceBackoff: newIceBackoff(60 * time.Minute),
+	}
+	for i := 0; i < 3; i++ {
+		c.iceBackoff.markFailure()
+	}
+	preBypass := c.iceBackoff.Snapshot().Failures
+
+	_ = c.AttachICEUserInitiated(30 * time.Second)
+	// pion would normally drive onICEFailed; emulate it directly.
+	c.onICEFailed()
+
+	if got := c.iceBackoff.Snapshot().Failures; got != preBypass+1 {
+		t.Fatalf("post-bypass failure must increment counter: got %d want %d", got, preBypass+1)
+	}
+	if !c.iceBackoff.IsSuspended() {
+		t.Fatal("post-bypass failure must re-suspend the backoff")
+	}
+}
+
 func TestConn_OnICEFailed_MarksBackoffFailure(t *testing.T) {
 	c := &Conn{
 		Log:        log.WithField("peer", "test"),

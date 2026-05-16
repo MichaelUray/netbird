@@ -20,6 +20,15 @@ const (
 	watcherInactivity
 )
 
+// userInitiatedAttachICECooldown bounds how often a real lazyconn activity
+// edge can drive a fresh ICE attempt while ICE backoff is suspended.
+// Phase 3.7i (#5989): user-traffic is allowed to bypass the long
+// failure-retry-suspend at most once per cooldown so a steady packet
+// stream (e.g. a VNC session) does not produce continuous SendOffer
+// storms. Tuned to half-a-minute to roughly match the 13-15 s pion ICE
+// pair-check budget plus a small grace gap.
+const userInitiatedAttachICECooldown = 30 * time.Second
+
 type watcherType int
 
 type managedPeer struct {
@@ -578,7 +587,12 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 
 	m.activateHAGroupPeers(mp.peerCfg)
 
-	m.peerStore.PeerConnOpen(m.engineCtx, mp.peerCfg.PublicKey)
+	// Real lazyconn activity edge = local user traffic. Drive a user-
+	// initiated AttachICE so a peer parked on the long ICE failure
+	// backoff still gets a fresh attempt while data is flowing.
+	// PeerConnOpen path is preserved for non-dynamic modes via the
+	// embedded p.Open() call inside PeerConnOpenUserInitiated.
+	m.peerStore.PeerConnOpenUserInitiated(m.engineCtx, mp.peerCfg.PublicKey, userInitiatedAttachICECooldown)
 }
 
 func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
