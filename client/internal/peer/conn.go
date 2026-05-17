@@ -747,18 +747,28 @@ func (conn *Conn) onGuardEvent() {
 	// server has placed the REMOTE peer in p2p-lazy (typical for legacy
 	// clients covered by LegacyLazyFallback even though the account-wide
 	// mode is p2p-dynamic), it expects strict lazy semantics — i.e. no
-	// unsolicited offers from us. The remote will signal an OFFER on its
-	// own when its local WG-bind sees user traffic; we don't need (and
-	// shouldn't) bootstrap the tunnel. Skipping here prevents the eager
-	// initial P2P establishment to dozens of legacy peers that the user
-	// never actually communicates with.
+	// unsolicited initial offers from us. Skipping here prevents the
+	// eager initial P2P establishment to dozens of legacy peers that
+	// the user never actually communicates with.
+	//
+	// CRITICAL gate on everConnected: skip ONLY on the BOOTSTRAP case
+	// (peer never connected yet). For peers that WERE connected and
+	// then lost their relay/ICE path (network change, signal/relay
+	// reconnect, daemon resume from standby), the guard MUST still
+	// send recovery OFFERs — otherwise the tunnel stays cold forever
+	// because (a) the local activity-listener is inactive for already-
+	// opened conns and (b) the legacy remote won't re-initiate on its
+	// own either. Discovered 2026-05-17: S26 had 23 idle / 5 offline
+	// after overnight standby; relay reconnected at 06:18 but every
+	// guard fire was silently skipped here, leaving every legacy peer
+	// unable to recover.
 	//
 	// Note: we still respect remote-initiated OFFERs via the signal-
 	// receive path (engine.go -> ConnMgr.ActivatePeer is NOT gated on
 	// this), and we still bootstrap when local user traffic triggers
 	// the local lazy manager (manager.onPeerActivity -> AttachICE).
-	if conn.remoteEffectiveMode() == connectionmode.ModeP2PLazy {
-		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy; wait for remote OFFER or local activity)")
+	if conn.remoteEffectiveMode() == connectionmode.ModeP2PLazy && !conn.everConnected.Load() {
+		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy AND never connected; wait for remote OFFER or local activity)")
 		return
 	}
 
