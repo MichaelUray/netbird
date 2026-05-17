@@ -100,9 +100,18 @@ func TestConn_OnGuardEvent_SkipOfferForRemoteLazy(t *testing.T) {
 	}
 	body := extractFunctionBody(t, string(src), "onGuardEvent")
 	const modeCheck = "remoteEffectiveMode() == connectionmode.ModeP2PLazy"
+	const everConnectedGate = "!conn.everConnected.Load()"
 	const skipTrace = "skip offer (remote peer is p2p-lazy"
 	if !strings.Contains(body, modeCheck) {
 		t.Fatalf("onGuardEvent missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", modeCheck)
+	}
+	// The everConnected gate is REQUIRED so the guard does not silently
+	// suppress recovery offers for peers that already had a tunnel and
+	// then lost it (relay reconnect, network change, daemon resume from
+	// standby). Without this, post-standby S26 was stuck with all legacy
+	// peers in idle/disconnected forever — 2026-05-17 regression.
+	if !strings.Contains(body, everConnectedGate) {
+		t.Fatalf("onGuardEvent missing %q in p2p-lazy gate — recovery after relay/ICE reconnect will be silently suppressed for any peer that was once connected", everConnectedGate)
 	}
 	if !strings.Contains(body, skipTrace) {
 		t.Fatalf("onGuardEvent missing %q trace — remote p2p-lazy gate trace landmark is gone", skipTrace)
