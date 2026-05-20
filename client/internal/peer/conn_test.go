@@ -835,3 +835,69 @@ func TestConn_SwitchEndpointToRelayLocked_NoOpWhenAlreadyOnRelay(t *testing.T) {
 		t.Fatalf("already-on-relay path must NOT call proxy.Work, got %d", got)
 	}
 }
+
+// initIceBackoffFromConfig must read conn.config.P2pRetryMaxSeconds
+// through ResolveP2pRetryCap. Regression for the v0.2/v0.3 plan gap
+// where the test only checked the helper's arithmetic, not the call
+// site -- which is where the original bug lived (Conn.Open multiplying
+// the raw uint32 by time.Second and producing a ~136-year cap on
+// the sentinel input).
+func TestConn_InitIceBackoffFromConfig_SentinelDisables(t *testing.T) {
+	swWatcher := guard.NewSRWatcher(nil, nil, nil, connConf.ICEConfig)
+	sd := ServiceDependencies{
+		StatusRecorder:     NewRecorder("https://mgm"),
+		SrWatcher:          swWatcher,
+		PeerConnDispatcher: testDispatcher,
+	}
+	cfg := connConf
+	cfg.P2pRetryMaxSeconds = SentinelP2pRetryDisabled
+	cfg.WgConfig = WgConfig{
+		RemoteKey:   "remote-peer-key",
+		WgInterface: &stubWGIface{},
+		AllowedIps:  []netip.Prefix{netip.MustParsePrefix("100.64.0.5/32")},
+	}
+
+	conn, err := NewConn(cfg, sd)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+
+	conn.initIceBackoffFromConfig()
+	if conn.iceBackoff == nil {
+		t.Fatal("iceBackoff not initialized")
+	}
+	if got := conn.iceBackoff.maxBackoff; got != 0 {
+		t.Fatalf("maxBackoff = %v, want 0 (disabled)", got)
+	}
+	if delay := conn.iceBackoff.markFailure(); delay != 0 {
+		t.Fatalf("markFailure on disabled backoff returned %v, want 0", delay)
+	}
+}
+
+// Normal non-zero, non-sentinel value: the cap must equal
+// time.Duration(seconds)*time.Second.
+func TestConn_InitIceBackoffFromConfig_NormalValue(t *testing.T) {
+	swWatcher := guard.NewSRWatcher(nil, nil, nil, connConf.ICEConfig)
+	sd := ServiceDependencies{
+		StatusRecorder:     NewRecorder("https://mgm"),
+		SrWatcher:          swWatcher,
+		PeerConnDispatcher: testDispatcher,
+	}
+	cfg := connConf
+	cfg.P2pRetryMaxSeconds = 600
+	cfg.WgConfig = WgConfig{
+		RemoteKey:   "remote-peer-key",
+		WgInterface: &stubWGIface{},
+		AllowedIps:  []netip.Prefix{netip.MustParsePrefix("100.64.0.5/32")},
+	}
+
+	conn, err := NewConn(cfg, sd)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+
+	conn.initIceBackoffFromConfig()
+	if got := conn.iceBackoff.maxBackoff; got != 10*time.Minute {
+		t.Fatalf("maxBackoff = %v, want 10m", got)
+	}
+}
