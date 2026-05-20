@@ -197,6 +197,29 @@ func modeUsesLazyMgr(m connectionmode.Mode) bool {
 	return m == connectionmode.ModeP2PLazy || m == connectionmode.ModeP2PDynamic
 }
 
+// shouldRestartLazyMgr returns true when an incoming mgmt push changes
+// any value the inactivity.Manager bakes in at construction time and
+// has no setter for. Mode change or relay/p2p timeout change qualify.
+//
+// p2pRetryMaxSecs is deliberately excluded: it's the per-Conn
+// ICE-backoff cap, propagated live to every active *peer.Conn via
+// propagateP2pRetryMaxToConns -> SetIceBackoffMax. Restarting the
+// inactivity manager on a retry-max push would force
+// resetPeersToLazyIdle and kick every tunnel back to idle for no
+// functional gain.
+func shouldRestartLazyMgr(prevMode, newMode connectionmode.Mode, prevRelay, newRelay, prevP2P, newP2P uint32) bool {
+	if prevMode != newMode {
+		return true
+	}
+	if prevRelay != newRelay {
+		return true
+	}
+	if prevP2P != newP2P {
+		return true
+	}
+	return false
+}
+
 // startModeSideEffects flips the per-mode goroutines and status flags
 // that need to follow a successful initLazyManager. Called by Start()
 // and by the management-push transition path.
@@ -284,6 +307,8 @@ func (e *ConnMgr) UpdatedRemotePeerConfig(ctx context.Context, pc *mgmProto.Peer
 		return nil
 	}
 	prev := e.mode
+	prevRelay := e.relayTimeoutSecs
+	prevP2P := e.p2pTimeoutSecs
 	e.mode = newMode
 	e.relayTimeoutSecs = newRelay
 	e.p2pTimeoutSecs = newP2P
@@ -301,10 +326,9 @@ func (e *ConnMgr) UpdatedRemotePeerConfig(ctx context.Context, pc *mgmProto.Peer
 		return nil
 	}
 
-	if modeChanged && wasManaged && isManaged {
-		// Switching between lazy and dynamic at runtime: tear down the
-		// existing manager so initLazyManager picks up the new timeouts.
-		log.Infof("lazy/dynamic mode change %s -> %s, restarting manager", prev, newMode)
+	if wasManaged && isManaged && shouldRestartLazyMgr(prev, newMode, prevRelay, newRelay, prevP2P, newP2P) {
+		log.Infof("lazy/dynamic manager restart: mode %s->%s relay=%d p2p=%d",
+			prev, newMode, newRelay, newP2P)
 		e.closeManager(ctx)
 		e.statusRecorder.UpdateLazyConnection(false)
 	}
