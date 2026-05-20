@@ -634,20 +634,11 @@ func (e *ConnMgr) initLazyManager(engineCtx context.Context) {
 }
 
 // propagateP2pRetryMaxToConns iterates all active Conn instances and
-// updates their iceBackoff.SetMaxBackoff. Called when the server pushes
-// a new value via UpdatedRemotePeerConfig. Phase 3 of #5989.
+// updates their iceBackoff.SetMaxBackoff via the canonical wire-format
+// translation in peer.ResolveP2pRetryCap. Single source of truth shared
+// with (*peer.Conn).initIceBackoffFromConfig. Phase 3 of #5989.
 func (e *ConnMgr) propagateP2pRetryMaxToConns() {
-	const sentinelDisabled = ^uint32(0)
-	v := e.p2pRetryMaxSecs
-	var d time.Duration
-	switch {
-	case v == sentinelDisabled:
-		d = 0 // user-explicit disable
-	case v == 0:
-		d = peer.DefaultP2PRetryMax // server NULL -> use daemon default
-	default:
-		d = time.Duration(v) * time.Second
-	}
+	d := peer.ResolveP2pRetryCap(e.p2pRetryMaxSecs)
 	for _, peerKey := range e.peerStore.PeersPubKey() {
 		if conn, ok := e.peerStore.PeerConn(peerKey); ok {
 			conn.SetIceBackoffMax(d)

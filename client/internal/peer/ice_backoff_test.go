@@ -344,3 +344,36 @@ func TestIceBackoff_FirstFailure(t *testing.T) {
 		t.Fatalf("snapshot wrong: %+v", snap)
 	}
 }
+
+// TestResolveP2pRetryCap covers the wire-format -> time.Duration
+// translation for ICE-backoff cap. Single source of truth shared by
+// Conn.initIceBackoffFromConfig and ConnMgr.propagateP2pRetryMaxToConns.
+func TestResolveP2pRetryCap(t *testing.T) {
+	cases := []struct {
+		name string
+		in   uint32
+		want time.Duration
+	}{
+		{"sentinel/user-explicit-disable", SentinelP2pRetryDisabled, 0},
+		{"zero/use-daemon-default", 0, DefaultP2PRetryMax},
+		{"sixty-seconds", 60, time.Minute},
+		{"one-hour", 3600, time.Hour},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ResolveP2pRetryCap(c.in); got != c.want {
+				t.Fatalf("ResolveP2pRetryCap(%d) = %v, want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// The disabled semantic at ice_backoff.go markFailure (maxBackoff == 0
+// short-circuits to a 0 delay) is what we rely on the helper to feed.
+func TestResolveP2pRetryCap_SentinelMakesBackoffDisabled(t *testing.T) {
+	d := ResolveP2pRetryCap(SentinelP2pRetryDisabled)
+	bo := newIceBackoff(d)
+	if delay := bo.markFailure(); delay != 0 {
+		t.Fatalf("disabled backoff returned non-zero delay: %v", delay)
+	}
+}

@@ -224,17 +224,11 @@ func (conn *Conn) Open(engineCtx context.Context) error {
 
 	conn.workerRelay = NewWorkerRelay(conn.ctx, conn.Log, isController(conn.config), conn.config, conn, conn.relayManager)
 
-	// Phase 3: initialize per-peer ICE-failure backoff. The cap comes
-	// from the resolved P2pRetryMaxSeconds. 0 means "use built-in default".
-	backoffCap := time.Duration(conn.config.P2pRetryMaxSeconds) * time.Second
-	if backoffCap == 0 {
-		backoffCap = DefaultP2PRetryMax
-	}
-	if conn.iceBackoff == nil {
-		conn.iceBackoff = newIceBackoff(backoffCap)
-	} else {
-		conn.iceBackoff.SetMaxBackoff(backoffCap)
-	}
+	// Phase 3: initialize per-peer ICE-failure backoff. The cap goes
+	// through ResolveP2pRetryCap so the wire-format sentinel
+	// (^uint32(0) = user-explicit-disable) and the zero-means-default
+	// case stay consistent with ConnMgr.propagateP2pRetryMaxToConns.
+	conn.initIceBackoffFromConfig()
 
 	// Mode-driven branching. ModeRelayForced skips ICE entirely; all
 	// other modes (P2P, P2PLazy, P2PDynamic) construct workerICE
@@ -1614,6 +1608,22 @@ func (conn *Conn) onICEConnected() {
 	conn.iceBackoff.markSuccess()
 	if conn.statusRecorder != nil {
 		conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, conn.iceBackoff.Snapshot())
+	}
+}
+
+// initIceBackoffFromConfig (re-)initializes conn.iceBackoff from
+// conn.config.P2pRetryMaxSeconds via the canonical wire-format
+// translation in ResolveP2pRetryCap. Called from Open() on a fresh
+// peer; extracted so the call site can be unit-tested in isolation.
+//
+// Callers must hold conn.mu (Open holds it implicitly via its
+// caller).
+func (conn *Conn) initIceBackoffFromConfig() {
+	cap := ResolveP2pRetryCap(conn.config.P2pRetryMaxSeconds)
+	if conn.iceBackoff == nil {
+		conn.iceBackoff = newIceBackoff(cap)
+	} else {
+		conn.iceBackoff.SetMaxBackoff(cap)
 	}
 }
 
