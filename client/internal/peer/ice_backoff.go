@@ -7,6 +7,29 @@ import (
 	"github.com/cenkalti/backoff/v4"
 )
 
+// SentinelP2pRetryDisabled is the wire-format value (== ^uint32(0))
+// that means "user-explicit disable" for the ICE-failure backoff cap.
+// Translated to time.Duration(0) at the daemon boundary, which is the
+// existing "backoff disabled" semantic checked by markFailure /
+// markUserInitiatedRetry.
+const SentinelP2pRetryDisabled uint32 = ^uint32(0)
+
+// ResolveP2pRetryCap maps a wire-format uint32 to the time.Duration
+// that newIceBackoff / SetMaxBackoff expect. Single source of truth
+// for the sentinel + zero-means-default semantics shared by
+// (*Conn).initIceBackoffFromConfig and
+// ConnMgr.propagateP2pRetryMaxToConns. Phase-3.7i v0.5 fix.
+func ResolveP2pRetryCap(seconds uint32) time.Duration {
+	switch seconds {
+	case SentinelP2pRetryDisabled:
+		return 0
+	case 0:
+		return DefaultP2PRetryMax
+	default:
+		return time.Duration(seconds) * time.Second
+	}
+}
+
 const (
 	// DefaultP2PRetryMax is the built-in fallback when the management
 	// server has not pushed a p2p_retry_max_seconds value (Proto wire
