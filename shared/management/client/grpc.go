@@ -279,9 +279,13 @@ func defaultBackoff(ctx context.Context) backoff.BackOff {
 }
 
 // ready indicates whether the client is okay and ready to be used
-// for now it just checks whether gRPC connection to the service is ready
+// for now it just checks whether gRPC connection to the service is ready.
+// Uses snapshotConn() so reconnectClientConn cannot swap the conn out from
+// under this read.
 func (c *GrpcClient) ready() bool {
-	return c.conn.GetState() == connectivity.Ready || c.conn.GetState() == connectivity.Idle
+	conn, _ := c.snapshotConn()
+	state := conn.GetState()
+	return state == connectivity.Ready || state == connectivity.Idle
 }
 
 // Sync wraps the real client's Sync endpoint call and takes care of retries and encryption/decryption of messages
@@ -308,13 +312,14 @@ func (c *GrpcClient) withMgmtStream(
 ) error {
 	backOff := defaultBackoff(ctx)
 	operation := func() error {
-		log.Debugf("management connection state %v", c.conn.GetState())
-		connState := c.conn.GetState()
+		conn, _ := c.snapshotConn()
+		log.Debugf("management connection state %v", conn.GetState())
+		connState := conn.GetState()
 
 		if connState == connectivity.Shutdown {
 			return backoff.Permanent(fmt.Errorf("connection to management has been shut down"))
 		} else if !(connState == connectivity.Ready || connState == connectivity.Idle) {
-			c.conn.WaitForStateChange(ctx, connState)
+			conn.WaitForStateChange(ctx, connState)
 			return fmt.Errorf("connection to management is not ready and in %s state", connState)
 		}
 
@@ -340,10 +345,17 @@ func (c *GrpcClient) handleJobStream(
 	serverPubKey wgtypes.Key,
 	msgHandler func(msg *proto.JobRequest) *proto.JobResponse,
 ) error {
-	ctx, cancelStream := context.WithCancel(ctx)
-	defer cancelStream()
+	// Cause-aware cancel so the watchdog can request a job-stream
+	// reconnect via cancelAllStreams(errWatchdogReconnect) just like
+	// it does for the Sync stream.
+	ctx, cancelStream := context.WithCancelCause(ctx)
+	defer cancelStream(nil)
 
-	stream, err := c.realClient.Job(ctx)
+	id := c.registerStreamCancel(cancelStream)
+	defer c.unregisterStreamCancel(id)
+
+	_, realClient := c.snapshotConn()
+	stream, err := realClient.Job(ctx)
 	if err != nil {
 		log.Errorf("failed to open job stream: %v", err)
 		return err
@@ -360,6 +372,15 @@ func (c *GrpcClient) handleJobStream(
 	for {
 		jobReq, err := c.receiveJobRequest(ctx, stream, serverPubKey)
 		if err != nil {
+			// Cause-aware path: watchdog-requested reconnect must
+			// propagate as a non-nil, non-Permanent error so
+			// withMgmtStream's backoff.Retry schedules another
+			// attempt. Engine-shutdown path (cause==nil or generic
+			// context.Canceled) still returns nil.
+			if cause := context.Cause(ctx); cause != nil && errors.Is(cause, errWatchdogReconnect) {
+				log.Warnf("job stream cancelled by watchdog: %v", cause)
+				return cause
+			}
 			if ctx.Err() != nil {
 				log.Debugf("job stream context has been canceled, this usually indicates shutdown")
 				return nil
@@ -576,7 +597,8 @@ func (c *GrpcClient) connectToSyncStream(ctx context.Context, serverPubKey wgtyp
 		return nil, err
 	}
 	syncReq := &proto.EncryptedMessage{WgPubKey: myPublicKey.String(), Body: encryptedReq}
-	sync, err := c.realClient.Sync(ctx, syncReq)
+	_, realClient := c.snapshotConn()
+	sync, err := realClient.Sync(ctx, syncReq)
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +646,8 @@ func (c *GrpcClient) HealthCheck() error {
 func (c *GrpcClient) getServerPublicKey() (*wgtypes.Key, error) {
 	mgmCtx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
 	defer cancel()
-	resp, err := c.realClient.GetServerKey(mgmCtx, &proto.Empty{})
+	_, realClient := c.snapshotConn()
+	resp, err := realClient.GetServerKey(mgmCtx, &proto.Empty{})
 	if err != nil {
 		return nil, fmt.Errorf("failed getting Management Service public key: %w", err)
 	}
@@ -646,7 +669,8 @@ func (c *GrpcClient) getServerPublicKey() (*wgtypes.Key, error) {
 // production (the engine's "Management: Connected" indicator stayed
 // green while no bytes could move).
 func (c *GrpcClient) IsHealthy() bool {
-	switch c.conn.GetState() {
+	conn, realClient := c.snapshotConn()
+	switch conn.GetState() {
 	case connectivity.TransientFailure, connectivity.Shutdown:
 		return false
 	case connectivity.Connecting:
@@ -658,7 +682,7 @@ func (c *GrpcClient) IsHealthy() bool {
 	ctx, cancel := context.WithTimeout(c.ctx, healthCheckTimeout)
 	defer cancel()
 
-	_, err := c.realClient.GetServerKey(ctx, &proto.Empty{})
+	_, err := realClient.GetServerKey(ctx, &proto.Empty{})
 	if err != nil {
 		c.notifyDisconnected(err)
 		log.Warnf("health check returned: %s", err)
@@ -689,8 +713,9 @@ func (c *GrpcClient) login(req *proto.LoginRequest) (*proto.LoginResponse, error
 		mgmCtx, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
 		defer cancel()
 
+		_, realClient := c.snapshotConn()
 		var err error
-		resp, err = c.realClient.Login(mgmCtx, &proto.EncryptedMessage{
+		resp, err = realClient.Login(mgmCtx, &proto.EncryptedMessage{
 			WgPubKey: c.key.PublicKey().String(),
 			Body:     loginReq,
 		})
@@ -762,7 +787,8 @@ func (c *GrpcClient) GetDeviceAuthorizationFlow() (*proto.DeviceAuthorizationFlo
 		return nil, err
 	}
 
-	resp, err := c.realClient.GetDeviceAuthorizationFlow(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	resp, err := realClient.GetDeviceAuthorizationFlow(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encryptedMSG},
 	)
@@ -802,7 +828,8 @@ func (c *GrpcClient) GetPKCEAuthorizationFlow() (*proto.PKCEAuthorizationFlow, e
 		return nil, err
 	}
 
-	resp, err := c.realClient.GetPKCEAuthorizationFlow(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	resp, err := realClient.GetPKCEAuthorizationFlow(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encryptedMSG,
 	})
@@ -843,7 +870,8 @@ func (c *GrpcClient) SyncMeta(sysInfo *system.Info) error {
 	mgmCtx, cancel := context.WithTimeout(c.ctx, ConnectTimeout)
 	defer cancel()
 
-	_, err = c.realClient.SyncMeta(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	_, err = realClient.SyncMeta(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     syncMetaReq,
 	})
@@ -885,7 +913,8 @@ func (c *GrpcClient) Logout() error {
 		return fmt.Errorf("encrypt logout message: %w", err)
 	}
 
-	_, err = c.realClient.Logout(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	_, err = realClient.Logout(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encryptedMSG,
 	})
@@ -916,7 +945,8 @@ func (c *GrpcClient) CreateExpose(ctx context.Context, req ExposeRequest) (*Expo
 	mgmCtx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 
-	resp, err := c.realClient.CreateExpose(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	resp, err := realClient.CreateExpose(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encReq,
 	})
@@ -948,7 +978,8 @@ func (c *GrpcClient) RenewExpose(ctx context.Context, domain string) error {
 	mgmCtx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 
-	_, err = c.realClient.RenewExpose(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	_, err = realClient.RenewExpose(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encReq,
 	})
@@ -971,7 +1002,8 @@ func (c *GrpcClient) StopExpose(ctx context.Context, domain string) error {
 	mgmCtx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 
-	_, err = c.realClient.StopExpose(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	_, err = realClient.StopExpose(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encReq,
 	})
