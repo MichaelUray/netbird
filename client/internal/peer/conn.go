@@ -17,7 +17,6 @@ import (
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/iface/wgproxy"
 	"github.com/netbirdio/netbird/client/internal/metrics"
-	"github.com/netbirdio/netbird/shared/connectionmode"
 	"github.com/netbirdio/netbird/client/internal/peer/conntype"
 	"github.com/netbirdio/netbird/client/internal/peer/dispatcher"
 	"github.com/netbirdio/netbird/client/internal/peer/guard"
@@ -27,6 +26,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/portforward"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	"github.com/netbirdio/netbird/route"
+	"github.com/netbirdio/netbird/shared/connectionmode"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
 )
 
@@ -128,7 +128,7 @@ type Conn struct {
 	// lazy mgr kept the peer in its "active" set with no activity
 	// listener, so local traffic was silently dropped. Codex follow-up
 	// to the 6-host hardware test on c9a47ed90.
-	onWGTimeoutRecover                        func()
+	onWGTimeoutRecover func()
 
 	statusRelay         *worker.AtomicWorkerStatus
 	statusICE           *worker.AtomicWorkerStatus
@@ -736,6 +736,22 @@ func (conn *Conn) remoteEffectiveMode() connectionmode.Mode {
 	return m
 }
 
+// shouldSkipBootstrapOffer mirrors the gate at the top of onGuardEvent:
+// the guard must suppress the bootstrap offer ONLY when the remote
+// peer is resolved to p2p-lazy AND this Conn has never connected.
+// For peers that WERE connected and then lost their relay/ICE path
+// (network change, signal/relay reconnect, daemon resume from
+// standby) the guard MUST still send recovery offers, otherwise the
+// tunnel stays cold forever -- see the 2026-05-17 S26 stuck-peer
+// incident.
+//
+// Extracted into a method (Phase-3.7i v0.5) so the gate logic can be
+// behaviourally unit-tested without driving through the full
+// Handshaker + Signaler call chain.
+func (conn *Conn) shouldSkipBootstrapOffer() bool {
+	return conn.remoteEffectiveMode() == connectionmode.ModeP2PLazy && !conn.everConnected.Load()
+}
+
 func (conn *Conn) onGuardEvent() {
 	// Respect remote peer's resolved connection mode: when the management
 	// server has placed the REMOTE peer in p2p-lazy (typical for legacy
@@ -761,7 +777,7 @@ func (conn *Conn) onGuardEvent() {
 	// receive path (engine.go -> ConnMgr.ActivatePeer is NOT gated on
 	// this), and we still bootstrap when local user traffic triggers
 	// the local lazy manager (manager.onPeerActivity -> AttachICE).
-	if conn.remoteEffectiveMode() == connectionmode.ModeP2PLazy && !conn.everConnected.Load() {
+	if conn.shouldSkipBootstrapOffer() {
 		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy AND never connected; wait for remote OFFER or local activity)")
 		return
 	}
@@ -1265,19 +1281,19 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 // (ICE worker detached on iceTimeout). Encapsulates Codex review-point-
 // 4 gating so the engine doesn't have to peek into Conn internals:
 //
-//   1. mode must be p2p-dynamic (other modes have no detached state)
-//   2. conn must be open (not yet closed by relay-timeout)
-//   3. currentConnPriority must be Relay (we're using the relay tunnel)
-//   4. handshaker.iceListener must be nil (ICE actually detached)
-//   5. iceBackoff: by default skipped while suspended, BUT a rate-
-//      limited override applies (iceBackoff.AllowActivityOverride —
-//      one bypass per activityOverrideMinInterval=5min per peer).
-//      Codex review 2026-05-05 point 5: real user activity is the
-//      strongest "I want this peer back" signal, so a single override
-//      per 5min trades a bounded extra offer/answer pair for unsticking
-//      legitimately working peers that hit a transient ICE drop.
-//   6. everConnected must be true (we had P2P at least once -- avoids
-//      pointless retries for peers we never reached P2P with)
+//  1. mode must be p2p-dynamic (other modes have no detached state)
+//  2. conn must be open (not yet closed by relay-timeout)
+//  3. currentConnPriority must be Relay (we're using the relay tunnel)
+//  4. handshaker.iceListener must be nil (ICE actually detached)
+//  5. iceBackoff: by default skipped while suspended, BUT a rate-
+//     limited override applies (iceBackoff.AllowActivityOverride —
+//     one bypass per activityOverrideMinInterval=5min per peer).
+//     Codex review 2026-05-05 point 5: real user activity is the
+//     strongest "I want this peer back" signal, so a single override
+//     per 5min trades a bounded extra offer/answer pair for unsticking
+//     legitimately working peers that hit a transient ICE drop.
+//  6. everConnected must be true (we had P2P at least once -- avoids
+//     pointless retries for peers we never reached P2P with)
 //
 // Returns true when AttachICE was actually called (caller can rate-
 // limit further). The lazy-mgr.onPeerActivity path uses
