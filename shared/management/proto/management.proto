@@ -352,6 +352,13 @@ message PeerConfig {
 
   // IPv6 overlay address as compact bytes: 16 bytes IP + 1 byte prefix length.
   bytes address_v6 = 9;
+
+  // ForceRelay, when set by the management server, instructs the client
+  // to skip ICE entirely and pin the peer to the relay path. Step 1 of
+  // the broader connection-mode redesign tracked in #5989 -- intentionally
+  // a single boolean rather than the full ConnectionMode enum so the
+  // change can be reviewed and merged independently.
+  bool force_relay = 10;
 }
 
 message AutoUpdateSettings {

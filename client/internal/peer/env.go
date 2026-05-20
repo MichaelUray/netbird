@@ -4,6 +4,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -11,11 +12,37 @@ const (
 	EnvKeyNBHomeRelayServers = "NB_HOME_RELAY_SERVERS"
 )
 
+// serverForceRelay holds the management-server-pushed force_relay
+// PeerConfig field. Engine sets this on each Sync update; readers
+// (peer.Conn.Open et al.) OR-combine it with the env-var override.
+//
+// Step 1 of the connection-mode redesign tracked in #5989 -- a single
+// boolean wire field (server-pushed) is intentionally minimal so the
+// change can land independently of the broader ConnectionMode enum
+// work, which is sequenced as Step 2 of the same ladder.
+var serverForceRelay atomic.Bool
+
+// SetServerForceRelay records the management-server-pushed force_relay
+// flag. Called by engine.go on PeerConfig updates.
+func SetServerForceRelay(b bool) {
+	serverForceRelay.Store(b)
+}
+
+// ServerForceRelay returns the current management-server-pushed
+// force_relay flag (without OR-combining with the env override).
+// Useful for surfacing the raw value in status output.
+func ServerForceRelay() bool {
+	return serverForceRelay.Load()
+}
+
 func IsForceRelayed() bool {
 	if runtime.GOOS == "js" {
 		return true
 	}
-	return strings.EqualFold(os.Getenv(EnvKeyNBForceRelay), "true")
+	if strings.EqualFold(os.Getenv(EnvKeyNBForceRelay), "true") {
+		return true
+	}
+	return serverForceRelay.Load()
 }
 
 // OverrideRelayURLs returns the relay server URL list set in

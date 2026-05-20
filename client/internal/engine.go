@@ -1267,6 +1267,12 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 		log.Errorf("failed to update lazy connection feature flag: %v", err)
 	}
 
+	// Step 1 of #5989 connection-mode redesign: honor the server-pushed
+	// force_relay flag. peer.IsForceRelayed OR-combines this with the
+	// env-var override so existing deployments continue to work
+	// unchanged.
+	peer.SetServerForceRelay(networkMap.GetPeerConfig().GetForceRelay())
+
 	if e.firewall != nil {
 		if localipfw, ok := e.firewall.(localIpUpdater); ok {
 			if err := localipfw.UpdateLocalIPs(); err != nil {
