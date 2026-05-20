@@ -203,6 +203,41 @@ func TestConnMgr_deactivatePeerAction(t *testing.T) {
 	}
 }
 
+// shouldRestartLazyMgr is the predicate UpdatedRemotePeerConfig uses
+// to decide whether to bounce the inactivity manager. The contract is:
+// mode change OR relay/p2p timeout change => restart; p2pRetryMax-only
+// change must NOT trigger a restart (that value is pushed to active
+// Conns live and doesn't live inside the manager struct).
+func TestShouldRestartLazyMgr(t *testing.T) {
+	dyn := connectionmode.ModeP2PDynamic
+	lazy := connectionmode.ModeP2PLazy
+	cases := []struct {
+		name                                       string
+		prevMode, newMode                          connectionmode.Mode
+		prevRelay, newRelay, prevP2P, newP2P       uint32
+		want                                       bool
+	}{
+		{"nothing changes", dyn, dyn, 86400, 86400, 600, 600, false},
+		{"mode changes lazy->dyn", lazy, dyn, 86400, 86400, 600, 600, true},
+		{"relay timeout changes", dyn, dyn, 86400, 14400, 600, 600, true},
+		{"p2p timeout changes", dyn, dyn, 86400, 86400, 600, 300, true},
+		{"both timeouts change", dyn, dyn, 86400, 14400, 600, 300, true},
+		// Regression guard for the v0.4 plan miss: a retry-max-only
+		// push (modeled here as no change in any of the four args we
+		// compare) must NOT trigger a restart. p2pRetryMax is not an
+		// argument because the predicate is intentionally blind to it.
+		{"retry-max-only push is no-op for this predicate", dyn, dyn, 86400, 86400, 600, 600, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := shouldRestartLazyMgr(c.prevMode, c.newMode, c.prevRelay, c.newRelay, c.prevP2P, c.newP2P)
+			if got != c.want {
+				t.Errorf("shouldRestartLazyMgr=%v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestConnMgr_ServerPushedFieldsAreRaceSafe(t *testing.T) {
 	cm := &ConnMgr{}
 	done := make(chan struct{})
