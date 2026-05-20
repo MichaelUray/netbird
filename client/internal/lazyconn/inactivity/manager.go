@@ -36,13 +36,23 @@ type WgInterface interface {
 // Phase 2 (#5989) introduced TWO independent thresholds per peer:
 //   - iceTimeout fires the iceInactiveChan (consumer detaches the ICE
 //     worker but keeps the relay-tunnel up).
-//   - relayTimeout fires the relayInactiveChan (consumer tears down
+//   - relayTimeout fires the inactivePeersChan (consumer tears down
 //     the whole connection).
 //
 // Threshold == 0 disables that channel for all peers (the corresponding
 // teardown never fires). Phase-1 p2p-lazy is expressed as
-// iceTimeout=0 + relayTimeout=X; the legacy InactivePeersChan is the
-// same as RelayInactiveChan for backwards compat.
+// iceTimeout=0 + relayTimeout=X.
+//
+// Phase-3.7i v0.5: the previous Manager carried a separate
+// relayInactiveChan that was aliased to inactivePeersChan; both
+// lazyconn.Manager (via InactivePeersChan) and ConnMgr.runDynamic
+// InactivityLoop (via RelayInactiveChan) consumed the same buffered
+// channel, and only one of them received any given event. Routing
+// peers silently stuck in connected-but-stale state were the
+// production fallout. The fix is single-ownership: lazyconn.Manager
+// is the sole consumer of inactivePeersChan, and the public
+// RelayInactiveChan accessor + its field are gone so the alias
+// cannot re-form.
 type Manager struct {
 	iface WgInterface
 
@@ -54,13 +64,12 @@ type Manager struct {
 	interestedPeers map[string]*lazyconn.PeerConfig
 
 	iceInactiveChan   chan map[string]struct{}
-	relayInactiveChan chan map[string]struct{}
+	inactivePeersChan chan map[string]struct{}
 
-	// inactivityThreshold + inactivePeersChan are kept for the
-	// Phase-1 NewManager API. Internally they alias to the relay
-	// timeout / channel.
+	// inactivityThreshold retained for the Phase-1 NewManager API
+	// (mirrors relayTimeout). NewManagerWithTwoTimers no longer
+	// relies on it.
 	inactivityThreshold time.Duration
-	inactivePeersChan   chan map[string]struct{}
 }
 
 // NewManager is the Phase-1 single-timer constructor. Pass a *time.Duration
@@ -95,23 +104,22 @@ func NewManagerWithTwoTimers(iface WgInterface, iceTimeout, relayTimeout time.Du
 }
 
 func newManager(iface WgInterface, iceTimeout, relayTimeout time.Duration) *Manager {
-	relayCh := make(chan map[string]struct{}, 1)
 	return &Manager{
 		iface:               iface,
 		iceTimeout:          iceTimeout,
 		relayTimeout:        relayTimeout,
 		interestedPeers:     make(map[string]*lazyconn.PeerConfig),
 		iceInactiveChan:     make(chan map[string]struct{}, 1),
-		relayInactiveChan:   relayCh,
+		inactivePeersChan:   make(chan map[string]struct{}, 1),
 		inactivityThreshold: relayTimeout,
-		inactivePeersChan:   relayCh, // Phase-1 alias: same channel as relayInactiveChan
 	}
 }
 
-// InactivePeersChan is the Phase-1 channel for whole-tunnel teardown.
-// In the Phase-2 internal model this is the same channel as
-// RelayInactiveChan -- existing callers (engine.go p2p-lazy path) keep
-// working unchanged.
+// InactivePeersChan is the single source-of-truth for whole-tunnel
+// teardown events. lazyconn.Manager is the only consumer; ConnMgr no
+// longer subscribes (it used to read the same channel via the now-
+// removed RelayInactiveChan accessor, which created an aliasing race
+// where one of the two consumers absorbed any given event).
 func (m *Manager) InactivePeersChan() chan map[string]struct{} {
 	if m == nil {
 		// return a nil channel that blocks forever
@@ -130,15 +138,6 @@ func (m *Manager) ICEInactiveChan() chan map[string]struct{} {
 		return nil
 	}
 	return m.iceInactiveChan
-}
-
-// RelayInactiveChan returns the channel that signals relay-worker
-// (and thus whole-tunnel) inactivity per peer.
-func (m *Manager) RelayInactiveChan() chan map[string]struct{} {
-	if m == nil {
-		return nil
-	}
-	return m.relayInactiveChan
 }
 
 func (m *Manager) AddPeer(peerCfg *lazyconn.PeerConfig) {
@@ -191,7 +190,10 @@ func (m *Manager) Start(ctx context.Context) {
 				m.notifyChan(ctx, m.iceInactiveChan, iceIdle)
 			}
 			if len(relayIdle) > 0 {
-				m.notifyChan(ctx, m.relayInactiveChan, relayIdle)
+				// Single owner (lazyconn.Manager). The Phase-1
+				// RelayInactiveChan accessor is intentionally
+				// removed; see TestManager_HasNoRelayInactiveChanAccessor.
+				m.notifyChan(ctx, m.inactivePeersChan, relayIdle)
 			}
 		}
 	}
