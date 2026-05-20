@@ -901,3 +901,70 @@ func TestConn_InitIceBackoffFromConfig_NormalValue(t *testing.T) {
 		t.Fatalf("maxBackoff = %v, want 10m", got)
 	}
 }
+
+// shouldSkipBootstrapOffer is the extracted gate at the top of
+// onGuardEvent (Phase-3.7i v0.5). It must:
+//  1. SKIP only when remote is p2p-lazy AND this Conn has never connected.
+//  2. NOT skip when the Conn has ever connected (recovery offers must
+//     flow -- regression for the 2026-05-17 S26 stuck-peer incident).
+//  3. NOT skip when remote is anything other than p2p-lazy.
+func TestConn_ShouldSkipBootstrapOffer(t *testing.T) {
+	swWatcher := guard.NewSRWatcher(nil, nil, nil, connConf.ICEConfig)
+
+	type tc struct {
+		name           string
+		everConnected  bool
+		remoteMode     string // RemoteEffectiveConnectionMode in status state
+		registerPeer   bool   // whether to put the peer in the status recorder
+		wantSkip       bool
+	}
+	cases := []tc{
+		{"fresh peer, remote unknown -> bootstrap fires", false, "", false, false},
+		{"fresh peer, remote p2p-lazy -> SKIP", false, "p2p-lazy", true, true},
+		{"recovered peer, remote p2p-lazy -> bootstrap fires (recovery)", true, "p2p-lazy", true, false},
+		{"fresh peer, remote p2p-dynamic -> bootstrap fires", false, "p2p-dynamic", true, false},
+		{"fresh peer, remote p2p -> bootstrap fires", false, "p2p", true, false},
+		{"fresh peer, remote relay-forced -> bootstrap fires", false, "relay-forced", true, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			recorder := NewRecorder("https://mgm")
+			cfg := connConf
+			cfg.Key = "remote-" + c.name
+			cfg.WgConfig = WgConfig{
+				RemoteKey:   cfg.Key,
+				WgInterface: &stubWGIface{},
+				AllowedIps:  []netip.Prefix{netip.MustParsePrefix("100.64.0.5/32")},
+			}
+			sd := ServiceDependencies{
+				StatusRecorder:     recorder,
+				SrWatcher:          swWatcher,
+				PeerConnDispatcher: testDispatcher,
+			}
+			conn, err := NewConn(cfg, sd)
+			if err != nil {
+				t.Fatalf("NewConn: %v", err)
+			}
+
+			if c.registerPeer {
+				if err := recorder.AddPeer(cfg.Key, "", ""); err != nil {
+					t.Fatalf("AddPeer: %v", err)
+				}
+				if err := recorder.UpdatePeerRemoteMeta(cfg.Key, RemoteMeta{
+					EffectiveConnectionMode: c.remoteMode,
+				}); err != nil {
+					t.Fatalf("UpdatePeerRemoteMeta: %v", err)
+				}
+			}
+			if c.everConnected {
+				conn.everConnected.Store(true)
+			}
+
+			got := conn.shouldSkipBootstrapOffer()
+			if got != c.wantSkip {
+				t.Errorf("shouldSkipBootstrapOffer = %v, want %v", got, c.wantSkip)
+			}
+		})
+	}
+}

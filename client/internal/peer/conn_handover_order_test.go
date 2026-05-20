@@ -67,9 +67,10 @@ func TestConn_OnGuardEvent_SkipOfferGatedOnEverConnected(t *testing.T) {
 	}
 	body := extractFunctionBody(t, string(src), "onGuardEvent")
 	// The skip-offer branch must reference everConnected.Load() in its
-	// guard. If a future refactor splits the conditions, the landmark
-	// "everConnected.Load()" should still appear ABOVE the
-	// "skip offer (ICE detached for inactivity" trace log to gate it.
+	// guard. The dynamic-mode ICE-detached gate inspects everConnected
+	// directly inside onGuardEvent (NOT factored into a helper -- the
+	// p2p-lazy gate is the one that became shouldSkipBootstrapOffer in
+	// Phase-3.7i v0.5; this branch stays inline for compactness).
 	const everCheck = "everConnected.Load()"
 	const skipTrace = "skip offer (ICE detached for inactivity"
 	idxEver := strings.Index(body, everCheck)
@@ -93,17 +94,27 @@ func TestConn_OnGuardEvent_SkipOfferGatedOnEverConnected(t *testing.T) {
 // the user is not actively communicating with — defeating the lazy
 // semantics that the server explicitly asked us to honor for that peer.
 // Caught after the 13-idle-P2P-tunnels report on 2026-05-16.
+//
+// Phase-3.7i v0.5 refactor: the predicate moved into the
+// shouldSkipBootstrapOffer helper so it can be unit-tested via
+// TestConn_ShouldSkipBootstrapOffer. The textual landmarks the
+// regression test relies on live in the helper now; the helper's
+// body is folded into the inspection here.
 func TestConn_OnGuardEvent_SkipOfferForRemoteLazy(t *testing.T) {
 	src, err := os.ReadFile("conn.go")
 	if err != nil {
 		t.Fatalf("read conn.go: %v", err)
 	}
-	body := extractFunctionBody(t, string(src), "onGuardEvent")
+	guardBody := extractFunctionBody(t, string(src), "onGuardEvent")
+	predicateBody := extractFunctionBody(t, string(src), "shouldSkipBootstrapOffer")
+	body := guardBody + "\n" + predicateBody
+
 	const modeCheck = "remoteEffectiveMode() == connectionmode.ModeP2PLazy"
 	const everConnectedGate = "!conn.everConnected.Load()"
 	const skipTrace = "skip offer (remote peer is p2p-lazy"
+	const helperCall = "shouldSkipBootstrapOffer()"
 	if !strings.Contains(body, modeCheck) {
-		t.Fatalf("onGuardEvent missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", modeCheck)
+		t.Fatalf("missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", modeCheck)
 	}
 	// The everConnected gate is REQUIRED so the guard does not silently
 	// suppress recovery offers for peers that already had a tunnel and
@@ -111,19 +122,21 @@ func TestConn_OnGuardEvent_SkipOfferForRemoteLazy(t *testing.T) {
 	// standby). Without this, post-standby S26 was stuck with all legacy
 	// peers in idle/disconnected forever — 2026-05-17 regression.
 	if !strings.Contains(body, everConnectedGate) {
-		t.Fatalf("onGuardEvent missing %q in p2p-lazy gate — recovery after relay/ICE reconnect will be silently suppressed for any peer that was once connected", everConnectedGate)
+		t.Fatalf("missing %q in p2p-lazy gate — recovery after relay/ICE reconnect will be silently suppressed for any peer that was once connected", everConnectedGate)
 	}
-	if !strings.Contains(body, skipTrace) {
+	if !strings.Contains(guardBody, skipTrace) {
 		t.Fatalf("onGuardEvent missing %q trace — remote p2p-lazy gate trace landmark is gone", skipTrace)
 	}
+	if !strings.Contains(guardBody, helperCall) {
+		t.Fatalf("onGuardEvent must call %s -- predicate was bypassed", helperCall)
+	}
 	// The gate MUST be the first non-comment guard in onGuardEvent so it
-	// applies before the local-mode-only carve-outs. Verify it appears
-	// before the existing "RemoteServerLivenessKnown" guard which is the
-	// next pre-existing exit branch.
-	idxMode := strings.Index(body, modeCheck)
-	idxLiveness := strings.Index(body, "RemoteServerLivenessKnown")
-	if idxLiveness >= 0 && idxMode > idxLiveness {
-		t.Errorf("remote-lazy gate must appear BEFORE the live-online gate (got %d > %d)", idxMode, idxLiveness)
+	// applies before the local-mode-only carve-outs. Verify the helper
+	// call appears before the existing "RemoteServerLivenessKnown" guard.
+	idxHelper := strings.Index(guardBody, helperCall)
+	idxLiveness := strings.Index(guardBody, "RemoteServerLivenessKnown")
+	if idxLiveness >= 0 && idxHelper > idxLiveness {
+		t.Errorf("remote-lazy gate must appear BEFORE the live-online gate (got %d > %d)", idxHelper, idxLiveness)
 	}
 }
 
