@@ -55,6 +55,20 @@ type GrpcClient struct {
 	connStateCallback     ConnStateNotifier
 	connStateCallbackLock sync.RWMutex
 	serverURL             string
+	tlsEnabled            bool
+
+	// connMu guards conn and realClient so reconnectClientConn can
+	// swap them atomically with the watchdog's probe path.
+	connMu sync.RWMutex
+
+	// streamCancels holds per-stream CancelCauseFuncs so the watchdog
+	// can cancel registered streams with errWatchdogReconnect as cause.
+	streamCancelMu sync.Mutex
+	streamCancels  map[string]context.CancelCauseFunc
+
+	// watchdog is the probe-driven liveness watchdog. Constructed in
+	// NewClient, started after NewClient returns, stopped in Close.
+	watchdog *streamWatchdog
 }
 
 type ExposeRequest struct {
@@ -141,14 +155,19 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 		}
 	}()
 
-	return &GrpcClient{
+	c := &GrpcClient{
 		key:                   ourPrivateKey,
 		realClient:            realClient,
 		ctx:                   ctx,
 		conn:                  conn,
 		connStateCallbackLock: sync.RWMutex{},
 		serverURL:             addr,
-	}, nil
+		tlsEnabled:            tlsEnabled,
+		streamCancels:         map[string]context.CancelCauseFunc{},
+	}
+	c.watchdog = newStreamWatchdog(c)
+	c.watchdog.start()
+	return c, nil
 }
 
 // GetServerURL returns the management server URL
@@ -158,7 +177,85 @@ func (c *GrpcClient) GetServerURL() string {
 
 // Close closes connection to the Management Service
 func (c *GrpcClient) Close() error {
+	if c.watchdog != nil {
+		c.watchdog.stop()
+	}
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	return c.conn.Close()
+}
+
+// snapshotConn returns the current ClientConn + ManagementServiceClient
+// under a read lock. Callers must use the returned pair without holding
+// a write lock; reconnectClientConn swaps both atomically.
+func (c *GrpcClient) snapshotConn() (*grpc.ClientConn, proto.ManagementServiceClient) {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.conn, c.realClient
+}
+
+// registerStreamCancel adds a CancelCauseFunc to the stream-cancel
+// map and returns a unique id. handleSyncStream/handleJobStream call
+// this on entry and unregisterStreamCancel on exit.
+func (c *GrpcClient) registerStreamCancel(cancel context.CancelCauseFunc) string {
+	id := uuid.New().String()
+	c.streamCancelMu.Lock()
+	c.streamCancels[id] = cancel
+	c.streamCancelMu.Unlock()
+	return id
+}
+
+// unregisterStreamCancel removes a previously-registered cancel func.
+func (c *GrpcClient) unregisterStreamCancel(id string) {
+	c.streamCancelMu.Lock()
+	delete(c.streamCancels, id)
+	c.streamCancelMu.Unlock()
+}
+
+// cancelAllStreams invokes every registered CancelCauseFunc with the
+// given cause. Used by the streamWatchdog to request a stream-reconnect
+// via context.Cause(ctx) in handleSyncStream.
+func (c *GrpcClient) cancelAllStreams(cause error) {
+	c.streamCancelMu.Lock()
+	defer c.streamCancelMu.Unlock()
+	for id, cancel := range c.streamCancels {
+		log.Warnf("watchdog cancelling stream %q: %v", id, cause)
+		cancel(cause)
+	}
+}
+
+// reconnectClientConn closes the underlying *grpc.ClientConn and dials
+// a fresh one. The conn + realClient fields are swapped under c.connMu
+// so other goroutines see the change atomically (via snapshotConn).
+// Called by the watchdog only after watchdogReconnectBudget consecutive
+// probe failures beyond watchdogFailureBudget.
+func (c *GrpcClient) reconnectClientConn(ctx context.Context) error {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	var extraOpts []grpc.DialOption
+	if maxSize := MaxRecvMsgSize(); maxSize > 0 {
+		extraOpts = append(extraOpts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxSize)))
+	}
+	conn, err := nbgrpc.CreateConnection(ctx, c.serverURL, c.tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
+	if err != nil {
+		return fmt.Errorf("create connection: %w", err)
+	}
+	c.conn = conn
+	c.realClient = proto.NewManagementServiceClient(conn)
+	log.Infof("watchdog rebuilt management ClientConn")
+	return nil
+}
+
+// WatchdogStats returns probe-OK / probe-error / trip counters.
+// Counters persist for the lifetime of the GrpcClient.
+func (c *GrpcClient) WatchdogStats() (ok, errCount, tripped uint64) {
+	if c.watchdog == nil {
+		return 0, 0, 0
+	}
+	return c.watchdog.probeOk.Load(), c.watchdog.probeErr.Load(), c.watchdog.tripped.Load()
 }
 
 // SetConnStateListener set the ConnStateNotifier
@@ -375,8 +472,15 @@ func (c *GrpcClient) sendJobResponse(
 }
 
 func (c *GrpcClient) handleSyncStream(ctx context.Context, serverPubKey wgtypes.Key, sysInfo *system.Info, msgHandler func(msg *proto.SyncResponse) error) error {
-	ctx, cancelStream := context.WithCancel(ctx)
-	defer cancelStream()
+	// Use WithCancelCause so the watchdog can request a stream
+	// reconnect via cancelAllStreams(errWatchdogReconnect). The
+	// cause-aware branch below propagates that as a retryable error
+	// instead of returning nil (which would end the retry loop).
+	ctx, cancelStream := context.WithCancelCause(ctx)
+	defer cancelStream(nil)
+
+	id := c.registerStreamCancel(cancelStream)
+	defer c.unregisterStreamCancel(id)
 
 	stream, err := c.connectToSyncStream(ctx, serverPubKey, sysInfo)
 	if err != nil {
@@ -394,6 +498,15 @@ func (c *GrpcClient) handleSyncStream(ctx context.Context, serverPubKey wgtypes.
 	err = c.receiveUpdatesEvents(stream, serverPubKey, msgHandler)
 	if err != nil {
 		c.notifyDisconnected(err)
+		// Cause-aware path: watchdog-requested reconnect must propagate
+		// as a non-nil, non-Permanent error so withMgmtStream's outer
+		// backoff.Retry schedules another attempt. Engine-shutdown path
+		// (cause == nil or cause is generic context.Canceled) still
+		// returns nil.
+		if cause := context.Cause(ctx); cause != nil && errors.Is(cause, errWatchdogReconnect) {
+			log.Warnf("management stream cancelled by watchdog: %v", cause)
+			return cause
+		}
 		if ctx.Err() != nil {
 			log.Debugf("management connection context has been canceled, this usually indicates shutdown")
 			return nil
