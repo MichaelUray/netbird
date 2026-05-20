@@ -2,6 +2,7 @@ package inactivity
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -11,6 +12,18 @@ import (
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/monotime"
 )
+
+// Manager must not expose RelayInactiveChan(): the Phase-1 alias
+// between relayInactiveChan and inactivePeersChan caused a race where
+// lazyconn.Manager and ConnMgr both consumed the same buffered chan
+// and only one received any given event. The fix is to remove the
+// accessor entirely so the alias cannot be re-introduced.
+func TestManager_HasNoRelayInactiveChanAccessor(t *testing.T) {
+	m := NewManagerWithTwoTimers(&mockWgInterface{}, 0, time.Minute)
+	if _, exists := reflect.TypeOf(m).MethodByName("RelayInactiveChan"); exists {
+		t.Fatal("Manager.RelayInactiveChan must be removed (alias race regression risk)")
+	}
+}
 
 type mockWgInterface struct {
 	lastActivities map[string]monotime.Time
@@ -163,7 +176,7 @@ func TestTwoTimers_OnlyICEFires(t *testing.T) {
 
 	// Relay channel must NOT fire.
 	select {
-	case <-manager.RelayInactiveChan():
+	case <-manager.InactivePeersChan():
 		t.Fatal("Relay channel should not fire when only iceTimeout exceeded")
 	case <-time.After(200 * time.Millisecond):
 		// expected
@@ -203,7 +216,7 @@ func TestTwoTimers_BothFire(t *testing.T) {
 			if _, ok := peers[peerID]; ok {
 				gotICE = true
 			}
-		case peers := <-manager.RelayInactiveChan():
+		case peers := <-manager.InactivePeersChan():
 			if _, ok := peers[peerID]; ok {
 				gotRelay = true
 			}
@@ -238,7 +251,7 @@ func TestTwoTimers_ICEDisabled(t *testing.T) {
 	fakeTick <- time.Now()
 
 	select {
-	case peers := <-manager.RelayInactiveChan():
+	case peers := <-manager.InactivePeersChan():
 		assert.Contains(t, peers, peerID)
 	case <-time.After(1 * time.Second):
 		t.Fatal("relay channel should fire when relayTimeout exceeded")
@@ -286,7 +299,7 @@ func TestTwoTimers_RelayDisabled(t *testing.T) {
 
 	// Relay channel must never fire because relayTimeout=0.
 	select {
-	case <-manager.RelayInactiveChan():
+	case <-manager.InactivePeersChan():
 		t.Fatal("Relay channel should NEVER fire when relayTimeout=0")
 	case <-time.After(200 * time.Millisecond):
 		// expected
@@ -320,7 +333,7 @@ func TestTwoTimers_BothDisabled(t *testing.T) {
 	select {
 	case <-manager.ICEInactiveChan():
 		t.Fatal("ICE channel must not fire when both disabled")
-	case <-manager.RelayInactiveChan():
+	case <-manager.InactivePeersChan():
 		t.Fatal("Relay channel must not fire when both disabled")
 	case <-time.After(300 * time.Millisecond):
 		// expected

@@ -217,17 +217,20 @@ func (e *ConnMgr) startModeSideEffects() {
 	}
 }
 
-// runDynamicInactivityLoop reads from the two-timer inactivity channels
-// exposed by the inactivity.Manager and dispatches per-peer teardown.
+// runDynamicInactivityLoop reads the ICEInactiveChan from the
+// inactivity.Manager and detaches the ICE worker per peer.
 //
-// ICEInactiveChan: detach the ICE worker for each listed peer; the
-// relay tunnel is left running so traffic still flows.
+// Phase-3.7i v0.5: relay-idle teardown is owned exclusively by
+// lazyconn.Manager.onPeerInactivityTimedOut, which already calls
+// peerStore.PeerConnIdle(...) and performs the same "keep WG peer
+// entry, close conn" semantics this loop used to do. Having both
+// lazyconn.Manager and ConnMgr consume the same buffered relay-idle
+// channel created an aliasing race (only one of the two ever saw any
+// given event), which manifested in production as routing peers
+// silently stuck in connected-but-stale state.
 //
-// RelayInactiveChan: close the whole connection. The activity-detector
-// will reopen it when the next outbound packet arrives.
-//
-// Only meaningful in p2p-dynamic mode; in p2p-lazy the iceTimeout is 0
-// and ICEInactiveChan never fires, so the loop is a passthrough.
+// Only meaningful in p2p-dynamic mode; in p2p-lazy iceTimeout is 0
+// and ICEInactiveChan never fires.
 func (e *ConnMgr) runDynamicInactivityLoop(ctx context.Context) {
 	if e.lazyConnMgr == nil {
 		return
@@ -236,8 +239,8 @@ func (e *ConnMgr) runDynamicInactivityLoop(ctx context.Context) {
 	if im == nil {
 		return
 	}
-	log.Infof("p2p-dynamic inactivity loop started (iceTimeout=%ds, relayTimeout=%ds)", e.p2pTimeoutSecs, e.relayTimeoutSecs)
-	defer log.Infof("p2p-dynamic inactivity loop stopped")
+	log.Infof("p2p-dynamic ICE-inactivity loop started (iceTimeout=%ds)", e.p2pTimeoutSecs)
+	defer log.Infof("p2p-dynamic ICE-inactivity loop stopped")
 	for {
 		select {
 		case <-ctx.Done():
@@ -246,19 +249,6 @@ func (e *ConnMgr) runDynamicInactivityLoop(ctx context.Context) {
 			for peerKey := range peers {
 				if err := e.DetachICEForPeer(peerKey); err != nil {
 					log.Warnf("DetachICEForPeer(%s): %v", peerKey, err)
-				}
-			}
-		case peers := <-im.RelayInactiveChan():
-			for peerKey := range peers {
-				if conn, ok := e.peerStore.PeerConn(peerKey); ok {
-					conn.Log.Infof("relay-inactivity timeout, closing peer connection")
-					// Lazy-suspend: keep the WG peer entry so routed-
-					// subnet AllowedIPs (e.g. 192.168.91.0/24 via this
-					// routing peer) survive the wake/sleep cycle.
-					// Otherwise routed traffic to the prefix would not
-					// match any peer and silently drop until the next
-					// reconcile (see docs/bugs/2026-05-04-...md).
-					conn.Close(false, true)
 				}
 			}
 		}
