@@ -145,23 +145,6 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 
 	realClient := proto.NewManagementServiceClient(conn)
 
-	// Continuous log of the connectivity.State path the ClientConn
-	// walks (IDLE -> CONNECTING -> READY -> TRANSIENT_FAILURE -> ...)
-	// so future zombie-state incidents can be reconstructed from logs
-	// alone. The goroutine lifetime is bound to ctx.
-	go func() {
-		prev := conn.GetState()
-		log.Infof("management gRPC initial state: %s", prev)
-		for {
-			if !conn.WaitForStateChange(ctx, prev) {
-				return // ctx done
-			}
-			cur := conn.GetState()
-			log.Infof("management gRPC state %s -> %s", prev, cur)
-			prev = cur
-		}
-	}()
-
 	c := &GrpcClient{
 		key:                   ourPrivateKey,
 		realClient:            realClient,
@@ -172,6 +155,7 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 		tlsEnabled:            tlsEnabled,
 		streamCancels:         map[string]context.CancelCauseFunc{},
 	}
+	go c.runStateLogger()
 	c.watchdog = newStreamWatchdog(c)
 	c.watchdog.start()
 	return c, nil
@@ -254,6 +238,51 @@ func (c *GrpcClient) reconnectClientConn(ctx context.Context) error {
 	c.realClient = proto.NewManagementServiceClient(conn)
 	log.Infof("watchdog rebuilt management ClientConn")
 	return nil
+}
+
+// runStateLogger continuously logs the connectivity.State path of the
+// current management ClientConn. After every Shutdown it re-snapshots
+// c.conn so it follows reconnectClientConn() swaps -- without that, the
+// logger would stay attached to the original (now-closed) conn and the
+// instrumentation would go silent precisely when zombie-state incidents
+// happen. Lifetime is bound to c.ctx.
+func (c *GrpcClient) runStateLogger() {
+	var lastConn *grpc.ClientConn
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+		conn, _ := c.snapshotConn()
+		if conn == nil {
+			return
+		}
+		if conn == lastConn {
+			// reconnectClientConn hasn't finished swapping yet; brief
+			// pause so we don't busy-loop on the same dead conn.
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+		lastConn = conn
+		prev := conn.GetState()
+		log.Infof("management gRPC state (re-)attached: %s", prev)
+		for {
+			if !conn.WaitForStateChange(c.ctx, prev) {
+				return // ctx done -- terminal
+			}
+			cur := conn.GetState()
+			log.Infof("management gRPC state %s -> %s", prev, cur)
+			prev = cur
+			if cur == connectivity.Shutdown {
+				// This conn is dead. Break out so the outer loop
+				// snapshots the replacement.
+				break
+			}
+		}
+	}
 }
 
 // WatchdogStats returns probe-OK / probe-error / trip counters.
