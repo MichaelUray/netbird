@@ -124,6 +124,23 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 
 	realClient := proto.NewManagementServiceClient(conn)
 
+	// Continuous log of the connectivity.State path the ClientConn
+	// walks (IDLE -> CONNECTING -> READY -> TRANSIENT_FAILURE -> ...)
+	// so future zombie-state incidents can be reconstructed from logs
+	// alone. The goroutine lifetime is bound to ctx.
+	go func() {
+		prev := conn.GetState()
+		log.Infof("management gRPC initial state: %s", prev)
+		for {
+			if !conn.WaitForStateChange(ctx, prev) {
+				return // ctx done
+			}
+			cur := conn.GetState()
+			log.Infof("management gRPC state %s -> %s", prev, cur)
+			prev = cur
+		}
+	}()
+
 	return &GrpcClient{
 		key:                   ourPrivateKey,
 		realClient:            realClient,
@@ -509,16 +526,20 @@ func (c *GrpcClient) getServerPublicKey() (*wgtypes.Key, error) {
 
 // IsHealthy returns the current connection status without blocking.
 // Used by the engine to monitor connectivity in the background.
+//
+// connectivity.Shutdown means the *grpc.ClientConn has been irreversibly
+// torn down -- neither withMgmtStream nor IsHealthy can recover from it.
+// Reporting healthy in that state masked multi-hour outages in
+// production (the engine's "Management: Connected" indicator stayed
+// green while no bytes could move).
 func (c *GrpcClient) IsHealthy() bool {
 	switch c.conn.GetState() {
-	case connectivity.TransientFailure:
+	case connectivity.TransientFailure, connectivity.Shutdown:
 		return false
 	case connectivity.Connecting:
 		return true
-	case connectivity.Shutdown:
-		return true
-	case connectivity.Idle:
-	case connectivity.Ready:
+	case connectivity.Idle, connectivity.Ready:
+		// fall through to active probe
 	}
 
 	ctx, cancel := context.WithTimeout(c.ctx, healthCheckTimeout)
