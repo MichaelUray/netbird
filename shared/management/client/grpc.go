@@ -946,7 +946,8 @@ func (c *GrpcClient) SyncPeerConnections(ctx context.Context, m *proto.PeerConne
 	mgmCtx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 
-	_, err = c.realClient.SyncPeerConnections(mgmCtx, &proto.EncryptedMessage{
+	_, realClient := c.snapshotConn()
+	_, err = realClient.SyncPeerConnections(mgmCtx, &proto.EncryptedMessage{
 		WgPubKey: c.key.PublicKey().String(),
 		Body:     encrypted,
 	})
