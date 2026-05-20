@@ -26,6 +26,24 @@ func Backoff(ctx context.Context) backoff.BackOff {
 	return backoff.WithContext(b, ctx)
 }
 
+// DefaultKeepaliveClientParameters is the keepalive policy used for every
+// outbound gRPC connection from a NetBird client. Exported as a function
+// (not a var) so tests can assert against the actual struct.
+//
+// Time+Timeout sets the cadence at which the runtime sends HTTP/2 PINGs
+// while a stream is active. PermitWithoutStream extends that coverage to
+// streamless idle phases (between withMgmtStream backoff retries; on a
+// freshly-created ClientConn before its first stream opens). Without it,
+// a half-dead TCP between client and management goes undetected until a
+// stream is opened, which can itself be the operation that hangs.
+func DefaultKeepaliveClientParameters() keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:                30 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
+}
+
 // CreateConnection creates a gRPC client connection with the appropriate transport options.
 // The component parameter specifies the WebSocket proxy component path (e.g., "/management", "/signal").
 func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, component string, extraOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
@@ -50,10 +68,7 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
 		transportOption,
 		WithCustomDialer(tlsEnabled, component),
 		grpc.WithBlock(),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:    30 * time.Second,
-			Timeout: 10 * time.Second,
-		}),
+		grpc.WithKeepaliveParams(DefaultKeepaliveClientParameters()),
 	}
 	opts = append(opts, extraOpts...)
 
