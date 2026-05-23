@@ -434,6 +434,42 @@ func (conn *Conn) IsConnected() bool {
 	return conn.evalStatus() == StatusConnected
 }
 
+// TransportSnapshot returns the current connectivity state of both
+// transports (ICE and Relay) as boolean flags indicating "not connected".
+// Intended for external watchdogs and telemetry: pure read, no logging,
+// no state mutation, no lock acquisition (atomic loads).
+//
+// Returns (iceDisconnected, relayDisconnected) where each bool is true if
+// that transport is NOT in StatusConnected.
+func (conn *Conn) TransportSnapshot() (iceDisconnected, relayDisconnected bool) {
+	return conn.statusICE.Get() != worker.StatusConnected,
+		conn.statusRelay.Get() != worker.StatusConnected
+}
+
+// NewConnForTransportTest constructs a minimal *Conn for tests in OTHER
+// packages that need a Conn satisfying TransportSnapshot. Production code
+// MUST use NewConn — this helper does NOT initialize ICE/relay workers,
+// guard, dispatcher, or any of the production fields. It only initializes
+// the two atomic status holders + Log so TransportSnapshot reads cleanly.
+//
+// Exported because Go does not support cross-package test-only exports.
+// Callers in lazyconn/manager use this together with peerstore.AddPeerConn
+// to build watchdog test fixtures.
+func NewConnForTransportTest(log *log.Entry, iceStatus, relayStatus worker.Status) *Conn {
+	c := &Conn{
+		Log:         log,
+		statusICE:   worker.NewAtomicStatus(),
+		statusRelay: worker.NewAtomicStatus(),
+	}
+	if iceStatus == worker.StatusConnected {
+		c.statusICE.SetConnected()
+	}
+	if relayStatus == worker.StatusConnected {
+		c.statusRelay.SetConnected()
+	}
+	return c
+}
+
 func (conn *Conn) GetKey() string {
 	return conn.config.Key
 }
