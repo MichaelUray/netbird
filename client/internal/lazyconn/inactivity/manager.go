@@ -72,10 +72,10 @@ type Manager struct {
 	// relies on it.
 	inactivityThreshold time.Duration
 
-	// v0.7 Stufe 1: counts silent drops on the two notify channels.
-	// Drops happen when the consumer (lazyconn-Manager Start loop) is
-	// slow or blocked, and indicate that a state-transition event was
-	// lost. The lazy-watchdog reads these via DropCounters().
+	// Counts silent drops on the two notify channels. Drops happen
+	// when the consumer (lazyconn-Manager Start loop) is slow or
+	// blocked, and indicate that a state-transition event was lost.
+	// The lazy reconcile-watchdog reads these via DropCounters().
 	notifyDropsRelay atomic.Uint64
 	notifyDropsICE   atomic.Uint64
 }
