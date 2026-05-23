@@ -169,25 +169,68 @@ func (m *Manager) UpdateRouteHAMap(haMap route.HAMap) {
 	log.Debugf("updated route HA mappings: %d HA groups, %d peers with routes", len(m.haGroupToPeers), len(m.peerToHAGroups))
 }
 
-// Start starts the manager and listens for peer activity and inactivity events
+// Start starts the manager and listens for peer activity and inactivity events.
+// Two code paths depending on whether the inactivity manager is initialized
+// (manager.go NewManager only initializes it for userspace-bind WG). The
+// kernel-mode path skips the inactivity-channel arm entirely; without this
+// guard a kernel-mode caller would nil-deref on
+// m.inactivityManager.InactivePeersChan(). v0.7 Stufe 0 hardening (Codex
+// round-11): the watchdog (Task 6) also lives only on the userspace path
+// because relayDrops + inactivityManager are its inputs.
 func (m *Manager) Start(ctx context.Context) {
 	defer m.close()
 
-	if m.inactivityManager != nil {
-		go m.inactivityManager.Start(ctx)
+	if m.inactivityManager == nil {
+		// Kernel-mode: no inactivity tracking, no watchdog.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case peerConnID := <-m.activityManager.OnActivityChan:
+				m.safeOnPeerActivity(peerConnID)
+			}
+		}
 	}
+
+	// Userspace-bind: inactivity tracking active. Task 6 adds the
+	// runReconcileWatchdog goroutine into this block.
+	go m.inactivityManager.Start(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case peerConnID := <-m.activityManager.OnActivityChan:
-			m.onPeerActivity(peerConnID)
+			m.safeOnPeerActivity(peerConnID)
 		case peerIDs := <-m.inactivityManager.InactivePeersChan():
-			m.onPeerInactivityTimedOut(peerIDs)
+			m.safeOnPeerInactivityTimedOut(peerIDs)
 		}
 	}
+}
 
+// safeOnPeerActivity wraps onPeerActivity with a panic recovery so the
+// consumer goroutine survives bugs in downstream handlers. v0.7 Stufe 0
+// hardening — does NOT fix stuck-state symptoms (a Go panic crashes
+// the whole process unless recovered here), but prevents future
+// regressions.
+func (m *Manager) safeOnPeerActivity(peerConnID peerid.ConnID) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("lazyconn: panic in onPeerActivity (peerConnID=%v): %v", peerConnID, r)
+		}
+	}()
+	m.onPeerActivity(peerConnID)
+}
+
+// safeOnPeerInactivityTimedOut wraps onPeerInactivityTimedOut with a
+// panic recovery (see safeOnPeerActivity).
+func (m *Manager) safeOnPeerInactivityTimedOut(peerIDs map[string]struct{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("lazyconn: panic in onPeerInactivityTimedOut: %v", r)
+		}
+	}()
+	m.onPeerInactivityTimedOut(peerIDs)
 }
 
 // ExcludePeer marks peers for a permanent connection
