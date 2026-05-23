@@ -38,8 +38,11 @@ This PR adds a 120s-tick reconcile watchdog inside the lazy connection
 Manager that classifies all managed peers per tick and dispatches recovery
 goroutines for the two stuck states. Recovery is **state-flip + listener-arm
 only** — the watchdog NEVER calls `PeerConnIdle`/`Conn.Close()`. This avoids
-a `conn.mu`/`managedPeersMu` deadlock that an earlier iteration of the design
-exhibited (Codex review round 4 caught it).
+a `conn.mu`/`managedPeersMu` deadlock that an earlier iteration of the
+design exhibited: if the watchdog spawned `Conn.Close()` async and the
+newly-armed listener fired concurrently, `onPeerActivity` would acquire
+`managedPeersMu` and then block on `conn.mu` (still held by the hanging
+`Close`), freezing the whole lazy manager.
 
 ### Architecture
 
@@ -80,7 +83,10 @@ Six commits, each individually reviewable + green-tested:
 5. `lazyconn/inactivity: count + log silent notifyChan drops`
 6. `lazyconn/manager: reconcile watchdog with two-case recovery`
 
-(Plus one test-rename touch-up after Codex round-12 post-implementation review.)
+(Plus one test-rename touch-up after a post-implementation code review
+identified that `TestReconcileWatchdog_PanicSelfRestart` was misnamed —
+it actually verifies `spawnRecovery`'s panic containment, not
+`runReconcileWatchdog`'s self-restart. Now `_RecoveryPanicContained`.)
 
 ### Testability trade-offs (please review)
 
@@ -88,7 +94,9 @@ Three `*ForTest` symbols are exported in production packages to enable
 cross-package unit tests. Go does not support cross-package test-only
 exports, and the alternative — making `peerstore.Store` mockable via an
 interface — would be significantly more invasive. The chosen approach
-stays under `client/internal/` (not public-API), but it IS upstream-review-sensitive:
+stays under `client/internal/` (not public-API), but the exports are
+intentional and flagged here so maintainers can choose to keep, rename,
+or replace them with an interface refactor:
 
 - `peer.NewConnForTransportTest(log, ice, relay) *Conn` — minimal `*Conn`
   constructor that initializes only `Log + statusICE + statusRelay`. Used by
@@ -104,9 +112,9 @@ stays under `client/internal/` (not public-API), but it IS upstream-review-sensi
   post-arm `peerStillManaged` re-validate. Tests use it to simulate
   concurrent `RemovePeer` and verify the cleanup path.
 
-Each is documented as test-only with a clear doc-comment. If upstream
-maintainers prefer the interface-refactor route instead, the watchdog
-implementation pivots there without spec-level changes.
+Each is documented as test-only with a clear doc-comment. If maintainers
+prefer the interface-refactor route instead, the watchdog implementation
+can pivot there without architectural changes.
 
 ### Test coverage
 
@@ -135,11 +143,16 @@ session before the PR was opened:
 Longer soak (24h+) was running at the time of PR submission to capture an
 actual watchdog firing event in the wild.
 
-### Related spec
+### Related design docs
 
-`docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md` (v0.7.2)
-captures the full architectural rationale across 12 Codex pre-review rounds.
+`docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md`
+(v0.7.2) captures the full architectural rationale: two-case classification,
+why the watchdog deliberately avoids `Conn.Close()`, R14 race protection
+(`peerStillManaged` post-arm re-validate), HA-defer batch semantics, and
+the kernel-mode `Start()` two-path split.
+
 The plan file
 `docs/superpowers/plans/2026-05-24-phase37i-lazy-watchdog-impl.md` (v4.2)
-captures the 6-commit implementation sequence with verified APIs and
-concrete TDD test code.
+captures the 6-commit implementation sequence with API references and
+concrete TDD test code, including the bootstrap of the previously
+nonexistent `lazyconn/manager` test harness.
