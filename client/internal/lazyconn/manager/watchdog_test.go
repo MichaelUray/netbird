@@ -387,8 +387,9 @@ func TestIntegration_ActivityNoListener_WatchdogHeals(t *testing.T) {
 	t.Fatal("watchdog did not re-arm activity listener within deadline")
 }
 
-// TestIntegration_PanicInConsumer_WatchdogHeals: Stufe 0 + Stufe 2
-// cooperation. The consumer-loop panic-recovery (safeOnPeerActivity /
+// TestIntegration_PanicInConsumer_WatchdogHeals: panic-recovery and
+// reconcile-watchdog cooperation. The consumer-loop panic-recovery
+// wrappers (safeOnPeerActivity /
 // safeOnPeerInactivityTimedOut) keeps the consumer alive after a bug,
 // and the watchdog still ticks and recovers any subsequently stuck peer.
 // We exercise this by running runReconcileWatchdog directly while a

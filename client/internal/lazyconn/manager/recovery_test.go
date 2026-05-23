@@ -75,7 +75,7 @@ func TestPeerStillManaged_ConnIDChanged(t *testing.T) {
 	}
 }
 
-// TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock (v0.7 R14): when
+// TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock (peer-removal race): when
 // RemovePeer races between armActivityListener and peerStillManaged,
 // the orphan listener must be cleaned up via activityManager.RemovePeer.
 // This test verifies the R14 fix shipped in Task 3.
@@ -294,7 +294,7 @@ func TestRecoverActivityNoListener_SkipsHADefer(t *testing.T) {
 	}
 }
 
-// TestRecoverInactivityStuck_RemoveRaceAfterUnlock (v0.7 R14): if
+// TestRecoverInactivityStuck_RemoveRaceAfterUnlock (peer-removal race): if
 // RemovePeer races between armActivityListener and the post-arm
 // peerStillManaged check, the orphan listener must be cleaned up via
 // activityManager.RemovePeer.
@@ -320,7 +320,7 @@ func TestRecoverInactivityStuck_RemoveRaceAfterUnlock(t *testing.T) {
 	}
 }
 
-// TestRecoverActivityNoListener_RemoveRaceAfterUnlock (v0.7 R14):
+// TestRecoverActivityNoListener_RemoveRaceAfterUnlock (peer-removal race):
 // same race window in the Case-b path.
 func TestRecoverActivityNoListener_RemoveRaceAfterUnlock(t *testing.T) {
 	h := newTestHarness(t)
@@ -344,7 +344,7 @@ func TestRecoverActivityNoListener_RemoveRaceAfterUnlock(t *testing.T) {
 	}
 }
 
-// TestRecoverActivityNoListener_ConnIDChangeAfterUnlock (v0.7 R14):
+// TestRecoverActivityNoListener_ConnIDChangeAfterUnlock (peer-removal race):
 // peer is re-added with a fresh ConnID between Unlock and the post-arm
 // Re-Validate. peerStillManaged must report false and the orphan
 // listener for the OLD ConnID must be removed.
