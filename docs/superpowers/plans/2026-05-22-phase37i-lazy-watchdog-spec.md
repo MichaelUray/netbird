@@ -14,7 +14,7 @@ changelog:
       `RemovePeer(log *log.Entry, peerConnID peerid.ConnID)`
       (activity/manager.go:84). Existing-Callsite bei manager.go:494 nutzt
       `m.activityManager.RemovePeer(cfg.Log, cfg.PeerConnID)`. **Fix**:
-      vor `managedPeersMu.Unlock()` `connID := cfg.PeerConnID` + 
+      vor `managedPeersMu.Unlock()` `connID := cfg.PeerConnID` +
       `peerLog := cfg.Log` capturen; bei Recheck-Mismatch
       `m.activityManager.RemovePeer(peerLog, connID)` aufrufen.
     * Self-Review (Implementor) — alle weiteren API-Aufrufe der Spec
@@ -40,7 +40,7 @@ changelog:
       vereinheitlicht.
   - v0.7 (2026-05-23 spätabend final): Codex round-6 Korrekturen
     (IMPLEMENTATION-READY):
-    * SHOULD-FIX 1 — Pseudocode-Typfehler: `expectedWatcher watcher` → 
+    * SHOULD-FIX 1 — Pseudocode-Typfehler: `expectedWatcher watcher` →
       `expectedWatcher watcherType`. Realer Typ ist `watcherType int`
       (manager.go:32), mit Konstanten `watcherActivity watcherType = iota`
       und `watcherInactivity` (manager.go:19-20).
@@ -1421,7 +1421,7 @@ race-clean HasPeer-Tests. In Stufe-6-Commit aufgenommen.
   Phase-B snapshotet jetzt ALLE Peers (nicht nur watcherInactivity) mit
   `(pubKey, connID, expectedWatcher)`. Phase-C klassifiziert in zwei
   Trigger-Kategorien:
-  
+
   - **Case-a** (existing): `watcherInactivity + iceDisc && relayDisc &&
     deltaRelay > 0` → `recoverInactivityStuck` (state-flip + listener-arm,
     HA-Defer-Check aktiv)
@@ -1430,7 +1430,7 @@ race-clean HasPeer-Tests. In Stufe-6-Commit aufgenommen.
     state-flip, keine HA-Defer; Peer ist bereits "soll active")
   - **Case-c**: `watcherActivity + HasPeer(connID)` → no-op (gesund oder
     transient mid-handshake)
-  
+
   Damit ist der konkrete Stuck-Pfad nach hängendem PeerConnIdle in
   `onPeerInactivityTimedOut` (state-flip done, Close hängt, Listener nie
   armiert) **erstmals erkennbar und heilbar**.
@@ -1547,7 +1547,7 @@ Unit-Tests + 2 Integration-Tests), Hardware-Soak laut Section 6.3.
   2. `armActivityListener` (lock-free, Listener ZUERST armieren)
   3. `closePeerConnBestEffort` (fire-and-forget goroutine, Close darf ewig
      hängen ohne den Peer zu blockieren)
-  
+
   Damit kann der nächste WG-Wake-Event auch dann den Peer in den
   Activity-Pfad zurückbringen, wenn `Conn.Close()` strukturell hängt.
   Neuer Test `TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`
