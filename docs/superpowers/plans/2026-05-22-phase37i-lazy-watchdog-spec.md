@@ -1,12 +1,43 @@
 ---
-status: spec v0.7 / IMPLEMENTATION-READY (Codex round-6 verdict: kein BLOCKER mehr; 3 SHOULD-FIXes adressiert)
+status: spec v0.7.1 / IMPLEMENTATION-READY (self-reviewed gegen reale netbird-APIs)
 target-branch: see Section 8.1 — Stufe 1 separat upstream-fähig auf upstream/main, Stufen 0+2+3+4+5+6 auf phase3.7i-runtime-bugfixes-v0.5
 related-work: pr/mgmt-stream-keepalive, pr/mgmt-stream-watchdog, feat/force-relay-flag, phase3.7i-runtime-bugfixes-v0.5
-review-status: 7× Codex pre-review — v0.6 erhielt Architektonisch-tragfähig + 3 SHOULD-FIXes (watcherType-Typo, Remove/Exclude-Race nach Unlock, Stale Text R2/R6). v0.7 ist die Implementierungs-Vorlage
+review-status: 7× Codex pre-review + 1× Self-Review — alle BLOCKERs durchgereicht, v0.7.1 ist die Implementierungs-Vorlage. Self-Review hat keine weiteren API-Inkonsistenzen gefunden
 changelog:
   - v0.1 (2026-05-22 vormittag): Initial spec, Code-Refs verifiziert, Buffer-Größe 1 als kritischer Befund
   - v0.2 (2026-05-22 nachmittag): Codex round-1 Korrekturen — Stufe-2-Pseudocode mit echten APIs, Lock-Strategie, Panic-Recovery
   - v0.3 (2026-05-23 vormittag): Codex round-2 Korrekturen — Panic-Hypothese verworfen, Stufen 2+3 lock-sparsam, neue Stufe 5 TransportSnapshot, HA-Batch-Korrektur
+  - v0.7.1 (2026-05-24 morgen): Codex round-7 BLOCKER + Self-Review:
+    * BLOCKER (Codex round-7) — Pseudocode-Compile-Fehler:
+      `activityManager.RemovePeer(cfg.PublicKey)` an zwei Stellen kompiliert
+      nicht. Reale Signatur ist
+      `RemovePeer(log *log.Entry, peerConnID peerid.ConnID)`
+      (activity/manager.go:84). Existing-Callsite bei manager.go:494 nutzt
+      `m.activityManager.RemovePeer(cfg.Log, cfg.PeerConnID)`. **Fix**:
+      vor `managedPeersMu.Unlock()` `connID := cfg.PeerConnID` + 
+      `peerLog := cfg.Log` capturen; bei Recheck-Mismatch
+      `m.activityManager.RemovePeer(peerLog, connID)` aufrufen.
+    * Self-Review (Implementor) — alle weiteren API-Aufrufe der Spec
+      gegen reale netbird-Codebasis verifiziert:
+      - `activity.Manager.MonitorPeerActivity(peerCfg lazyconn.PeerConfig) error`
+        (value-receive) ✓
+      - `activity.Manager.HasPeer(connID peerid.ConnID) bool` (neu Stufe 6)
+        signature realistisch ✓
+      - `inactivity.Manager.RemovePeer(peer string)` (string, NICHT connID!)
+        — meine `transitionToActivityWatcherStateOnly` ruft korrekt
+        `m.inactivityManager.RemovePeer(mp.peerCfg.PublicKey)` ✓
+      - `peerstore.Store.PeerConn(pubKey string) (*peer.Conn, bool)` ✓
+      - `peerstore.Store.PeerConnIdle(pubKey string)` ✓
+      - `lazyconn.PeerConfig{PublicKey, PeerConnID, Log}` Felder ✓
+      - `managedPeer{peerCfg *lazyconn.PeerConfig, expectedWatcher watcherType}` ✓
+      - `peerid "github.com/netbirdio/netbird/client/internal/peer/id"`
+        Import-Alias in beiden Files ✓
+      - `shouldDeferIdleForHA(inactivePeers map[string]struct{}, peerID string) bool` ✓
+      Damit keine weiteren API-Inkonsistenzen → echte Implementation-Ready.
+    * NICE-FIX (Codex round-7) — Section 8.1 Wording: Überschrift +
+      Listenkopf von "5 Commits / Stufen 0+2+3+4+5" auf
+      "6 Commits / Stufen 0+2+3+4+5+6" (inkl. HasPeer/Stufe 6)
+      vereinheitlicht.
   - v0.7 (2026-05-23 spätabend final): Codex round-6 Korrekturen
     (IMPLEMENTATION-READY):
     * SHOULD-FIX 1 — Pseudocode-Typfehler: `expectedWatcher watcher` → 
@@ -793,6 +824,12 @@ func (m *Manager) recoverInactivityStuck(ctx context.Context, pubKey string, stu
         m.managedPeersMu.Unlock()
         return
     }
+    // v0.7.1 Codex round-7: capture connID+peerLog BEFORE unlock to match
+    // the real activity.Manager.RemovePeer(*log.Entry, peerid.ConnID) signature
+    // (activity/manager.go:84). After unlock, cfg/mp may have been mutated
+    // by RemovePeer/ExcludePeer racing in parallel.
+    connID := cfg.PeerConnID
+    peerLog := cfg.Log
     m.transitionToActivityWatcherStateOnly(mp)
     m.managedPeersMu.Unlock()
 
@@ -802,12 +839,13 @@ func (m *Manager) recoverInactivityStuck(ctx context.Context, pubKey string, stu
 
     // v0.7 Codex round-6: post-arm Re-Validate. If RemovePeer/ExcludePeer
     // ran in parallel between our snapshot and now, the listener we just
-    // armed belongs to a peer that is no longer managed. Cleanup.
-    if !m.peerStillManaged(cfg.PublicKey, cfg.PeerConnID) {
-        m.activityManager.RemovePeer(cfg.PublicKey)
+    // armed belongs to a peer that is no longer managed. Cleanup using
+    // the connID + peerLog captured before unlock.
+    if !m.peerStillManaged(pubKey, connID) {
+        m.activityManager.RemovePeer(peerLog, connID)
         return
     }
-    mp.peerCfg.Log.Infof("watchdog: recovery complete (inactivity-stuck: watcherInactivity -> watcherActivity, listener armed)")
+    peerLog.Infof("watchdog: recovery complete (inactivity-stuck: watcherInactivity -> watcherActivity, listener armed)")
 }
 
 // recoverActivityNoListener handles case (b) — peer is in watcherActivity
@@ -833,24 +871,29 @@ func (m *Manager) recoverActivityNoListener(ctx context.Context, pubKey string) 
         m.managedPeersMu.Unlock()
         return
     }
+    // v0.7.1 Codex round-7: capture connID+peerLog BEFORE unlock; see same
+    // rationale as recoverInactivityStuck.
+    connID := cfg.PeerConnID
+    peerLog := cfg.Log
     m.managedPeersMu.Unlock()
 
     // Re-check listener under no lock (activity.Manager has its own m.mu).
     // If onPeerInactivityTimedOut finally finished armActivityListener
     // between snapshot and now, HasPeer returns true and we no-op.
-    if m.activityManager.HasPeer(cfg.PeerConnID) {
+    if m.activityManager.HasPeer(connID) {
         return
     }
     m.armActivityListener(mp)
 
     // v0.7 Codex round-6: post-arm Re-Validate. If RemovePeer/ExcludePeer
     // ran in parallel between snapshot and now, the listener we just
-    // armed belongs to a peer that is no longer managed. Cleanup.
-    if !m.peerStillManaged(cfg.PublicKey, cfg.PeerConnID) {
-        m.activityManager.RemovePeer(cfg.PublicKey)
+    // armed belongs to a peer that is no longer managed. Cleanup using
+    // the captured connID + peerLog.
+    if !m.peerStillManaged(pubKey, connID) {
+        m.activityManager.RemovePeer(peerLog, connID)
         return
     }
-    mp.peerCfg.Log.Infof("watchdog: recovery complete (activity-no-listener: listener re-armed for peer in watcherActivity)")
+    peerLog.Infof("watchdog: recovery complete (activity-no-listener: listener re-armed for peer in watcherActivity)")
 }
 
 // peerStillManaged is the v0.7 Re-Validate helper for both recovery paths.
@@ -1241,7 +1284,7 @@ Damit keine offenen Spec-Fragen mehr → **Implementation kann starten**.
 
 ## 8. Rollout-Plan
 
-### 8.1 Branch + Commit-Struktur (v0.4 — Base fixiert)
+### 8.1 Branch + Commit-Struktur (v0.7 — 6 Commits inkl. HasPeer/Stufe 6)
 
 **Codex-Befund v0.2**: `upstream/main` hat den alten Lazy-Manager und 1-slot
 `inactivePeersChan`, aber **nicht** die komplette Phase-3.7i-Zwei-Timer- /
@@ -1257,7 +1300,7 @@ ICEInactive-Logik. Daher zwei verschiedene Branch-Strategien:
 - Test-Coverage: 1 neuer Unit-Test
 - Upstream-PR-Strategie: separat einreichen als NICHT-Phase-3.7i-blockierender Fix
 
-**Stufen 0+2+3+4+5 (Panic-Recovery + Watchdog + Refaktor + Wiring + TransportSnapshot) — Phase-3.7i-Stack**:
+**Stufen 0+2+3+4+5+6 (Panic-Recovery + Watchdog + Refaktor + Wiring + TransportSnapshot + HasPeer) — Phase-3.7i-Stack**:
 - **Base v0.4 (Codex-Empfehlung)**: `phase3.7i-runtime-bugfixes-v0.5`
   - enthält den relevanten Lazy-Manager-Stand: `NewManagerWithTwoTimers`,
     `expectedWatcher`, HA-Defer-Logik, Activity-AttachICE
