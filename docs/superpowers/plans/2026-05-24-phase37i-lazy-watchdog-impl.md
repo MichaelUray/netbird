@@ -56,8 +56,7 @@ in the recovery code paths) is enforced by code review.
 | `client/internal/lazyconn/manager/recovery_test.go` | Create | Stufe-3 Refactor-Tests + Task-4 R14-test |
 | `client/internal/lazyconn/manager/watchdog_test.go` | Create | Stufe-2 Watchdog-Tests + Integration-Tests |
 
-**Eines der 6 Commits ist KEIN bestehender Source-File-Touch:**
-- Commit 4 (`activity: add HasPeer + fix mockEndpointManager race`) berührt zusätzlich noch `listener_bind_test.go` für den Pre-Implementation Test-Mock-Race-Fix.
+**Note**: Commit 4 (`activity: add HasPeer + fix mockEndpointManager race`) is the only commit that modifies a pre-existing test file — `listener_bind_test.go` — to fix the data-race in `mockEndpointManager`. All other commits modify production source files and/or add new test files.
 
 ---
 
@@ -511,7 +510,15 @@ func newTestHarness(t *testing.T) *testHarness {
 		peerStore: peerStore,
 		mgr:       mgr,
 	}
-	t.Cleanup(func() { cancel() })
+	t.Cleanup(func() {
+		cancel()
+		// activity.Manager.MonitorPeerActivity spawns real UDP-listener
+		// goroutines per peer. Without Close() they leak across tests
+		// (visible as "ReadPackets" goroutines in -race reports). The
+		// existing TestManager_MonitorPeerActivity in activity/manager_test.go
+		// uses the same pattern (defer mgr.Close()).
+		mgr.activityManager.Close()
+	})
 	return h
 }
 
@@ -1731,29 +1738,15 @@ Test-only hook example: add a package-level var `var testListenerArmHook func()`
 
 - [ ] **Step 6.13: Write integration tests**
 
-Append to `watchdog_test.go`:
+Append to `watchdog_test.go`. Integration tests call `mgr.runReconcileWatchdog(ctx, 50*time.Millisecond)` directly in a goroutine they start themselves — they do NOT use `Start()` (which would spawn the consumer loop and require fully-wired peerStore traffic). Tests wait for at least 2-3 ticks (≈150-200ms with safety margin) before asserting recovery state.
 
 - `TestIntegration_InactivityStuck_WatchdogHeals` (Case a, full Manager wired + DropCounters drip)
 - `TestIntegration_ActivityNoListener_WatchdogHeals` (Case b — start a peer, simulate hung-Close after state-flip, watchdog re-arms)
 - `TestIntegration_PanicInConsumer_WatchdogHeals` (Stufe 0 + Stufe 2 cooperation)
 
-These should use a controllable tick interval (override `defaultReconcileInterval` via a package-level var, or pass it as a Manager-config field) for fast test execution (e.g. 50ms instead of 120s).
+- [ ] **Step 6.14: Tick interval is already parameterized**
 
-- [ ] **Step 6.14: Make the tick interval configurable for tests**
-
-Refactor `defaultReconcileInterval` from a `const` to a `var` so tests can monkey-patch it, OR (cleaner) make `runReconcileWatchdog` take the interval as a parameter:
-
-```go
-func (m *Manager) runReconcileWatchdog(ctx context.Context, interval time.Duration) {
-	// ...
-	ticker := time.NewTicker(interval)
-	// ...
-}
-```
-
-And `Start()` calls `go m.runReconcileWatchdog(ctx, defaultReconcileInterval)`.
-
-Integration tests then call `mgr.runReconcileWatchdog(ctx, 50*time.Millisecond)` directly.
+`runReconcileWatchdog(ctx context.Context, interval time.Duration)` was defined with the interval parameter in Step 6.8. `Start()` (Step 6.9) passes `defaultReconcileInterval`. Integration tests (Step 6.13) call `mgr.runReconcileWatchdog(ctx, 50*time.Millisecond)` directly to bypass the 120s default. No additional refactoring needed.
 
 - [ ] **Step 6.15: Run full Stufe-2 test set with -race**
 
@@ -1836,12 +1829,17 @@ git log --format='%H %an <%ae> | %cn <%ce> | %s' phase3.7i-runtime-bugfixes-v0.5
 ```
 Expected: every commit has Author + Committer `Michael Uray <25169478+MichaelUray@users.noreply.github.com>`. No `Co-Authored-By: Claude/Codex` trailers.
 
-- [ ] **Step 7.4: Push to fork**
+- [ ] **Step 7.4: Push to fork (MichaelUray/netbird)**
+
+Verify remotes first:
+```bash
+git remote -v
+```
+Expected: `origin` points to `MichaelUray/netbird` (the fork). If `origin` is upstream `netbirdio/netbird`, push explicitly to the fork remote (commonly named `michael` or `fork`). Per durable user policy, never push to `netbirdio/netbird` without explicit user OK for an upstream PR.
 
 ```bash
 git push -u origin pr/g-phase3.7i-lazy-watchdog
 ```
-Note: NOT pushing to netbirdio/netbird — only to MichaelUray/netbird fork per durable user policy.
 
 - [ ] **Step 7.5: Hardware-Soak deploy (per Spec Section 6.3, before any upstream PR)**
 
