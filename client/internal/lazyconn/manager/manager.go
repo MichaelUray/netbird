@@ -70,12 +70,12 @@ func setTestListenerArmHook(fn func(pubKey string)) {
 const userInitiatedAttachICECooldown = 30 * time.Second
 
 // defaultReconcileInterval is the production tick period for the
-// lazyconn reconcile-watchdog (Phase 3.7i Stufe 2 / Task 6). The
-// watchdog heals two stuck states (notifyChan-drop and post-Close-hang)
-// detected by combining inactivity DropCounters + TransportSnapshot +
-// activity.HasPeer. 120 s is a balance between recovery latency (worst
-// case ~2 min until a stuck VNC peer self-heals) and CPU overhead.
-// Tests use shorter intervals via runReconcileWatchdog(ctx, interval).
+// lazyconn reconcile-watchdog. The watchdog heals two stuck states
+// (notifyChan-drop and post-Close-hang) detected by combining
+// inactivity DropCounters + TransportSnapshot + activity.HasPeer.
+// 120 s is a balance between recovery latency (worst case ~2 min
+// until a stuck peer self-heals) and CPU overhead. Tests use shorter
+// intervals via runReconcileWatchdog(ctx, interval).
 const defaultReconcileInterval = 120 * time.Second
 
 type watcherType int
@@ -223,9 +223,9 @@ func (m *Manager) UpdateRouteHAMap(haMap route.HAMap) {
 // (manager.go NewManager only initializes it for userspace-bind WG). The
 // kernel-mode path skips the inactivity-channel arm entirely; without this
 // guard a kernel-mode caller would nil-deref on
-// m.inactivityManager.InactivePeersChan(). v0.7 Stufe 0 hardening (Codex
-// round-11): the watchdog (Task 6) also lives only on the userspace path
-// because relayDrops + inactivityManager are its inputs.
+// m.inactivityManager.InactivePeersChan(). The reconcile-watchdog also
+// lives only on the userspace path because relayDrops +
+// inactivityManager are its inputs.
 func (m *Manager) Start(ctx context.Context) {
 	defer m.close()
 
@@ -244,7 +244,7 @@ func (m *Manager) Start(ctx context.Context) {
 	// Userspace-bind: inactivity tracking active. Task 6 adds the
 	// runReconcileWatchdog goroutine into this block.
 	go m.inactivityManager.Start(ctx)
-	go m.runReconcileWatchdog(ctx, defaultReconcileInterval) // v0.7 Stufe 4 wiring
+	go m.runReconcileWatchdog(ctx, defaultReconcileInterval)
 
 	for {
 		select {
@@ -259,7 +259,7 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 // safeOnPeerActivity wraps onPeerActivity with a panic recovery so the
-// consumer goroutine survives bugs in downstream handlers. v0.7 Stufe 0
+// consumer goroutine survives bugs in downstream handlers. Pure
 // hardening — does NOT fix stuck-state symptoms (a Go panic crashes
 // the whole process unless recovered here), but prevents future
 // regressions.
@@ -803,10 +803,11 @@ func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
 	m.managedPeersMu.Unlock()
 
 	// Phase 2: blocking I/O outside lock. Sequential close → listener-arm
-	// (v0.3 ordering restored after v0.4 race finding). Then a post-arm
-	// Re-Validate (v0.7.1 R14): if RemovePeer/ExcludePeer raced between
-	// our state-flip and listener-arm, the listener we just installed
-	// belongs to a no-longer-managed peer. Remove it.
+	// (running PeerConnIdle under managedPeersMu blocked on a hanging
+	// Conn.Close → wgWatcherWg.Wait, freezing every other state
+	// transition). Then a post-arm Re-Validate: if RemovePeer/ExcludePeer
+	// raced between our state-flip and listener-arm, the listener we
+	// just installed belongs to a no-longer-managed peer. Remove it.
 	for _, p := range toTransition {
 		m.peerStore.PeerConnIdle(p.pubKey)
 		m.armActivityListener(p.mp)
@@ -819,9 +820,8 @@ func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
 
 // isStuckPeer is the Case-a heuristic: peer is watcherInactivity but the
 // notifyChan dropped events AND both transports are disconnected.
-// v0.5 Codex round-4: ONLY relayDrops trigger this — iceDrops semantically
-// belong to ConnMgr.runDynamicInactivityLoop (DetachICEForPeer), not full
-// sleep.
+// ONLY relayDrops trigger this — iceDrops semantically belong to
+// ConnMgr.runDynamicInactivityLoop (DetachICEForPeer), not full sleep.
 func isStuckPeer(iceDisc, relayDisc bool, deltaRelay uint64) bool {
 	return iceDisc && relayDisc && deltaRelay > 0
 }
@@ -829,8 +829,9 @@ func isStuckPeer(iceDisc, relayDisc bool, deltaRelay uint64) bool {
 // recoverInactivityStuck handles Case-a: peer in watcherInactivity, but
 // notifyChan dropped the inactivity-timed-out event so the state never
 // flipped. State-flip + arm listener; NO Close (Conn is already
-// disconnected). HA-defer applies. v0.7.1: capture connID+peerLog BEFORE
-// unlock to use the real activity.Manager.RemovePeer signature.
+// disconnected). HA-defer applies. Captures connID+peerLog BEFORE
+// unlock so the post-arm Re-Validate cleanup can call
+// activity.Manager.RemovePeer with stable arguments.
 func (m *Manager) recoverInactivityStuck(ctx context.Context, pubKey string, stuckBatch map[string]struct{}) {
 	m.managedPeersMu.Lock()
 	cfg, ok := m.managedPeers[pubKey]
@@ -935,8 +936,10 @@ func (m *Manager) spawnRecovery(ctx context.Context, pubKey string,
 //   - PHASE C: per-peer classification via TransportSnapshot + HasPeer.
 //   - PHASE D: bounded async recovery goroutine per stuck peer.
 //
-// The watchdog NEVER calls PeerConnIdle/Conn.Close — that's the v0.4
-// BLOCKER deadlock path between conn.mu and managedPeersMu.
+// The watchdog NEVER calls PeerConnIdle/Conn.Close — that path
+// deadlocks between conn.mu and managedPeersMu (Close holds conn.mu
+// while waiting on wgWatcherWg; a concurrent OnPeerActivity holds
+// managedPeersMu while waiting for conn.mu in PeerConnOpen).
 func (m *Manager) reconcileTick(ctx context.Context, lastRelayDrops, lastICEDrops *uint64,
 	recoveringPeers map[string]struct{}, recoveringMu *sync.Mutex) {
 
