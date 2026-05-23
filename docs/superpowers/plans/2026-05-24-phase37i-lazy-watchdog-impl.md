@@ -26,9 +26,9 @@
 | `client/internal/lazyconn/inactivity/manager.go` | Modify | + `DropCounters` + Drop-Log (Stufe 1) ~30 LOC |
 | `client/internal/lazyconn/inactivity/manager_test.go` | Modify | Stufe-1 Tests |
 | `client/internal/lazyconn/manager/manager.go` | Modify | Stufe 0 + 3-Refactor + 2-Watchdog + 4-Wiring ~250 LOC |
-| `client/internal/lazyconn/manager/recovery_test.go` | Create | Stufe-3 Refactor-Tests |
-| `client/internal/lazyconn/manager/watchdog_test.go` | Create | Stufe-2 Watchdog-Tests |
-| `client/internal/lazyconn/manager/panic_recovery_test.go` | Create | Stufe-0 Panic-Tests |
+| `client/internal/lazyconn/manager/manager_test.go` | **Create** (does NOT exist on base branch) | Package test-harness (mocks + helpers) — bootstrapped in Task 3 |
+| `client/internal/lazyconn/manager/recovery_test.go` | Create | Stufe-3 Refactor-Tests + Task-4 R14-test |
+| `client/internal/lazyconn/manager/watchdog_test.go` | Create | Stufe-2 Watchdog-Tests + Integration-Tests |
 
 **Eines der 6 Commits ist KEIN bestehender Source-File-Touch:**
 - Commit 4 (`activity: add HasPeer + fix mockEndpointManager race`) berührt zusätzlich noch `listener_bind_test.go` für den Pre-Implementation Test-Mock-Race-Fix.
@@ -73,6 +73,12 @@ Expected: all green. If anything fails on base branch, STOP and investigate befo
 
 - [ ] **Step 1.1: Write failing test for both-connected case**
 
+**API note (verified against `worker/state.go`)**:
+- Constructor: `worker.NewAtomicStatus() *AtomicWorkerStatus` (NOT `NewAtomicWorkerStatus`)
+- Setters: `SetConnected()` and `SetDisconnected()` (NOT a generic `Set(Status)`)
+- Reader: `Get() Status`
+- Enum: `worker.StatusConnected`, `worker.StatusDisconnected`
+
 Create `client/internal/peer/conn_transport_snapshot_test.go`:
 
 ```go
@@ -86,11 +92,11 @@ import (
 
 func TestTransportSnapshot_BothConnected(t *testing.T) {
 	conn := &Conn{
-		statusICE:   worker.NewAtomicWorkerStatus(),
-		statusRelay: worker.NewAtomicWorkerStatus(),
+		statusICE:   worker.NewAtomicStatus(),
+		statusRelay: worker.NewAtomicStatus(),
 	}
-	conn.statusICE.Set(worker.StatusConnected)
-	conn.statusRelay.Set(worker.StatusConnected)
+	conn.statusICE.SetConnected()
+	conn.statusRelay.SetConnected()
 
 	iceDisc, relayDisc := conn.TransportSnapshot()
 	if iceDisc || relayDisc {
@@ -136,10 +142,10 @@ Append to `client/internal/peer/conn_transport_snapshot_test.go`:
 ```go
 func TestTransportSnapshot_BothDisconnected(t *testing.T) {
 	conn := &Conn{
-		statusICE:   worker.NewAtomicWorkerStatus(),
-		statusRelay: worker.NewAtomicWorkerStatus(),
+		statusICE:   worker.NewAtomicStatus(),
+		statusRelay: worker.NewAtomicStatus(),
 	}
-	// Default is StatusDisconnected (iota = 0)
+	// NewAtomicStatus sets StatusDisconnected as default
 	iceDisc, relayDisc := conn.TransportSnapshot()
 	if !iceDisc || !relayDisc {
 		t.Fatalf("expected (true, true), got (%v, %v)", iceDisc, relayDisc)
@@ -148,11 +154,11 @@ func TestTransportSnapshot_BothDisconnected(t *testing.T) {
 
 func TestTransportSnapshot_RelayOnly(t *testing.T) {
 	conn := &Conn{
-		statusICE:   worker.NewAtomicWorkerStatus(),
-		statusRelay: worker.NewAtomicWorkerStatus(),
+		statusICE:   worker.NewAtomicStatus(),
+		statusRelay: worker.NewAtomicStatus(),
 	}
-	conn.statusICE.Set(worker.StatusDisconnected)
-	conn.statusRelay.Set(worker.StatusConnected)
+	conn.statusICE.SetDisconnected()
+	conn.statusRelay.SetConnected()
 
 	iceDisc, relayDisc := conn.TransportSnapshot()
 	if !iceDisc || relayDisc {
@@ -162,15 +168,15 @@ func TestTransportSnapshot_RelayOnly(t *testing.T) {
 
 func TestTransportSnapshot_RaceSafe(t *testing.T) {
 	conn := &Conn{
-		statusICE:   worker.NewAtomicWorkerStatus(),
-		statusRelay: worker.NewAtomicWorkerStatus(),
+		statusICE:   worker.NewAtomicStatus(),
+		statusRelay: worker.NewAtomicStatus(),
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 10000; i++ {
-			conn.statusICE.Set(worker.StatusConnected)
-			conn.statusRelay.Set(worker.StatusDisconnected)
+			conn.statusICE.SetConnected()
+			conn.statusRelay.SetDisconnected()
 		}
 	}()
 	for i := 0; i < 10000; i++ {
@@ -180,20 +186,12 @@ func TestTransportSnapshot_RaceSafe(t *testing.T) {
 }
 ```
 
-- [ ] **Step 1.6: Verify the constructor signature**
-
-```bash
-grep -n "func NewAtomicWorkerStatus" client/internal/peer/worker/state.go
-```
-
-If `NewAtomicWorkerStatus` does not exist as a public constructor, find the correct constructor pattern (it might be `&worker.AtomicWorkerStatus{}` direct zero-value, since `atomic.Int32` zero-value is valid). Adjust test setup accordingly.
-
-- [ ] **Step 1.7: Run full Stufe-5 test set with -race**
+- [ ] **Step 1.6: Run full Stufe-5 test set with -race**
 
 Run: `go test -race ./client/internal/peer/ -run TestTransportSnapshot -count=1 -timeout 60s`
 Expected: PASS, no race reports.
 
-- [ ] **Step 1.8: Commit**
+- [ ] **Step 1.7: Commit**
 
 ```bash
 cd /home/ai-agent/projects/netbird
@@ -219,50 +217,12 @@ GetRelayState API)."
 
 **Files:**
 - Modify: `client/internal/lazyconn/manager/manager.go` (wrap handler calls in Start)
-- Create: `client/internal/lazyconn/manager/panic_recovery_test.go` (~80 LOC)
 
-**Why second:** Pure hardening, smallest change, can land independently. Does NOT fix the stuck-state (Codex round-2 verdict) but prevents future daemon crashes.
+**Why second:** Pure defensive glue around the existing consumer-loop handlers. Smallest change, no behaviour change in the happy path. Implementation-only — the panic-injection integration test ships in Task 6 alongside the watchdog tests (the dedicated harness exists from Task 3, and combined panic-recovery + watchdog-recovery is the realistic test scenario).
 
-- [ ] **Step 2.1: Write failing test for panic in onPeerActivity**
+- [ ] **Step 2.1: Add the panic-recovery wrappers**
 
-Create `client/internal/lazyconn/manager/panic_recovery_test.go`. Skeleton (adapt to existing test-harness):
-
-```go
-package manager
-
-import (
-	"context"
-	"testing"
-	"time"
-
-	"github.com/netbirdio/netbird/client/internal/lazyconn"
-	peerid "github.com/netbirdio/netbird/client/internal/peer/id"
-)
-
-// TestManagerStart_PanicInOnPeerActivity_DoesNotKillConsumer: inject a
-// panic via a test-only hook; assert that Start's select loop continues
-// to drain subsequent events.
-func TestManagerStart_PanicInOnPeerActivity_DoesNotKillConsumer(t *testing.T) {
-	// Use the existing test harness pattern from manager_test.go.
-	// The strategy: send a peerConnID that triggers a panic in
-	// onPeerActivity (e.g. via a test-injected fault), then send a
-	// second peerConnID that the recovered loop should still process.
-	t.Skip("TODO: implement once test harness exposes panic-injection hook")
-}
-```
-
-Note: Read `client/internal/lazyconn/manager/manager_test.go` first to understand the existing test harness (mock peerStore, mock wgIface). Adapt the panic test to that pattern. The simplest panic-injection is to use a peerConnID that doesn't exist in `managedPeersByConnID` and assert no goroutine-leak; but since the existing code already log-warns on missing peers without panic, you may need to inject via a test-only `panicOnNextActivity bool` field.
-
-**Decision**: if panic-injection requires significant test-harness work, scope this commit to: just add the `defer recover()` wrappers + lint/compile + a smoke test that confirms `Start()` still returns on `ctx.Done()`. Document the missing panic-injection-test as a follow-up in the commit message.
-
-- [ ] **Step 2.2: Run test to verify it fails (or is skipped)**
-
-Run: `go test ./client/internal/lazyconn/manager/ -run TestManagerStart_PanicInOnPeerActivity -count=1`
-Expected: SKIP (per Step 2.1 placeholder) OR FAIL.
-
-- [ ] **Step 2.3: Wrap handler calls with defer recover() in Start**
-
-Edit `client/internal/lazyconn/manager/manager.go` around line 180-190:
+Edit `client/internal/lazyconn/manager/manager.go`. Replace the consumer-loop `Start()` (currently lines 173-191) with the wrapped variant + helper functions:
 
 ```go
 // Start starts the manager and listens for peer activity and inactivity events
@@ -311,24 +271,18 @@ func (m *Manager) safeOnPeerInactivityTimedOut(peerIDs map[string]struct{}) {
 }
 ```
 
-- [ ] **Step 2.4: Verify build + run package tests**
-
-Run: `go test -race ./client/internal/lazyconn/manager/ -count=1 -timeout 60s`
-Expected: all existing tests still PASS.
-
-- [ ] **Step 2.5: Implement actual panic-injection test (if test-harness permits)**
-
-If you can extend the test harness without too much yak-shaving: replace the t.Skip in Step 2.1 with a real test. Use a `t.Cleanup` to restore state. Otherwise: leave as Skip with a TODO and proceed.
-
-- [ ] **Step 2.6: Run full test set**
-
-Run: `go test -race ./client/internal/lazyconn/manager/ -count=1 -timeout 120s`
-Expected: PASS.
-
-- [ ] **Step 2.7: Commit**
+- [ ] **Step 2.2: Build + run existing tests**
 
 ```bash
-git add client/internal/lazyconn/manager/manager.go client/internal/lazyconn/manager/panic_recovery_test.go
+go build ./client/...
+go test -race ./client/internal/lazyconn/... -count=1 -timeout 120s
+```
+Expected: PASS. No new tests in this commit; verification is "existing behaviour unchanged in happy path". The panic-recovery itself is tested in Task 6 via `TestIntegration_PanicInConsumer_WatchdogHeals`.
+
+- [ ] **Step 2.3: Commit**
+
+```bash
+git add client/internal/lazyconn/manager/manager.go
 GIT_AUTHOR_NAME="Michael Uray" GIT_AUTHOR_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 GIT_COMMITTER_NAME="Michael Uray" GIT_COMMITTER_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 git commit -m "lazyconn/manager: defer recover() around consumer loop handlers
@@ -341,86 +295,255 @@ Pure hardening — does NOT fix the lazy-state stuck symptoms (a panic
 crashes the entire Go process unless recovered here, so this prevents
 future regressions but cannot resurrect an already-dead daemon).
 
+No dedicated unit test in this commit (the wrapper is defensive glue
+with no behavioural side-effects in the happy path); the panic-injection
+test ships alongside the watchdog in
+TestIntegration_PanicInConsumer_WatchdogHeals (final commit).
+
 See docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md
 Section 5.2 Stufe 0."
 ```
 
 ---
 
-## Task 3 (Commit 3): lazyconn/manager — Split state-mutation from blocking I/O (Stufe 3 Refactor)
+## Task 3 (Commit 3): lazyconn/manager — Split state-mutation from blocking I/O + R14 protection + bootstrap test harness (Stufe 3 Refactor)
 
 **Files:**
-- Modify: `client/internal/lazyconn/manager/manager.go` (~50 LOC refactor of onPeerInactivityTimedOut + 2 new helpers)
-- Create: `client/internal/lazyconn/manager/recovery_test.go` (~150 LOC)
+- Modify: `client/internal/lazyconn/manager/manager.go` (~70 LOC: 3 new helpers + refactor of onPeerInactivityTimedOut)
+- Create: `client/internal/lazyconn/manager/manager_test.go` (~120 LOC test harness + mocks)
+- Create: `client/internal/lazyconn/manager/recovery_test.go` (~200 LOC Stufe-3 tests)
 
-**Why third:** Pure refactor with behavior preserved (close still synchronous after state-flip + unlock). Establishes the helpers that Commit 5 (Watchdog) will reuse.
+**Why third:** Refactor + bootstrap of the package's test harness. Codex round-8 BLOCKER 2: the v1-plan deferred R14-Race-Protection to Task 6, but `onPeerInactivityTimedOut` ALSO drops `managedPeersMu` before calling `armActivityListener` — same race window. Task 3 must introduce `peerStillManaged` + cleanup-on-mismatch HERE for the inactivity-timeout path; Task 6 then reuses it for the watchdog.
 
-- [ ] **Step 3.1: Identify the current onPeerInactivityTimedOut**
+**Pre-Implementation note**: `client/internal/lazyconn/manager/manager_test.go` does NOT exist in the base branch. This task is also the package's first test-file; the harness must be self-contained.
 
-Read `client/internal/lazyconn/manager/manager.go` around line 629 (per spec) to confirm the current implementation. Note the existing `PeerConnIdle` call site that runs UNDER `managedPeersMu` (the TODO `potentially can be optimized` line).
+### Sub-tasks: bootstrap test harness
 
-- [ ] **Step 3.2: Write failing test for the new helper**
+- [ ] **Step 3.1: Verify package state before edits**
 
-Create `client/internal/lazyconn/manager/recovery_test.go`:
+```bash
+ls -la client/internal/lazyconn/manager/
+```
+Expected: only `manager.go`. No test file. If a test file appeared between plan-write and execution, read it first and adapt the harness below to extend, not replace.
+
+- [ ] **Step 3.2: Create the test harness file**
+
+Create `client/internal/lazyconn/manager/manager_test.go` with the package mocks + helpers. Note: this file deliberately contains NO `Test*` function — pure harness. Tests go in `recovery_test.go` (this Task) and `watchdog_test.go` (Task 6).
 
 ```go
 package manager
 
 import (
+	"context"
+	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	"github.com/netbirdio/netbird/client/internal/lazyconn"
+	peerid "github.com/netbirdio/netbird/client/internal/peer/id"
+	"github.com/netbirdio/netbird/client/internal/peerstore"
+	"github.com/netbirdio/netbird/monotime"
 )
 
-// TestTransitionToActivityWatcherStateOnly_HappyPath: verify that the
-// state-only helper flips expectedWatcher to watcherActivity and removes
-// the peer from the inactivity manager, but does NOT call PeerConnIdle.
-func TestTransitionToActivityWatcherStateOnly_HappyPath(t *testing.T) {
-	t.Skip("TODO: implement once a unit-test harness for managedPeer exists")
+// mockWGIface satisfies lazyconn.WGIface for unit tests in this package.
+// It provides nil-implementations for all interface methods plus a
+// controllable LastActivities map that tests can mutate.
+type mockWGIface struct {
+	mu             sync.Mutex
+	lastActivities map[string]monotime.Time
+}
+
+func newMockWGIface() *mockWGIface {
+	return &mockWGIface{lastActivities: map[string]monotime.Time{}}
+}
+
+func (m *mockWGIface) RemovePeer(string) error { return nil }
+func (m *mockWGIface) UpdatePeer(string, []netip.Prefix, time.Duration, *net.UDPAddr, *wgtypes.Key) error {
+	return nil
+}
+func (m *mockWGIface) IsUserspaceBind() bool { return false }
+func (m *mockWGIface) Address() wgaddr.Address {
+	return wgaddr.Address{
+		IP:      netip.MustParseAddr("100.64.0.1"),
+		Network: netip.MustParsePrefix("100.64.0.0/16"),
+	}
+}
+func (m *mockWGIface) LastActivities() map[string]monotime.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]monotime.Time, len(m.lastActivities))
+	for k, v := range m.lastActivities {
+		out[k] = v
+	}
+	return out
+}
+
+// testIdleCounter is a hook installed on the test peerStore so tests can
+// assert how many times PeerConnIdle was called. Watchdog tests assert
+// counter == 0 (no Close in watchdog recovery path).
+type testIdleCounter struct {
+	count atomic.Int64
+}
+
+func (c *testIdleCounter) inc() { c.count.Add(1) }
+func (c *testIdleCounter) get() int64 { return c.count.Load() }
+
+// testHarness builds a *Manager with controllable mock dependencies.
+// Tests modify the harness fields (e.g. wgIface.lastActivities) and then
+// drive the manager via direct method calls.
+type testHarness struct {
+	t           *testing.T
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wgIface     *mockWGIface
+	peerStore   *peerstore.Store
+	idleCounter *testIdleCounter
+	mgr         *Manager
+}
+
+// newTestHarness wires a *Manager with two-timer inactivity, real
+// activity.Manager (cheap), and a real peerstore.Store. Tests can add
+// peers via h.addPeer(pubKey, connID).
+func newTestHarness(t *testing.T) *testHarness {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	wgIface := newMockWGIface()
+	peerStore := peerstore.NewConnStore() // verify exact constructor name during Step 3.3 below
+	cfg := Config{
+		ICEInactivityThreshold:   time.Minute,
+		RelayInactivityThreshold: time.Minute,
+	}
+	mgr := NewManager(cfg, ctx, peerStore, wgIface)
+	h := &testHarness{
+		t:           t,
+		ctx:         ctx,
+		cancel:      cancel,
+		wgIface:     wgIface,
+		peerStore:   peerStore,
+		idleCounter: &testIdleCounter{},
+		mgr:         mgr,
+	}
+	t.Cleanup(func() { cancel() })
+	return h
+}
+
+// newTestPeerCfg builds a minimal valid PeerConfig. The PeerConnID is
+// derived from the pubKey via a deterministic stub.
+func newTestPeerCfg(pubKey string) lazyconn.PeerConfig {
+	return lazyconn.PeerConfig{
+		PublicKey:  pubKey,
+		PeerConnID: peerid.ConnID(&pubKeyStub{pubKey}),
+		Log:        log.WithField("peer", pubKey),
+	}
+}
+
+// pubKeyStub is a deterministic peerid.ConnID source: address of the
+// stub is stable per pubKey because newTestPeerCfg constructs a fresh
+// struct each call, but we re-use the SAME instance per (test, pubKey)
+// via the package-level connIDCache below.
+type pubKeyStub struct {
+	pubKey string
+}
+
+func (s *pubKeyStub) ConnID() peerid.ConnID {
+	return peerid.ConnID(s)
 }
 ```
 
-If `manager_test.go` already has a builder/harness for setting up `*Manager` with mocks, use that pattern. Otherwise scope the test to call the helper directly with a hand-rolled `*managedPeer`.
+- [ ] **Step 3.3: Verify the peerstore constructor + Config field names**
 
-- [ ] **Step 3.3: Implement `transitionToActivityWatcherStateOnly`**
+The harness above contains TWO unverified assumptions (intentionally surfaced as a separate step instead of guessed-and-buried):
 
-Edit `client/internal/lazyconn/manager/manager.go`. Add (near other private helpers):
+```bash
+grep -n "^func New" client/internal/peerstore/store.go
+grep -n "ICEInactivityThreshold\|RelayInactivityThreshold\|type Config struct" client/internal/lazyconn/manager/manager.go
+```
+
+Adjust the harness's `peerstore.NewConnStore()` and `Config{...}` field names to match what `grep` returns. If `NewConnStore` does not exist, use whatever constructor signature the file shows. Document the chosen constructor in a comment.
+
+If `Config` is not the exposed type or fields differ: read the surrounding context in `manager.go` for the correct construction pattern (used by `engine.go`).
+
+- [ ] **Step 3.4: Verify the harness compiles**
+
+```bash
+go vet ./client/internal/lazyconn/manager/
+go test -run=^$ ./client/internal/lazyconn/manager/  # compile only, no tests yet
+```
+Expected: clean compile. Fix any imports / field mismatches uncovered by Step 3.3 before proceeding.
+
+### Sub-tasks: implementation (manager.go)
+
+- [ ] **Step 3.5: Implement `transitionToActivityWatcherStateOnly` + `armActivityListener` + `peerStillManaged`**
+
+Edit `client/internal/lazyconn/manager/manager.go`. Add (near other private helpers — preferred location: just above `onPeerInactivityTimedOut`):
 
 ```go
-// transitionToActivityWatcherStateOnly performs the non-blocking state-machine
-// part of the watcherInactivity → watcherActivity transition (expectedWatcher
-// flip + RemovePeer from inactivity manager).
+// transitionToActivityWatcherStateOnly performs the non-blocking
+// state-machine part of the watcherInactivity → watcherActivity
+// transition (expectedWatcher flip + RemovePeer from inactivity manager).
 // Caller MUST hold m.managedPeersMu. No I/O here.
 func (m *Manager) transitionToActivityWatcherStateOnly(mp *managedPeer) {
 	mp.peerCfg.Log.Infof("transition to watcherActivity (state-only) from %v", mp.expectedWatcher)
 	mp.expectedWatcher = watcherActivity
 	m.inactivityManager.RemovePeer(mp.peerCfg.PublicKey)
 }
-```
 
-- [ ] **Step 3.4: Implement `armActivityListener`**
-
-Add right below:
-
-```go
-// armActivityListener installs the activity monitor for a peer. Idempotent
-// when called against a peer that already has an active monitor (the
-// activity manager internally guards against double-arm). No lock required
-// (activityManager has its own internal mutex).
+// armActivityListener installs the activity monitor for a peer.
+// Idempotent — activity.Manager.MonitorPeerActivity logs a warning and
+// returns nil when called for an already-monitored connID. No lock
+// required (activityManager has its own internal mutex).
 func (m *Manager) armActivityListener(mp *managedPeer) {
 	if err := m.activityManager.MonitorPeerActivity(*mp.peerCfg); err != nil {
 		mp.peerCfg.Log.Errorf("failed to create activity monitor: %v", err)
 	}
 }
+
+// peerStillManaged is the post-arm Re-Validate helper for any code path
+// that releases managedPeersMu before calling armActivityListener.
+// Re-acquires the lock briefly to verify the peer is still managed with
+// the SAME PeerConnID, defending against RemovePeer/ExcludePeer racing
+// (R14). Returns true if peer is still managed and connID matches.
+//
+// Used by:
+//   - onPeerInactivityTimedOut (this commit)
+//   - recoverInactivityStuck + recoverActivityNoListener (Watchdog, Task 6)
+func (m *Manager) peerStillManaged(pubKey string, expectedConnID peerid.ConnID) bool {
+	m.managedPeersMu.Lock()
+	defer m.managedPeersMu.Unlock()
+	cfg, ok := m.managedPeers[pubKey]
+	if !ok {
+		return false
+	}
+	return cfg.PeerConnID == expectedConnID
+}
 ```
 
-- [ ] **Step 3.5: Refactor `onPeerInactivityTimedOut`**
+- [ ] **Step 3.6: Refactor `onPeerInactivityTimedOut` with R14 protection**
 
-Replace the existing implementation with:
+Replace the existing implementation:
 
 ```go
 func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
-	// Phase 1: short lock — state mutations only
+	// Phase 1: short lock — state mutations + capture of connID+log
+	// BEFORE unlock for safe use of activityManager.RemovePeer on
+	// cleanup (signature is RemovePeer(*log.Entry, peerid.ConnID),
+	// see activity/manager.go:84).
+	type pending struct {
+		mp      *managedPeer
+		connID  peerid.ConnID
+		peerLog *log.Entry
+		pubKey  string
+	}
+
 	m.managedPeersMu.Lock()
-	toTransition := make([]*managedPeer, 0, len(peerIDs))
+	toTransition := make([]pending, 0, len(peerIDs))
 	for peerID := range peerIDs {
 		peerCfg, ok := m.managedPeers[peerID]
 		if !ok {
@@ -440,74 +563,189 @@ func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
 		}
 		mp.peerCfg.Log.Infof("connection timed out")
 		m.transitionToActivityWatcherStateOnly(mp)
-		toTransition = append(toTransition, mp)
+		toTransition = append(toTransition, pending{
+			mp:      mp,
+			connID:  peerCfg.PeerConnID,
+			peerLog: peerCfg.Log,
+			pubKey:  peerCfg.PublicKey,
+		})
 	}
 	m.managedPeersMu.Unlock()
 
 	// Phase 2: blocking I/O outside lock. Sequential close → listener-arm
-	// (v0.3 ordering, restored after v0.4 race finding). If Close hangs
-	// here, the peer enters the stuck state (watcherActivity without
-	// listener) and the watchdog (Stufe 2, separate commit) will pick it
-	// up. The hung close goroutine is then leaked but does not block
-	// further recovery.
-	for _, mp := range toTransition {
-		m.peerStore.PeerConnIdle(mp.peerCfg.PublicKey)
-		m.armActivityListener(mp)
+	// (v0.3 ordering restored after v0.4 race finding). Then a post-arm
+	// Re-Validate (v0.7.1 R14): if RemovePeer/ExcludePeer raced between
+	// our state-flip and listener-arm, the listener we just installed
+	// belongs to a no-longer-managed peer. Remove it.
+	for _, p := range toTransition {
+		m.peerStore.PeerConnIdle(p.pubKey)
+		m.armActivityListener(p.mp)
+		if !m.peerStillManaged(p.pubKey, p.connID) {
+			m.activityManager.RemovePeer(p.peerLog, p.connID)
+		}
 	}
 }
 ```
 
-- [ ] **Step 3.6: Verify build + existing tests still pass**
+Note the `log.Entry` import: ensure the file already imports `log "github.com/sirupsen/logrus"`. If `pending.peerLog` type clashes with other usages, qualify as `*log.Entry` explicitly.
 
-Run: `go test -race ./client/internal/lazyconn/manager/ -count=1 -timeout 120s`
-Expected: all existing tests PASS. The behavioural change (lock-released-during-close) MUST NOT regress existing inactivity-flow tests.
+- [ ] **Step 3.7: Verify build + existing tests still pass**
 
-- [ ] **Step 3.7: Write IOOutsideLock test**
+```bash
+go build ./client/...
+go test -race ./client/internal/lazyconn/... -count=1 -timeout 180s
+```
+Expected: PASS.
 
-Append to `recovery_test.go`:
+### Sub-tasks: unit tests (recovery_test.go)
+
+- [ ] **Step 3.8: Write `recovery_test.go` with concrete tests**
+
+Create `client/internal/lazyconn/manager/recovery_test.go`:
 
 ```go
-// TestOnPeerInactivityTimedOut_AfterRefactor_IOOutsideLock: instrument
-// peerStore.PeerConnIdle with a sleep, assert that managedPeersMu is
-// NOT held during that sleep (another goroutine can acquire it).
-func TestOnPeerInactivityTimedOut_AfterRefactor_IOOutsideLock(t *testing.T) {
-	t.Skip("TODO: needs test-only PeerConnIdle hook; defer to Commit 5 test harness")
+package manager
+
+import (
+	"testing"
+)
+
+// TestTransitionToActivityWatcherStateOnly_HappyPath: verify state-only
+// helper flips expectedWatcher and removes the peer from inactivity
+// manager, without any I/O or close.
+func TestTransitionToActivityWatcherStateOnly_HappyPath(t *testing.T) {
+	h := newTestHarness(t)
+	cfg := newTestPeerCfg("peer1")
+
+	h.mgr.managedPeersMu.Lock()
+	h.mgr.managedPeers[cfg.PublicKey] = &cfg
+	mp := &managedPeer{peerCfg: &cfg, expectedWatcher: watcherInactivity}
+	h.mgr.managedPeersByConnID[cfg.PeerConnID] = mp
+	h.mgr.transitionToActivityWatcherStateOnly(mp)
+	h.mgr.managedPeersMu.Unlock()
+
+	if mp.expectedWatcher != watcherActivity {
+		t.Fatalf("expected watcherActivity, got %v", mp.expectedWatcher)
+	}
+}
+
+// TestPeerStillManaged_Present: peer exists with matching connID → true.
+func TestPeerStillManaged_Present(t *testing.T) {
+	h := newTestHarness(t)
+	cfg := newTestPeerCfg("peer1")
+	h.mgr.managedPeersMu.Lock()
+	h.mgr.managedPeers[cfg.PublicKey] = &cfg
+	h.mgr.managedPeersByConnID[cfg.PeerConnID] = &managedPeer{peerCfg: &cfg, expectedWatcher: watcherInactivity}
+	h.mgr.managedPeersMu.Unlock()
+
+	if !h.mgr.peerStillManaged(cfg.PublicKey, cfg.PeerConnID) {
+		t.Fatal("expected true")
+	}
+}
+
+// TestPeerStillManaged_Removed: peer no longer in managedPeers → false.
+func TestPeerStillManaged_Removed(t *testing.T) {
+	h := newTestHarness(t)
+	cfg := newTestPeerCfg("peer1")
+	if h.mgr.peerStillManaged(cfg.PublicKey, cfg.PeerConnID) {
+		t.Fatal("expected false on empty Manager")
+	}
+}
+
+// TestPeerStillManaged_ConnIDChanged: peer re-added with different
+// ConnID between snapshot and re-validate → false.
+func TestPeerStillManaged_ConnIDChanged(t *testing.T) {
+	h := newTestHarness(t)
+	cfgOld := newTestPeerCfg("peer1")
+	h.mgr.managedPeersMu.Lock()
+	h.mgr.managedPeers[cfgOld.PublicKey] = &cfgOld
+	h.mgr.managedPeersByConnID[cfgOld.PeerConnID] = &managedPeer{peerCfg: &cfgOld, expectedWatcher: watcherInactivity}
+	h.mgr.managedPeersMu.Unlock()
+
+	// Now replace with a different cfg (different stub instance → different ConnID)
+	cfgNew := newTestPeerCfg("peer1")
+	h.mgr.managedPeersMu.Lock()
+	delete(h.mgr.managedPeersByConnID, cfgOld.PeerConnID)
+	h.mgr.managedPeers[cfgNew.PublicKey] = &cfgNew
+	h.mgr.managedPeersByConnID[cfgNew.PeerConnID] = &managedPeer{peerCfg: &cfgNew, expectedWatcher: watcherInactivity}
+	h.mgr.managedPeersMu.Unlock()
+
+	if h.mgr.peerStillManaged(cfgOld.PublicKey, cfgOld.PeerConnID) {
+		t.Fatal("expected false: ConnID changed since snapshot")
+	}
 }
 ```
 
-If the existing harness already supports a PeerConnIdle hook (check `peerstore_mock.go` or similar), implement the test fully. Otherwise leave skipped.
+**Note on `IOOutsideLock` and `RemoveRaceAfterUnlock` tests**: these need a test-only hook between `Unlock()` and `armActivityListener()`. Adding such a hook is light-touch but cross-cutting. **Decision**: add `RemoveRaceAfterUnlock` here in Task 3 because the race lives in the refactored code that this commit ships; defer `IOOutsideLock` to Task 6 where the watchdog test-harness already needs a `PeerConnIdle`-counter mock.
 
-- [ ] **Step 3.8: Run full package tests with -race**
+- [ ] **Step 3.9: Add the test-only hook to `manager.go` (R14 race instrumentation)**
 
-Run: `go test -race ./client/internal/lazyconn/manager/ -count=1 -timeout 120s`
-Expected: PASS.
+Add a package-level test-only hook in `manager.go` (top of file, near other vars or after the type definitions):
 
-- [ ] **Step 3.9: Commit**
+```go
+// testListenerArmHook is set by tests to inject a hook between the
+// armActivityListener call and the peerStillManaged Re-Validate inside
+// onPeerInactivityTimedOut + watchdog recovery paths. Production
+// codepaths leave this nil — no overhead beyond a nil-check.
+var testListenerArmHook func(pubKey string)
+```
+
+Modify `onPeerInactivityTimedOut`'s Phase 2 loop (from Step 3.6) to call the hook between arm and re-validate:
+
+```go
+	for _, p := range toTransition {
+		m.peerStore.PeerConnIdle(p.pubKey)
+		m.armActivityListener(p.mp)
+		if testListenerArmHook != nil {
+			testListenerArmHook(p.pubKey)
+		}
+		if !m.peerStillManaged(p.pubKey, p.connID) {
+			m.activityManager.RemovePeer(p.peerLog, p.connID)
+		}
+	}
+```
+
+**Decision: defer the actual R14-test to Task 4**. Reason: the assertion needs `activity.Manager.HasPeer(connID)` which lands in Task 4. The hook + cleanup-code ship in Task 3; the verification test in Task 4 (one-commit lag — acceptable; the test still validates the Task-3 fix). Task 4 adds `TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock` to `recovery_test.go` (NOT to Task-4's own `manager_test.go` in activity package).
+
+- [ ] **Step 3.10: Run package tests**
 
 ```bash
-git add client/internal/lazyconn/manager/manager.go client/internal/lazyconn/manager/recovery_test.go
+go test -race ./client/internal/lazyconn/manager/ -count=1 -timeout 120s
+```
+Expected: PASS.
+
+- [ ] **Step 3.11: Commit**
+
+```bash
+git add client/internal/lazyconn/manager/manager.go \
+        client/internal/lazyconn/manager/manager_test.go \
+        client/internal/lazyconn/manager/recovery_test.go
 GIT_AUTHOR_NAME="Michael Uray" GIT_AUTHOR_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 GIT_COMMITTER_NAME="Michael Uray" GIT_COMMITTER_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
-git commit -m "lazyconn/manager: split state-mutation from blocking I/O in inactivity-timeout path
+git commit -m "lazyconn/manager: refactor inactivity-timeout I/O outside lock + R14 race protection
 
-Refactors onPeerInactivityTimedOut into a two-phase pattern:
+Splits onPeerInactivityTimedOut into a two-phase pattern:
 - Phase 1: short managedPeersMu hold for the state-flip + HA-defer
-  check + inactivity-manager RemovePeer
-- Phase 2: blocking I/O (PeerConnIdle + armActivityListener) sequentially
-  AFTER unlock, restoring v0.3 close-then-listen ordering
+  check + inactivity-manager RemovePeer. Captures connID + peerLog
+  BEFORE unlock.
+- Phase 2: blocking I/O sequentially AFTER unlock: PeerConnIdle, then
+  armActivityListener, then a post-arm Re-Validate via peerStillManaged.
+  If RemovePeer/ExcludePeer raced between snapshot and arm, the orphan
+  listener is cleaned up via activityManager.RemovePeer.
 
-Extracts two helpers used here and (in a follow-up commit) by the
-watchdog: transitionToActivityWatcherStateOnly (under lock) and
-armActivityListener (lock-free, idempotent).
+Extracts three helpers used here and (in Task 6) by the watchdog:
+- transitionToActivityWatcherStateOnly (under lock)
+- armActivityListener (lock-free, idempotent)
+- peerStillManaged (re-validate after unlock)
 
 Behavioural change: PeerConnIdle no longer runs under managedPeersMu
 (the existing TODO 'potentially can be optimized' is now resolved).
-If PeerConnIdle hangs structurally, the peer enters the stuck state
-(watcherActivity + no listener) which the upcoming watchdog (Stufe 2)
-heals.
+
+Also bootstraps the package's test harness (manager_test.go) — the
+package had no test file before this commit.
 
 See docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md
-Section 5.2 Stufe 3 (v0.5 + v0.7.1 refinements)."
+Section 5.2 Stufe 3 + Section 7.1 R14."
 ```
 
 ---
@@ -568,24 +806,28 @@ Expected: PASS, no race reports.
 
 - [ ] **Step 4.5: Write failing test for `HasPeer` on empty Manager**
 
-Edit (or create) `client/internal/lazyconn/activity/manager_test.go` (or add new `has_peer_test.go`):
+**Existing harness in `activity/manager_test.go` provides** (verified):
+- `type MocWGIface struct{}` with all 5 `lazyconn.WGIface` methods implemented as no-ops returning sensible defaults (line 25-45).
+- `type MocPeer struct { PeerID string }` with `func (m *MocPeer) ConnID() peerid.ConnID { return peerid.ConnID(m) }` (line 17-23).
+- Constructor pattern: `mgr := NewManager(&MocWGIface{})` + `cfg := lazyconn.PeerConfig{ PublicKey, PeerConnID, Log }`.
+
+Append to `client/internal/lazyconn/activity/manager_test.go`:
 
 ```go
 func TestActivityManager_HasPeer_Empty(t *testing.T) {
-	mgr := NewManager(newMockWgIface(t)) // adapt to existing test harness
-	var dummyConnID peerid.ConnID // zero-value
-	if mgr.HasPeer(dummyConnID) {
-		t.Fatalf("expected HasPeer == false on empty Manager, got true")
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	dummy := &MocPeer{PeerID: "nonexistent"}
+	if mgr.HasPeer(dummy.ConnID()) {
+		t.Fatal("expected HasPeer == false on empty Manager")
 	}
 }
 ```
 
-Note: `newMockWgIface(t)` is a placeholder for whatever test setup the existing `manager_test.go` uses. Adapt.
-
 - [ ] **Step 4.6: Run test to verify it fails**
 
 Run: `go test ./client/internal/lazyconn/activity/ -run TestActivityManager_HasPeer_Empty -count=1`
-Expected: FAIL with `undefined: mgr.HasPeer`.
+Expected: FAIL with `undefined: mgr.HasPeer` (compile error).
 
 - [ ] **Step 4.7: Implement `HasPeer`**
 
@@ -611,35 +853,53 @@ Expected: PASS.
 
 - [ ] **Step 4.9: Add remaining HasPeer tests**
 
-Append (need to inspect existing test patterns to construct PeerConfig with valid PeerConnID + a WgInterface mock that lets MonitorPeerActivity succeed):
+Append to `client/internal/lazyconn/activity/manager_test.go`:
 
 ```go
 func TestActivityManager_HasPeer_AfterMonitor(t *testing.T) {
-	mgr := NewManager(newMockWgIface(t))
-	cfg := newTestPeerConfig(t) // adapt
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerA"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
 	if err := mgr.MonitorPeerActivity(cfg); err != nil {
 		t.Fatalf("MonitorPeerActivity: %v", err)
 	}
 	if !mgr.HasPeer(cfg.PeerConnID) {
-		t.Fatalf("expected HasPeer == true after MonitorPeerActivity, got false")
+		t.Fatal("expected HasPeer == true after MonitorPeerActivity")
 	}
 }
 
 func TestActivityManager_HasPeer_AfterRemove(t *testing.T) {
-	mgr := NewManager(newMockWgIface(t))
-	cfg := newTestPeerConfig(t)
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerB"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
 	if err := mgr.MonitorPeerActivity(cfg); err != nil {
 		t.Fatalf("MonitorPeerActivity: %v", err)
 	}
 	mgr.RemovePeer(cfg.Log, cfg.PeerConnID)
 	if mgr.HasPeer(cfg.PeerConnID) {
-		t.Fatalf("expected HasPeer == false after RemovePeer, got true")
+		t.Fatal("expected HasPeer == false after RemovePeer")
 	}
 }
 
 func TestActivityManager_HasPeer_RaceSafe(t *testing.T) {
-	mgr := NewManager(newMockWgIface(t))
-	cfg := newTestPeerConfig(t)
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerC"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
 	if err := mgr.MonitorPeerActivity(cfg); err != nil {
 		t.Fatalf("MonitorPeerActivity: %v", err)
 	}
@@ -658,7 +918,49 @@ func TestActivityManager_HasPeer_RaceSafe(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4.10: Run full activity-package tests with -race**
+- [ ] **Step 4.9b: Add R14 race test (deferred from Task 3 Step 3.9)**
+
+Append to `client/internal/lazyconn/manager/recovery_test.go` (NOT to the activity-package test file):
+
+```go
+// TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock (v0.7 R14): when
+// RemovePeer races between armActivityListener and peerStillManaged,
+// the orphan listener must be cleaned up via activityManager.RemovePeer.
+// This test verifies the R14 fix shipped in Task 3.
+func TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock(t *testing.T) {
+	h := newTestHarness(t)
+	cfg := newTestPeerCfg("peerR14")
+
+	// Wire up peer in watcherInactivity
+	h.mgr.managedPeersMu.Lock()
+	h.mgr.managedPeers[cfg.PublicKey] = &cfg
+	h.mgr.managedPeersByConnID[cfg.PeerConnID] = &managedPeer{
+		peerCfg:         &cfg,
+		expectedWatcher: watcherInactivity,
+	}
+	h.mgr.managedPeersMu.Unlock()
+
+	// Install hook: between arm and re-validate, simulate concurrent removal.
+	testListenerArmHook = func(pubKey string) {
+		if pubKey != cfg.PublicKey {
+			return
+		}
+		h.mgr.managedPeersMu.Lock()
+		delete(h.mgr.managedPeers, cfg.PublicKey)
+		delete(h.mgr.managedPeersByConnID, cfg.PeerConnID)
+		h.mgr.managedPeersMu.Unlock()
+	}
+	t.Cleanup(func() { testListenerArmHook = nil })
+
+	h.mgr.onPeerInactivityTimedOut(map[string]struct{}{cfg.PublicKey: {}})
+
+	if h.mgr.activityManager.HasPeer(cfg.PeerConnID) {
+		t.Fatal("R14 regression: listener not cleaned up after race-removed peer")
+	}
+}
+```
+
+- [ ] **Step 4.10: Run full activity-package + manager-package tests with -race**
 
 Run: `go test -race ./client/internal/lazyconn/activity/ -count=1 -timeout 120s`
 Expected: PASS, no race reports.
@@ -668,7 +970,8 @@ Expected: PASS, no race reports.
 ```bash
 git add client/internal/lazyconn/activity/manager.go \
         client/internal/lazyconn/activity/listener_bind_test.go \
-        client/internal/lazyconn/activity/manager_test.go
+        client/internal/lazyconn/activity/manager_test.go \
+        client/internal/lazyconn/manager/recovery_test.go
 GIT_AUTHOR_NAME="Michael Uray" GIT_AUTHOR_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 GIT_COMMITTER_NAME="Michael Uray" GIT_COMMITTER_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 git commit -m "lazyconn/activity: add HasPeer(connID) accessor + fix mockEndpointManager race
@@ -682,6 +985,11 @@ Also fixes a pre-existing data race in mockEndpointManager
 (listener_bind_test.go) where concurrent SetEndpoint/RemoveEndpoint/
 GetEndpoint accessed the endpoints map without synchronization.
 Required so the race-clean HasPeer tests can run.
+
+Adds TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock to
+recovery_test.go (deferred from Task 3 because the assertion needs
+the HasPeer API introduced in this commit) — verifies the R14 race
+fix shipped in the previous refactor commit.
 
 See docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md
 Section 5.2 Stufe 6 + Section 7.3."
@@ -699,11 +1007,22 @@ Section 5.2 Stufe 6 + Section 7.3."
 
 - [ ] **Step 5.1: Write failing test for DropCounters API**
 
+**Existing harness in `inactivity/manager_test.go` provides** (verified at line 28-37):
+```go
+type mockWgInterface struct {
+    lastActivities map[string]monotime.Time
+}
+func (m *mockWgInterface) LastActivities() map[string]monotime.Time { return m.lastActivities }
+```
+That's the only `WgInterface` method needed for inactivity (smaller surface than `lazyconn.WGIface` — inactivity defines its own narrower interface). Tests construct via `&mockWgInterface{lastActivities: map[string]monotime.Time{}}`.
+
 Append to `client/internal/lazyconn/inactivity/manager_test.go`:
 
 ```go
 func TestDropCounters_InitialZero(t *testing.T) {
-	m := NewManagerWithTwoTimers(newMockWgIfaceInactivity(t), time.Second, time.Second)
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
 	relay, ice := m.DropCounters()
 	if relay != 0 || ice != 0 {
 		t.Fatalf("expected (0,0) initial, got (%d,%d)", relay, ice)
@@ -796,8 +1115,10 @@ Append:
 
 ```go
 func TestNotifyChan_FullChannelIncrementsDropCounter(t *testing.T) {
-	m := NewManagerWithTwoTimers(newMockWgIfaceInactivity(t), time.Second, time.Second)
-	// Fill the channel
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
+	// Fill the channel (capacity is 1)
 	m.inactivePeersChan <- map[string]struct{}{"pre-fill": {}}
 	// Now trigger a drop
 	m.notifyChan(context.Background(), m.inactivePeersChan, map[string]struct{}{"dropped": {}})
@@ -808,7 +1129,9 @@ func TestNotifyChan_FullChannelIncrementsDropCounter(t *testing.T) {
 }
 
 func TestDropCounters_RelayAndICESeparate(t *testing.T) {
-	m := NewManagerWithTwoTimers(newMockWgIfaceInactivity(t), time.Second, time.Second)
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
 	// Fill both channels
 	m.inactivePeersChan <- map[string]struct{}{"r": {}}
 	m.iceInactiveChan <- map[string]struct{}{"i": {}}
@@ -883,25 +1206,9 @@ func isStuckPeer(iceDisc, relayDisc bool, deltaRelay uint64) bool {
 }
 ```
 
-- [ ] **Step 6.3: Implement `peerStillManaged` (re-validate helper, v0.7 R14)**
+- [ ] **Step 6.3: `peerStillManaged` already exists from Task 3**
 
-Add:
-
-```go
-// peerStillManaged is the v0.7 post-arm Re-Validate helper. After
-// armActivityListener is called outside lock, this re-acquires
-// managedPeersMu briefly to verify the peer is still managed with the
-// SAME PeerConnID (defending against RemovePeer/ExcludePeer racing).
-func (m *Manager) peerStillManaged(pubKey string, expectedConnID peerid.ConnID) bool {
-	m.managedPeersMu.Lock()
-	defer m.managedPeersMu.Unlock()
-	cfg, ok := m.managedPeers[pubKey]
-	if !ok {
-		return false
-	}
-	return cfg.PeerConnID == expectedConnID
-}
-```
+The helper `peerStillManaged(pubKey, expectedConnID) bool` was introduced in Task 3 (refactor commit) and is reused here. No new code needed for this step — proceed to Step 6.4.
 
 - [ ] **Step 6.4: Implement `recoverInactivityStuck` (Case-a)**
 
