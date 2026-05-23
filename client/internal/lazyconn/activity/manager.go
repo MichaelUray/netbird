@@ -94,6 +94,17 @@ func (m *Manager) RemovePeer(log *log.Entry, peerConnID peerid.ConnID) {
 	listener.Close()
 }
 
+// HasPeer reports whether an activity listener is currently registered
+// for the given peer connection ID. Intended for the lazyconn-Manager
+// watchdog (Phase 3.7i) to distinguish "active and listening" from
+// "active but stuck after hung Close".
+func (m *Manager) HasPeer(connID peerid.ConnID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.peers[connID]
+	return ok
+}
+
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
