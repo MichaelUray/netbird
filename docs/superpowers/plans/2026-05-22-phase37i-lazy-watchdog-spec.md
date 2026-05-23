@@ -1309,14 +1309,14 @@ ICEInactive-Logik. Daher zwei verschiedene Branch-Strategien:
   - sauberer als `pr/c/d/e` (das sind upstream-PR-Branches für andere
     Phase-3.7i-Subsysteme und enthalten den Lazy-Manager-Code nicht voll)
 - Branch: `pr/g-phase3.7i-lazy-watchdog` (auf `phase3.7i-runtime-bugfixes-v0.5`)
-- Commits (5 separate commits, jeder einzeln reviewbar):
+- Commits (**6 separate commits**, jeder einzeln reviewbar — inkl. Stufe 6 HasPeer):
   1. `peer/conn: add TransportSnapshot accessor for external watchdogs` (Stufe 5 — lock-free atomic-load über `statusICE`/`statusRelay`)
   2. `lazyconn/manager: defer recover() around consumer loop handlers` (Stufe 0 — pure Hardening, nicht Stuck-Fix)
   3. `lazyconn/manager: split state-mutation from blocking I/O, sequential close→listen` (Stufe 3 Refaktor: `transitionToActivityWatcherStateOnly` + `armActivityListener` Pair-Helper; `onPeerInactivityTimedOut` ruft Close synchron außerhalb Lock, danach Listener-Arm — kein async-close)
-  4. `lazyconn/activity: add HasPeer(connID) read-only accessor` (Stufe 6 — neue API für Watchdog Listener-State-Detection)
-  5. `lazyconn/manager: reconcile watchdog with two-case recovery (inactivity-stuck + activity-no-listener)` (Stufe 2 + 4: Watchdog-goroutine + `recoverInactivityStuck` + `recoverActivityNoListener` + Inflight-Dedupe + Test-Suite)
+  4. `lazyconn/activity: add HasPeer(connID) read-only accessor + fix mockEndpointManager race` (Stufe 6 — neue API für Watchdog Listener-State-Detection, plus Cleanup des bestehenden Test-Mock-Race in `listener_bind_test.go`)
+  5. `lazyconn/manager: reconcile watchdog with two-case recovery (inactivity-stuck + activity-no-listener)` (Stufe 2 + 4: Watchdog-goroutine + `recoverInactivityStuck` + `recoverActivityNoListener` + `peerStillManaged` Re-Validate + Inflight-Dedupe + Test-Suite)
   6. `lazyconn/inactivity: count + log silent notifyChan drops` (Stufe 1 — kann als letzter Commit auch hier mitlaufen wenn Stufe 1 nicht parallel upstream-merged ist)
-- Test-Coverage: ~32 neue Unit-Tests + 3 Integration-Tests (siehe Section 6.1)
+- Test-Coverage: ~35 neue Unit-Tests + 3 Integration-Tests (siehe Section 6.1)
 
 Author + Committer für alle Commits:
 `Michael Uray <25169478+MichaelUray@users.noreply.github.com>`. Keine
