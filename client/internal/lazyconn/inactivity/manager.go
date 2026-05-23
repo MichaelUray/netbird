@@ -3,6 +3,7 @@ package inactivity
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -70,6 +71,13 @@ type Manager struct {
 	// (mirrors relayTimeout). NewManagerWithTwoTimers no longer
 	// relies on it.
 	inactivityThreshold time.Duration
+
+	// v0.7 Stufe 1: counts silent drops on the two notify channels.
+	// Drops happen when the consumer (lazyconn-Manager Start loop) is
+	// slow or blocked, and indicate that a state-transition event was
+	// lost. The lazy-watchdog reads these via DropCounters().
+	notifyDropsRelay atomic.Uint64
+	notifyDropsICE   atomic.Uint64
 }
 
 // NewManager is the Phase-1 single-timer constructor. Pass a *time.Duration
@@ -140,6 +148,26 @@ func (m *Manager) ICEInactiveChan() chan map[string]struct{} {
 	return m.iceInactiveChan
 }
 
+// DropCounters returns the cumulative count of dropped notifications
+// per channel: relayDrops from inactivePeersChan, iceDrops from
+// iceInactiveChan. Lock-free atomic load.
+func (m *Manager) DropCounters() (relayDrops, iceDrops uint64) {
+	return m.notifyDropsRelay.Load(), m.notifyDropsICE.Load()
+}
+
+// RecordRelayDropForTest is a test-only helper for the lazyconn/manager
+// watchdog tests in another package. Bumps the relay-drop counter
+// without going through notifyChan. NOT for production use.
+func (m *Manager) RecordRelayDropForTest() {
+	m.notifyDropsRelay.Add(1)
+}
+
+// RecordICEDropForTest is the ICE counterpart of RecordRelayDropForTest.
+// Exported because Go does not support cross-package test-only exports.
+func (m *Manager) RecordICEDropForTest() {
+	m.notifyDropsICE.Add(1)
+}
+
 func (m *Manager) AddPeer(peerCfg *lazyconn.PeerConfig) {
 	if m == nil {
 		return
@@ -205,6 +233,19 @@ func (m *Manager) notifyChan(ctx context.Context, ch chan map[string]struct{}, p
 	case <-ctx.Done():
 		return
 	default:
+		var n uint64
+		switch ch {
+		case m.inactivePeersChan:
+			n = m.notifyDropsRelay.Add(1)
+		case m.iceInactiveChan:
+			n = m.notifyDropsICE.Add(1)
+		}
+		// Throttle: log on 1st, 10th, 100th, then every 100 drops
+		if n == 1 || n == 10 || (n >= 100 && n%100 == 0) {
+			log.Warnf("inactivity: notify channel full, dropped %d-th event (peers in batch=%d). "+
+				"Consumer may be slow or stuck — see lazyconn/manager.go state.",
+				n, len(peers))
+		}
 		return
 	}
 }
