@@ -68,3 +68,39 @@ func TestPeerStillManaged_ConnIDChanged(t *testing.T) {
 		t.Fatal("expected false: ConnID changed since snapshot")
 	}
 }
+
+// TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock (v0.7 R14): when
+// RemovePeer races between armActivityListener and peerStillManaged,
+// the orphan listener must be cleaned up via activityManager.RemovePeer.
+// This test verifies the R14 fix shipped in Task 3.
+func TestOnPeerInactivityTimedOut_RemoveRaceAfterUnlock(t *testing.T) {
+	h := newTestHarness(t)
+	cfg := newTestPeerCfg("peerR14")
+
+	// Wire up peer in watcherInactivity
+	h.mgr.managedPeersMu.Lock()
+	h.mgr.managedPeers[cfg.PublicKey] = &cfg
+	h.mgr.managedPeersByConnID[cfg.PeerConnID] = &managedPeer{
+		peerCfg:         &cfg,
+		expectedWatcher: watcherInactivity,
+	}
+	h.mgr.managedPeersMu.Unlock()
+
+	// Install hook: between arm and re-validate, simulate concurrent removal.
+	testListenerArmHook = func(pubKey string) {
+		if pubKey != cfg.PublicKey {
+			return
+		}
+		h.mgr.managedPeersMu.Lock()
+		delete(h.mgr.managedPeers, cfg.PublicKey)
+		delete(h.mgr.managedPeersByConnID, cfg.PeerConnID)
+		h.mgr.managedPeersMu.Unlock()
+	}
+	t.Cleanup(func() { testListenerArmHook = nil })
+
+	h.mgr.onPeerInactivityTimedOut(map[string]struct{}{cfg.PublicKey: {}})
+
+	if h.mgr.activityManager.HasPeer(cfg.PeerConnID) {
+		t.Fatal("R14 regression: listener not cleaned up after race-removed peer")
+	}
+}

@@ -189,6 +189,76 @@ func TestManager_MultiPeerActivity(t *testing.T) {
 	}
 }
 
+func TestActivityManager_HasPeer_Empty(t *testing.T) {
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	dummy := &MocPeer{PeerID: "nonexistent"}
+	if mgr.HasPeer(dummy.ConnID()) {
+		t.Fatal("expected HasPeer == false on empty Manager")
+	}
+}
+
+func TestActivityManager_HasPeer_AfterMonitor(t *testing.T) {
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerA"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
+	if err := mgr.MonitorPeerActivity(cfg); err != nil {
+		t.Fatalf("MonitorPeerActivity: %v", err)
+	}
+	if !mgr.HasPeer(cfg.PeerConnID) {
+		t.Fatal("expected HasPeer == true after MonitorPeerActivity")
+	}
+}
+
+func TestActivityManager_HasPeer_AfterRemove(t *testing.T) {
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerB"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
+	if err := mgr.MonitorPeerActivity(cfg); err != nil {
+		t.Fatalf("MonitorPeerActivity: %v", err)
+	}
+	mgr.RemovePeer(cfg.Log, cfg.PeerConnID)
+	if mgr.HasPeer(cfg.PeerConnID) {
+		t.Fatal("expected HasPeer == false after RemovePeer")
+	}
+}
+
+func TestActivityManager_HasPeer_RaceSafe(t *testing.T) {
+	mgr := NewManager(&MocWGIface{})
+	defer mgr.Close()
+	peer := &MocPeer{PeerID: "peerC"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		Log:        log.WithField("peer", peer.PeerID),
+	}
+	if err := mgr.MonitorPeerActivity(cfg); err != nil {
+		t.Fatalf("MonitorPeerActivity: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			mgr.RemovePeer(cfg.Log, cfg.PeerConnID)
+			_ = mgr.MonitorPeerActivity(cfg)
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		_ = mgr.HasPeer(cfg.PeerConnID)
+	}
+	<-done
+}
+
 func trigger(addr string) error {
 	// Create a connection to the destination UDP address and port
 	conn, err := net.Dial("udp", addr)

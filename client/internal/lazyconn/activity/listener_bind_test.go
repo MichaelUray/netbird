@@ -3,6 +3,7 @@ package activity
 import (
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 
 // mockEndpointManager implements device.EndpointManager for testing
 type mockEndpointManager struct {
+	mu        sync.Mutex
 	endpoints map[netip.Addr]net.Conn
 }
 
@@ -30,14 +32,20 @@ func newMockEndpointManager() *mockEndpointManager {
 }
 
 func (m *mockEndpointManager) SetEndpoint(fakeIP netip.Addr, conn net.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.endpoints[fakeIP] = conn
 }
 
 func (m *mockEndpointManager) RemoveEndpoint(fakeIP netip.Addr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.endpoints, fakeIP)
 }
 
 func (m *mockEndpointManager) GetEndpoint(fakeIP netip.Addr) net.Conn {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.endpoints[fakeIP]
 }
 
