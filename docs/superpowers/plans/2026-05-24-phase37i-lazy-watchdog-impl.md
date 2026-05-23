@@ -14,6 +14,32 @@
 
 ---
 
+## Design Trade-Offs (read before starting)
+
+**`*ForTest` exports in production packages**: Three exported helpers
+ship as part of the production API to enable cross-package unit tests:
+- `peer.NewConnForTransportTest(log, ice, relay)` — Task 1
+- `inactivity.Manager.RecordRelayDropForTest()` — Task 5
+- `inactivity.Manager.RecordICEDropForTest()` — Task 5
+
+Each is documented as "test-only, do not use in production". Go does
+not support cross-package test-only exports, so the alternative would
+be an interface-refactor of `peerstore.Store` to make `*peer.Conn`
+mockable — significantly more invasive. The `*ForTest` approach is
+acceptable because everything lives under `client/internal/` (not a
+public-API package), but it IS upstream-review-sensitive. If the
+upstream maintainers prefer the interface-refactor route, the impl
+can pivot there with no spec-level changes.
+
+**Recovery assertions via observable state, not call-counters**:
+`peerstore.Store.PeerConnIdle(pubKey)` has no hook (concrete type,
+no interface — verified `store.go:137`). Tests asserting "no Close
+called during watchdog recovery" verify this via observable state:
+the same `*peer.Conn` instance remains in the peerStore + the
+TransportSnapshot reads remain consistent + no goroutine leak from
+`wgWatcherWg.Wait()`. The static guarantee (no `PeerConnIdle` call
+in the recovery code paths) is enforced by code review.
+
 ## File Structure
 
 | Datei | Aktion | Verantwortung |
@@ -378,7 +404,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -387,6 +412,7 @@ import (
 
 	"github.com/netbirdio/netbird/client/iface/wgaddr"
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
+	"github.com/netbirdio/netbird/client/internal/lazyconn/inactivity"
 	peerid "github.com/netbirdio/netbird/client/internal/peer/id"
 	"github.com/netbirdio/netbird/client/internal/peerstore"
 	"github.com/netbirdio/netbird/monotime"
@@ -408,12 +434,19 @@ func (m *mockWGIface) RemovePeer(string) error { return nil }
 func (m *mockWGIface) UpdatePeer(string, []netip.Prefix, time.Duration, *net.UDPAddr, *wgtypes.Key) error {
 	return nil
 }
-// IsUserspaceBind must return true so NewManager initializes
-// m.inactivityManager (manager.go:111: kernel-mode skips inactivity
-// tracking entirely). Without this the inactivityManager would be nil
-// and every transitionToActivityWatcherStateOnly + reconcileTick would
-// nil-deref. Codex round-9 BLOCKER 1.
-func (m *mockWGIface) IsUserspaceBind() bool { return true }
+// IsUserspaceBind must return FALSE here. Two conflicting consumers:
+//   - manager.go:111 only initializes m.inactivityManager when this is true
+//   - activity/manager.go:71 (createListener) requires the iface to
+//     implement bindProvider when this is true — our mock does not
+// Codex round-9 BLOCKER 1 (inactivityManager nil) was fixed via mock
+// returning true, but Codex round-10 BLOCKER caught the activity-side
+// regression: MonitorPeerActivity would error with "interface claims
+// userspace bind but doesn't implement bindProvider".
+// Final fix: keep this false so activity.Manager uses the
+// NewUDPListener kernel path (the existing TestManager_MonitorPeerActivity
+// proves the UDP path works with MocWGIface{}), and inject the
+// inactivityManager manually after NewManager (see newTestHarness below).
+func (m *mockWGIface) IsUserspaceBind() bool { return false }
 func (m *mockWGIface) Address() wgaddr.Address {
 	return wgaddr.Address{
 		IP:      netip.MustParseAddr("100.64.0.1"),
@@ -430,32 +463,25 @@ func (m *mockWGIface) LastActivities() map[string]monotime.Time {
 	return out
 }
 
-// testIdleCounter is a hook installed on the test peerStore so tests can
-// assert how many times PeerConnIdle was called. Watchdog tests assert
-// counter == 0 (no Close in watchdog recovery path).
-type testIdleCounter struct {
-	count atomic.Int64
-}
-
-func (c *testIdleCounter) inc() { c.count.Add(1) }
-func (c *testIdleCounter) get() int64 { return c.count.Load() }
-
-// testHarness builds a *Manager with controllable mock dependencies.
-// Tests modify the harness fields (e.g. wgIface.lastActivities) and then
-// drive the manager via direct method calls.
+// testHarness wires a *Manager with manually-injected two-timer
+// inactivity, real activity.Manager (UDP path via false IsUserspaceBind),
+// and a real peerstore.Store. Tests populate peers via the helpers
+// defined in watchdog_test.go (addStuckInactivityPeer etc.).
+//
+// Note on "no Close was called" assertions: peerstore.Store is a
+// concrete type without an IdleCalled hook (verified — store.go:137).
+// Tests assert this via OBSERVABLE STATE post-recovery (Conn still
+// satisfies TransportSnapshot the same way, no goroutine leak),
+// not via call-counting. Codex round-10 SHOULD-FIX.
 type testHarness struct {
-	t           *testing.T
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wgIface     *mockWGIface
-	peerStore   *peerstore.Store
-	idleCounter *testIdleCounter
-	mgr         *Manager
+	t         *testing.T
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wgIface   *mockWGIface
+	peerStore *peerstore.Store
+	mgr       *Manager
 }
 
-// newTestHarness wires a *Manager with two-timer inactivity, real
-// activity.Manager (cheap), and a real peerstore.Store. Tests can add
-// peers via h.addPeer(pubKey, connID).
 func newTestHarness(t *testing.T) *testHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -466,27 +492,35 @@ func newTestHarness(t *testing.T) *testHarness {
 		RelayInactivityThreshold: time.Minute,
 	}
 	mgr := NewManager(cfg, ctx, peerStore, wgIface)
-	// Sanity-check: with IsUserspaceBind() == true + non-zero timeouts,
-	// NewManager must have initialized inactivityManager via
-	// inactivity.NewManagerWithTwoTimers (manager.go:117).
+
+	// With IsUserspaceBind() == false (required so activity.Manager
+	// uses the UDP listener path — see mockWGIface.IsUserspaceBind doc),
+	// NewManager skips inactivityManager initialization (manager.go:111).
+	// Inject it manually with non-zero two-timer config so all
+	// transitionToActivityWatcherStateOnly + reconcileTick code paths
+	// can dereference it safely. Codex round-10 fix.
+	mgr.inactivityManager = inactivity.NewManagerWithTwoTimers(wgIface, time.Minute, time.Minute)
 	if mgr.inactivityManager == nil {
-		t.Fatalf("test harness setup error: inactivityManager is nil — check mockWGIface.IsUserspaceBind()")
+		t.Fatalf("test harness setup error: inactivity.NewManagerWithTwoTimers returned nil")
 	}
 	h := &testHarness{
-		t:           t,
-		ctx:         ctx,
-		cancel:      cancel,
-		wgIface:     wgIface,
-		peerStore:   peerStore,
-		idleCounter: &testIdleCounter{},
-		mgr:         mgr,
+		t:         t,
+		ctx:       ctx,
+		cancel:    cancel,
+		wgIface:   wgIface,
+		peerStore: peerStore,
+		mgr:       mgr,
 	}
 	t.Cleanup(func() { cancel() })
 	return h
 }
 
-// newTestPeerCfg builds a minimal valid PeerConfig. The PeerConnID is
-// derived from the pubKey via a deterministic stub.
+// newTestPeerCfg builds a minimal valid PeerConfig. PeerConnID is
+// derived from a fresh pubKeyStub instance — the resulting ConnID is
+// unique per call (the underlying type is unsafe.Pointer). Tests are
+// expected to capture the returned cfg in a local variable and use
+// cfg.PeerConnID consistently from there. Do NOT call newTestPeerCfg
+// twice with the same pubKey and expect identical PeerConnIDs.
 func newTestPeerCfg(pubKey string) lazyconn.PeerConfig {
 	return lazyconn.PeerConfig{
 		PublicKey:  pubKey,
@@ -495,16 +529,12 @@ func newTestPeerCfg(pubKey string) lazyconn.PeerConfig {
 	}
 }
 
-// pubKeyStub is a deterministic peerid.ConnID source: address of the
-// stub is stable per pubKey because newTestPeerCfg constructs a fresh
-// struct each call, but we re-use the SAME instance per (test, pubKey)
-// via the package-level connIDCache below.
+// pubKeyStub mirrors the activity-package MocPeer pattern: a pointer
+// whose address is converted to peerid.ConnID (= unsafe.Pointer per
+// peer/id/connid.go). Holding a reference to the cfg keeps the stub
+// alive for the duration of the test.
 type pubKeyStub struct {
 	pubKey string
-}
-
-func (s *pubKeyStub) ConnID() peerid.ConnID {
-	return peerid.ConnID(s)
 }
 ```
 
@@ -1536,12 +1566,9 @@ Test pattern (concrete, copy-pasteable):
 package manager
 
 import (
-	"context"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/client/internal/peer"
@@ -1671,22 +1698,7 @@ func TestReconcileWatchdog_ActivityWithListener_NoOp(t *testing.T) {
 }
 ```
 
-**Test-only counter-increment hook for inactivity manager** (mentioned above as `RecordRelayDropForTest`): the spec leaves the production `notifyDropsRelay/ICE` fields as `atomic.Uint64` (Task 5). For tests that need to bump these without flooding the channels, add two tiny helpers in `inactivity/manager.go`:
-
-```go
-// RecordRelayDropForTest is a test-only helper that bumps the relay-drop
-// counter without going through notifyChan. NOT for production use.
-func (m *Manager) RecordRelayDropForTest() {
-	m.notifyDropsRelay.Add(1)
-}
-
-// RecordICEDropForTest is the ICE counterpart.
-func (m *Manager) RecordICEDropForTest() {
-	m.notifyDropsICE.Add(1)
-}
-```
-
-These belong in Task 5 (Stufe 1) since they touch inactivity.Manager — add them in the same commit as `DropCounters`. Update Task 5 Step 5.3 to include both helpers.
+**Test-only counter helpers**: `RecordRelayDropForTest` and `RecordICEDropForTest` are part of Task 5 Step 5.3 (shipped in the same commit as `DropCounters`). The watchdog tests above call them — no extra implementation needed here.
 
 Remaining tests to implement (same harness, similar patterns — leave specifics to the implementer):
 
@@ -1700,10 +1712,10 @@ Remaining tests to implement (same harness, similar patterns — leave specifics
 
 Append to `client/internal/lazyconn/manager/recovery_test.go`:
 
-- `TestRecoverInactivityStuck_HappyPath` — also asserts `peerStore.PeerConnIdle` was NOT called (via counter-mock)
+- `TestRecoverInactivityStuck_HappyPath` — assert post-recovery state: `mp.expectedWatcher == watcherActivity`, `activityManager.HasPeer(connID) == true`, and the `*peer.Conn` in `peerStore` is still the same instance (proving no Conn-replacement). The "no Close was called" property is enforced by code-inspection of `recoverInactivityStuck` rather than a runtime assertion (peerstore.Store has no hook; see Task 3 harness comment).
 - `TestRecoverInactivityStuck_AlreadyActivity_NoOp`
 - `TestRecoverInactivityStuck_RespectsHA_FullBatch`
-- `TestRecoverInactivityStuck_NoCloseDeadlock` — explicit assertion via PeerConnIdle counter
+- `TestRecoverInactivityStuck_NoCloseDeadlock` — drop (was meant to assert "no PeerConnIdle call" via a counter mock, but peerstore.Store has no observable side-channel). The same property is covered statically by `TestRecoverInactivityStuck_HappyPath` (Conn instance unchanged in peerStore) plus code-inspection of `recoverInactivityStuck`.
 - `TestRecoverActivityNoListener_HappyPath`
 - `TestRecoverActivityNoListener_ListenerArmedConcurrently_NoOp`
 - `TestRecoverActivityNoListener_SkipsHADefer`
