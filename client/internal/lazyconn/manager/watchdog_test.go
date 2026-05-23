@@ -244,18 +244,27 @@ func TestReconcileWatchdog_InflightDedupePreventsDoubleSpawn(t *testing.T) {
 	}
 }
 
-// TestReconcileWatchdog_PanicSelfRestart: the runReconcileWatchdog
-// deferred recover() must restart the loop after a panic. We exercise
-// this by running runReconcileWatchdog with a short interval, injecting
-// a panic via testListenerArmHook during recovery, then verifying that
-// the goroutine processes a SECOND tick.
-func TestReconcileWatchdog_PanicSelfRestart(t *testing.T) {
+// TestReconcileWatchdog_RecoveryPanicContained: a panic raised inside a
+// recovery goroutine (via testListenerArmHook) must be caught by
+// spawnRecovery's defer recover() — without that the whole Go process
+// would crash. The watchdog loop itself should keep ticking and dispatch
+// further recoveries.
+//
+// Note: this does NOT exercise the OUTER runReconcileWatchdog defer
+// recover() self-restart path (the synthetic panic happens inside the
+// spawned recovery-goroutine, where spawnRecovery already catches it,
+// so the outer loop never panics). A future test could inject a panic
+// directly into reconcileTick (e.g. via a testReconcileTickHook) to
+// cover that path explicitly; for now the production code's
+// `defer { if r := recover(); ...; go m.runReconcileWatchdog(...) }`
+// is covered by inspection only.
+func TestReconcileWatchdog_RecoveryPanicContained(t *testing.T) {
 	h := newTestHarness(t)
 	cfg := addStuckInactivityPeer(t, h, "peerPanic")
 
-	// First listener-arm panics, subsequent calls are no-ops. Tests the
-	// spawnRecovery panic-recovery (logged but contained) — the watchdog
-	// loop itself should keep ticking either way.
+	// First listener-arm panics, subsequent calls are no-ops. Asserts
+	// the spawnRecovery panic-recovery (logged but contained) — the
+	// watchdog loop itself keeps ticking either way.
 	var armCount int
 	var armMu sync.Mutex
 	setTestListenerArmHook(func(pubKey string) {
