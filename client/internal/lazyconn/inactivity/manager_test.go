@@ -387,3 +387,43 @@ func TestPhase1_LazyEquivalence(t *testing.T) {
 		// expected
 	}
 }
+
+func TestDropCounters_InitialZero(t *testing.T) {
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
+	relay, ice := m.DropCounters()
+	if relay != 0 || ice != 0 {
+		t.Fatalf("expected (0,0) initial, got (%d,%d)", relay, ice)
+	}
+}
+
+func TestNotifyChan_FullChannelIncrementsDropCounter(t *testing.T) {
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
+	// Fill the channel (capacity is 1)
+	m.inactivePeersChan <- map[string]struct{}{"pre-fill": {}}
+	// Now trigger a drop
+	m.notifyChan(context.Background(), m.inactivePeersChan, map[string]struct{}{"dropped": {}})
+	relay, _ := m.DropCounters()
+	if relay != 1 {
+		t.Fatalf("expected relayDrops=1, got %d", relay)
+	}
+}
+
+func TestDropCounters_RelayAndICESeparate(t *testing.T) {
+	m := NewManagerWithTwoTimers(
+		&mockWgInterface{lastActivities: map[string]monotime.Time{}},
+		time.Second, time.Second)
+	// Fill both channels
+	m.inactivePeersChan <- map[string]struct{}{"r": {}}
+	m.iceInactiveChan <- map[string]struct{}{"i": {}}
+	m.notifyChan(context.Background(), m.inactivePeersChan, map[string]struct{}{"r2": {}})
+	m.notifyChan(context.Background(), m.iceInactiveChan, map[string]struct{}{"i2": {}})
+	m.notifyChan(context.Background(), m.iceInactiveChan, map[string]struct{}{"i3": {}})
+	relay, ice := m.DropCounters()
+	if relay != 1 || ice != 2 {
+		t.Fatalf("expected (1,2), got (%d,%d)", relay, ice)
+	}
+}
