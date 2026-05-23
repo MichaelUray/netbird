@@ -278,25 +278,46 @@ GetRelayState API)."
 
 ---
 
-## Task 2 (Commit 2): lazyconn/manager — Panic-Recovery (Stufe 0)
+## Task 2 (Commit 2): lazyconn/manager — Panic-Recovery + Start() two-path split (Stufe 0)
 
 **Files:**
-- Modify: `client/internal/lazyconn/manager/manager.go` (wrap handler calls in Start)
+- Modify: `client/internal/lazyconn/manager/manager.go` (rewrite Start + add safeOn* wrappers)
 
-**Why second:** Pure defensive glue around the existing consumer-loop handlers. Smallest change, no behaviour change in the happy path. Implementation-only — the panic-injection integration test ships in Task 6 alongside the watchdog tests (the dedicated harness exists from Task 3, and combined panic-recovery + watchdog-recovery is the realistic test scenario).
+**Why second:** Pure defensive glue around the existing consumer-loop handlers, plus a latent pre-existing bug-fix surfaced by Codex round-11. The current `Start()` does `<-m.inactivityManager.InactivePeersChan()` unconditionally, but `inactivityManager == nil` in kernel-bind mode (manager.go:111), and `ConnMgr` calls `Start()` without a nil-guard (conn_mgr.go:632). Today this happens to work only because production callers always run userspace mode; on kernel-WG hosts the daemon would nil-deref on startup. Task 6 also rewrites `Start()`, so introducing the two-path structure here means Task 6 only adds one line.
 
-- [ ] **Step 2.1: Add the panic-recovery wrappers**
+Implementation-only — the panic-injection integration test ships in Task 6 alongside the watchdog tests (the dedicated harness exists from Task 3, and combined panic-recovery + watchdog-recovery is the realistic test scenario).
 
-Edit `client/internal/lazyconn/manager/manager.go`. Replace the consumer-loop `Start()` (currently lines 173-191) with the wrapped variant + helper functions:
+- [ ] **Step 2.1: Rewrite Start() with two-path split + panic-recovery wrappers**
+
+Edit `client/internal/lazyconn/manager/manager.go`. Replace the consumer-loop `Start()` (currently lines 173-191) with the two-path version plus the panic-recovery helper functions:
 
 ```go
-// Start starts the manager and listens for peer activity and inactivity events
+// Start starts the manager and listens for peer activity and inactivity events.
+// Two code paths depending on whether the inactivity manager is initialized
+// (manager.go NewManager only initializes it for userspace-bind WG). The
+// kernel-mode path skips the inactivity-channel arm entirely; without this
+// guard a kernel-mode caller would nil-deref on
+// m.inactivityManager.InactivePeersChan(). v0.7 Stufe 0 hardening (Codex
+// round-11): the watchdog (Task 6) also lives only on the userspace path
+// because relayDrops + inactivityManager are its inputs.
 func (m *Manager) Start(ctx context.Context) {
 	defer m.close()
 
-	if m.inactivityManager != nil {
-		go m.inactivityManager.Start(ctx)
+	if m.inactivityManager == nil {
+		// Kernel-mode: no inactivity tracking, no watchdog.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case peerConnID := <-m.activityManager.OnActivityChan:
+				m.safeOnPeerActivity(peerConnID)
+			}
+		}
 	}
+
+	// Userspace-bind: inactivity tracking active. Task 6 adds the
+	// runReconcileWatchdog goroutine into this block.
+	go m.inactivityManager.Start(ctx)
 
 	for {
 		select {
@@ -350,20 +371,31 @@ Expected: PASS. No new tests in this commit; verification is "existing behaviour
 git add client/internal/lazyconn/manager/manager.go
 GIT_AUTHOR_NAME="Michael Uray" GIT_AUTHOR_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
 GIT_COMMITTER_NAME="Michael Uray" GIT_COMMITTER_EMAIL="25169478+MichaelUray@users.noreply.github.com" \
-git commit -m "lazyconn/manager: defer recover() around consumer loop handlers
+git commit -m "lazyconn/manager: defer recover() in consumer loop + Start() two-path split
 
-Wraps onPeerActivity and onPeerInactivityTimedOut in safeOn* helpers
-with defer recover() so a panic in any handler logs an error rather
-than crashing the whole NetBird daemon.
+Two changes in one commit, both pure defensive hardening:
 
-Pure hardening — does NOT fix the lazy-state stuck symptoms (a panic
-crashes the entire Go process unless recovered here, so this prevents
-future regressions but cannot resurrect an already-dead daemon).
+1) Wrap onPeerActivity and onPeerInactivityTimedOut in safeOn* helpers
+   with defer recover() so a panic in any handler logs an error rather
+   than crashing the whole NetBird daemon. Pure hardening — does NOT
+   fix the lazy-state stuck symptoms (a Go panic crashes the entire
+   process unless recovered here).
 
-No dedicated unit test in this commit (the wrapper is defensive glue
-with no behavioural side-effects in the happy path); the panic-injection
-test ships alongside the watchdog in
-TestIntegration_PanicInConsumer_WatchdogHeals (final commit).
+2) Split Start() into a kernel-mode path (no inactivity tracking) and a
+   userspace-bind path (with go inactivityManager.Start). The pre-
+   existing single-path Start() would nil-deref on
+   m.inactivityManager.InactivePeersChan() when called in kernel mode
+   (NewManager leaves inactivityManager nil per manager.go:111, and
+   ConnMgr.Start unconditionally invokes lazyConnMgr.Start). Today's
+   production avoids this only because callers happen to use userspace
+   WG; the kernel path was latently broken. Codex round-11 surfaced
+   this; we fix it here so the upcoming watchdog wiring (Task 6) is
+   a single-line addition.
+
+No dedicated unit test in this commit (defensive glue + a guard that's
+only exercised in kernel mode); the panic-injection test ships
+alongside the watchdog in TestIntegration_PanicInConsumer_WatchdogHeals
+(final commit). Existing tests continue to exercise the userspace path.
 
 See docs/superpowers/plans/2026-05-22-phase37i-lazy-watchdog-spec.md
 Section 5.2 Stufe 0."
@@ -1525,20 +1557,15 @@ func (m *Manager) runReconcileWatchdog(ctx context.Context, interval time.Durati
 }
 ```
 
-- [ ] **Step 6.9: Wire watchdog into `Start()` (Stufe 4) — INSIDE inactivity-guard**
+- [ ] **Step 6.9: Wire watchdog into `Start()` (Stufe 4) — ONE LINE in userspace path**
 
-**Codex round-9 BLOCKER 2**: the watchdog dereferences `m.inactivityManager.DropCounters()` in `reconcileTick`. In kernel-bind mode `m.inactivityManager` is `nil` (manager.go:111-122). The watchdog therefore must NOT run when inactivityManager is nil — and it makes no semantic sense anyway (without inactivity tracking there are no relay-drops to detect).
-
-Edit `Start()` (the version produced by Task 2 with the panic-recovery wrappers). The added watchdog line MUST be inside the existing `if m.inactivityManager != nil` block:
+Task 2 already split `Start()` into a kernel-mode path (no inactivity, no watchdog) and a userspace-bind path (`go m.inactivityManager.Start(ctx)` + the 3-arm select). This step adds exactly one line: `go m.runReconcileWatchdog(ctx, defaultReconcileInterval)` immediately after the existing `go m.inactivityManager.Start(ctx)` in the userspace path:
 
 ```go
-func (m *Manager) Start(ctx context.Context) {
-	defer m.close()
-
-	if m.inactivityManager != nil {
-		go m.inactivityManager.Start(ctx)
-		go m.runReconcileWatchdog(ctx, defaultReconcileInterval)  // v0.7 Stufe 4 wiring
-	}
+	// Userspace-bind: inactivity tracking active. Task 6 adds the
+	// runReconcileWatchdog goroutine into this block.
+	go m.inactivityManager.Start(ctx)
+	go m.runReconcileWatchdog(ctx, defaultReconcileInterval)  // <- v0.7 Stufe 4 wiring (NEW)
 
 	for {
 		select {
@@ -1550,10 +1577,9 @@ func (m *Manager) Start(ctx context.Context) {
 			m.safeOnPeerInactivityTimedOut(peerIDs)
 		}
 	}
-}
 ```
 
-Note: `runReconcileWatchdog` now takes an interval parameter (see Step 6.14 — interval was already parameterized for fast integration tests).
+Rationale: the watchdog dereferences `m.inactivityManager.DropCounters()` in `reconcileTick`. The kernel-mode path skips both inactivity tracking AND the watchdog — without relay-drops to detect, the watchdog has nothing to do anyway (Codex round-9 BLOCKER 2).
 
 - [ ] **Step 6.10: Verify build + existing tests still pass**
 
