@@ -20,6 +20,12 @@ const (
 	watcherInactivity
 )
 
+// testListenerArmHook is set by tests to inject a hook between the
+// armActivityListener call and the peerStillManaged Re-Validate inside
+// onPeerInactivityTimedOut + watchdog recovery paths. Production
+// codepaths leave this nil — no overhead beyond a nil-check.
+var testListenerArmHook func(pubKey string)
+
 // userInitiatedAttachICECooldown bounds how often a real lazyconn activity
 // edge can drive a fresh ICE attempt while ICE backoff is suspended.
 // Phase 3.7i (#5989): user-traffic is allowed to bypass the long
@@ -669,47 +675,102 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 	}
 }
 
-func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
+// transitionToActivityWatcherStateOnly performs the non-blocking
+// state-machine part of the watcherInactivity → watcherActivity
+// transition (expectedWatcher flip + RemovePeer from inactivity manager).
+// Caller MUST hold m.managedPeersMu. No I/O here.
+func (m *Manager) transitionToActivityWatcherStateOnly(mp *managedPeer) {
+	mp.peerCfg.Log.Infof("transition to watcherActivity (state-only) from %v", mp.expectedWatcher)
+	mp.expectedWatcher = watcherActivity
+	m.inactivityManager.RemovePeer(mp.peerCfg.PublicKey)
+}
+
+// armActivityListener installs the activity monitor for a peer.
+// Idempotent — activity.Manager.MonitorPeerActivity logs a warning and
+// returns nil when called for an already-monitored connID. No lock
+// required (activityManager has its own internal mutex).
+func (m *Manager) armActivityListener(mp *managedPeer) {
+	if err := m.activityManager.MonitorPeerActivity(*mp.peerCfg); err != nil {
+		mp.peerCfg.Log.Errorf("failed to create activity monitor: %v", err)
+	}
+}
+
+// peerStillManaged is the post-arm Re-Validate helper for any code path
+// that releases managedPeersMu before calling armActivityListener.
+// Re-acquires the lock briefly to verify the peer is still managed with
+// the SAME PeerConnID, defending against RemovePeer/ExcludePeer racing
+// (R14). Returns true if peer is still managed and connID matches.
+//
+// Used by:
+//   - onPeerInactivityTimedOut (this commit)
+//   - recoverInactivityStuck + recoverActivityNoListener (Watchdog, Task 6)
+func (m *Manager) peerStillManaged(pubKey string, expectedConnID peerid.ConnID) bool {
 	m.managedPeersMu.Lock()
 	defer m.managedPeersMu.Unlock()
+	cfg, ok := m.managedPeers[pubKey]
+	if !ok {
+		return false
+	}
+	return cfg.PeerConnID == expectedConnID
+}
 
+func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
+	// Phase 1: short lock — state mutations + capture of connID+log
+	// BEFORE unlock for safe use of activityManager.RemovePeer on
+	// cleanup (signature is RemovePeer(*log.Entry, peerid.ConnID),
+	// see activity/manager.go:84).
+	type pending struct {
+		mp      *managedPeer
+		connID  peerid.ConnID
+		peerLog *log.Entry
+		pubKey  string
+	}
+
+	m.managedPeersMu.Lock()
+	toTransition := make([]pending, 0, len(peerIDs))
 	for peerID := range peerIDs {
 		peerCfg, ok := m.managedPeers[peerID]
 		if !ok {
 			log.Errorf("peer not found by peerId: %v", peerID)
 			continue
 		}
-
 		mp, ok := m.managedPeersByConnID[peerCfg.PeerConnID]
 		if !ok {
 			log.Errorf("peer not found by conn id: %v", peerCfg.PeerConnID)
 			continue
 		}
-
 		if mp.expectedWatcher != watcherInactivity {
 			mp.peerCfg.Log.Warnf("ignore inactivity event")
 			continue
 		}
-
 		if m.shouldDeferIdleForHA(peerIDs, mp.peerCfg.PublicKey) {
 			mp.peerCfg.Log.Infof("defer inactivity due to active HA group peers")
 			continue
 		}
-
 		mp.peerCfg.Log.Infof("connection timed out")
+		m.transitionToActivityWatcherStateOnly(mp)
+		toTransition = append(toTransition, pending{
+			mp:      mp,
+			connID:  peerCfg.PeerConnID,
+			peerLog: peerCfg.Log,
+			pubKey:  peerCfg.PublicKey,
+		})
+	}
+	m.managedPeersMu.Unlock()
 
-		// this is blocking operation, potentially can be optimized
-		m.peerStore.PeerConnIdle(mp.peerCfg.PublicKey)
-
-		mp.expectedWatcher = watcherActivity
-
-		m.inactivityManager.RemovePeer(mp.peerCfg.PublicKey)
-
-		mp.peerCfg.Log.Infof("start activity monitor")
-
-		if err := m.activityManager.MonitorPeerActivity(*mp.peerCfg); err != nil {
-			mp.peerCfg.Log.Errorf("failed to create activity monitor: %v", err)
-			continue
+	// Phase 2: blocking I/O outside lock. Sequential close → listener-arm
+	// (v0.3 ordering restored after v0.4 race finding). Then a post-arm
+	// Re-Validate (v0.7.1 R14): if RemovePeer/ExcludePeer raced between
+	// our state-flip and listener-arm, the listener we just installed
+	// belongs to a no-longer-managed peer. Remove it.
+	for _, p := range toTransition {
+		m.peerStore.PeerConnIdle(p.pubKey)
+		m.armActivityListener(p.mp)
+		if testListenerArmHook != nil {
+			testListenerArmHook(p.pubKey)
+		}
+		if !m.peerStillManaged(p.pubKey, p.connID) {
+			m.activityManager.RemovePeer(p.peerLog, p.connID)
 		}
 	}
 }
