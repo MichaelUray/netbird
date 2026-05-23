@@ -1,31 +1,34 @@
 ---
-status: spec v0.3 / pre-implementation review (round 3)
-target-branch: see Section 8.1 — Stufe 1 separat upstream-fähig, Stufen 0+2+3+4 auf Phase-3.7i-Stack
-related-work: pr/mgmt-stream-keepalive, pr/mgmt-stream-watchdog, feat/force-relay-flag, test/plan1+plan2-combined
-review-status: 3× Codex pre-review — v0.2 returned with 2 BLOCKERs + 1 SHOULD-FIX + HA-Korrektur, addressed in v0.3
+status: spec v0.4 / pre-implementation review (round 4)
+target-branch: see Section 8.1 — Stufe 1 separat upstream-fähig auf upstream/main, Stufen 0+2+3+4+5 auf phase3.7i-runtime-bugfixes-v0.5
+related-work: pr/mgmt-stream-keepalive, pr/mgmt-stream-watchdog, feat/force-relay-flag, phase3.7i-runtime-bugfixes-v0.5
+review-status: 4× Codex pre-review — v0.3 returned with 1 BLOCKER + 2 SHOULD-FIXes, addressed in v0.4
 changelog:
   - v0.1 (2026-05-22 vormittag): Initial spec, Code-Refs verifiziert, Buffer-Größe 1 als kritischer Befund
   - v0.2 (2026-05-22 nachmittag): Codex round-1 Korrekturen — Stufe-2-Pseudocode mit echten APIs, Lock-Strategie, Panic-Recovery
-  - v0.3 (2026-05-23): Codex round-2 Korrekturen:
-    * BLOCKER 1 — Panic-Hypothese als Root-Cause technisch falsch (Go-Goroutine-
-      Panic crashed gesamten Prozess, nicht 33h stale). Section 4.3 reorganisiert:
-      Panic-Tod als plausible-aber-falsche Hypothese, dauerhaft-blockierter
-      Consumer in `Conn.Close()` als Haupt-Hypothese. Stufe 0 bleibt als REINES
-      Hardening (verhindert zukünftige Daemon-Crashes), aber NICHT als Stuck-Fix.
-    * BLOCKER 2 — `transitionToActivityWatcherLocked` ruft `PeerConnIdle` →
-      `Conn.Close()` → `wgWatcherWg.Wait()` UNTER LOCK. Das repliziert exakt das
-      "potentially can be optimized"-TODO des bestehenden `onPeerInactivityTimedOut`.
-      v0.3 Stufen 2+3 komplett neu geschnitten: short-snapshot-Lock, blocking-calls
-      AUSSERHALB Lock, optional bounded-async pro Peer.
-    * SHOULD-FIX — `conn.GetICEState()` / `conn.GetRelayState()` existieren nicht.
-      `isConnectedOnAllWay` ist private und hat `logTraceConnState()` als Side-Effect.
-      Neue read-only Accessor-API `Conn.TransportSnapshot()` skizziert.
-    * HA-Korrektur — `shouldDeferIdleForHA` mit Single-Peer-map deferred ad infinitum
-      (alle anderen HA-Peers werden als aktiv interpretiert). Watchdog sammelt jetzt
-      Batch aller stuck-Kandidaten und ruft die Funktion einmal mit dem Full-Batch.
-    * Stufe-1-Log: relay vs ice explizit im Text.
-    * Risiken R4 verschärft zu BLOCKER, R8 neu (HA-Single-Peer-Defer-Falle).
-    * 5 weitere Unit-Tests + 1 neuer Integration-Test.
+  - v0.3 (2026-05-23 vormittag): Codex round-2 Korrekturen — Panic-Hypothese verworfen, Stufen 2+3 lock-sparsam, neue Stufe 5 TransportSnapshot, HA-Batch-Korrektur
+  - v0.4 (2026-05-23 nachmittag): Codex round-3 Korrekturen:
+    * BLOCKER — Recovery-Reihenfolge in `transitionToActivityWatcherIOAfterUnlock`
+      ruft `PeerConnIdle()` VOR `MonitorPeerActivity()`. Wenn `PeerConnIdle`
+      blockiert (die vermutete Stuck-Ursache!), wird der Activity-Listener nie
+      armiert und der Peer landet in `watcherActivity` ohne Listener. Fix:
+      `MonitorPeerActivity` zuerst armieren, `PeerConnIdle` danach als async
+      best-effort goroutine. Damit kann nächster Traffic auch bei hängendem
+      Close den Wake signalisieren.
+    * SHOULD-FIX 1 — `Conn.TransportSnapshot()` v0.3-Stub nutzte fiktive Felder
+      `iceConnected`/`relayConnected`/`conn.mu`. Reale Felder sind
+      `conn.statusICE *worker.AtomicWorkerStatus` und
+      `conn.statusRelay *worker.AtomicWorkerStatus` mit atomarer `.Get()`-API.
+      Kein Lock nötig (atomic loads). Section 5.2 Stufe 5 + Section 7.2 Q5
+      angepasst.
+    * SHOULD-FIX 2 — v0.2-Reste entfernt: `panicCount > 0` als
+      Watchdog-Trigger aus R1, Tests + offenen Fragen; Single-Peer-Map-Frage
+      (alte Q5 in v0.3) wurde durch v0.3 HA-Batch-Fix obsolet, gestrichen.
+    * Branch-Basis (v0.3 Q4 offen): `phase3.7i-runtime-bugfixes-v0.5` als
+      Base für Stufen 0/2/3/4/5 explizit gewählt (Codex-Empfehlung — enthält
+      NewManagerWithTwoTimers, expectedWatcher, HA-Defer, Activity-AttachICE).
+    * 1 neuer Unit-Test:
+      `TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`.
 ---
 
 # Phase-3.7i Lazy-Connection State-Reconciliation Bug — Spezifikation
@@ -573,19 +576,29 @@ Tests:
 - `TestWatchdog_PanicSelfRestart`: injiziere panic in reconcileTick, assert dass
   ein neuer runReconcileWatchdog-Loop läuft.
 
-#### Stufe 3: Recovery-Helper mit Lock-Disziplin + HA-Batch-Korrektur (v0.3)
+#### Stufe 3: Recovery-Helper mit Lock-Disziplin + Listener-First-Reihenfolge (v0.4)
 **Datei**: `client/internal/lazyconn/manager/manager.go` (Refaktor + neue Methode)
-**Scope**: ~50 LOC Refaktor + ~60 LOC neue Methode
+**Scope**: ~50 LOC Refaktor + ~70 LOC neue Methode
 
-**Codex-Korrekturen v0.3**:
+**Codex-Korrekturen v0.4 (BLOCKER round-3)**:
+- **Recovery-Reihenfolge**: v0.3 rief im `IOAfterUnlock`-Pfad zuerst
+  `PeerConnIdle` (blocking) und erst dann `MonitorPeerActivity`. Wenn
+  `PeerConnIdle` blockiert (die vermutete Stuck-Ursache!), wird der
+  Activity-Listener nie armiert. Der Peer landet in `watcherActivity`-State
+  ohne Listener, und `recoveringPeers` blockiert künftige Recovery-Versuche.
+  **v0.4-Fix**: Listener ZUERST armieren, Close DANACH als async best-effort
+  goroutine. Damit kann der nächste WG-Wake auch bei hängendem Close
+  funktionieren.
+
+**Codex-Korrekturen v0.3 (übernommen)**:
 1. **HA-Batch**: `shouldDeferIdleForHA` mit Single-Peer-Map deferred ad infinitum
    (alle anderen HA-Member werden fälschlich als „aktiv" interpretiert).
    `recoverStuckPeer` muss den vollen `stuckBatch` durchreichen.
 2. **Lock-Disziplin**: `PeerConnIdle` ist blocking (chain to `Conn.Close()` mit
    `wgWatcherWg.Wait()`). Darf NICHT unter `managedPeersMu` laufen.
 
-Refaktor splittet die existierende `transitionToActivityWatcher`-Logik in zwei
-Hälften:
+Refaktor splittet die existierende `transitionToActivityWatcher`-Logik in drei
+Hälften (state-only / listener / close-best-effort):
 
 ```go
 // transitionToActivityWatcherStateOnly performs the non-blocking state-machine
@@ -597,20 +610,38 @@ func (m *Manager) transitionToActivityWatcherStateOnly(mp *managedPeer) {
     m.inactivityManager.RemovePeer(mp.peerCfg.PublicKey)
 }
 
-// transitionToActivityWatcherIOAfterUnlock runs the blocking I/O part of the
-// transition (PeerConnIdle which closes the WG peer and waits on
-// wgWatcherWg; plus MonitorPeerActivity which sets up the new listener).
-// Caller MUST NOT hold m.managedPeersMu.
-func (m *Manager) transitionToActivityWatcherIOAfterUnlock(mp *managedPeer) {
-    m.peerStore.PeerConnIdle(mp.peerCfg.PublicKey)   // blocking; safe outside lock
+// armActivityListener installs the activity monitor for a peer. This must run
+// BEFORE the blocking close (PeerConnIdle), so that even if the close hangs,
+// the next inbound WG traffic can still wake the peer back into the activity
+// watcher path. No lock required (activityManager has its own internal mutex).
+func (m *Manager) armActivityListener(mp *managedPeer) {
     if err := m.activityManager.MonitorPeerActivity(*mp.peerCfg); err != nil {
         mp.peerCfg.Log.Errorf("failed to create activity monitor: %v", err)
     }
 }
 
+// closePeerConnBestEffort runs the (potentially blocking) PeerConnIdle close
+// in its own goroutine. The watchdog's recovery completion is independent of
+// the close finishing — we only need the activity listener armed. If the close
+// hangs forever (the stuck-state symptom we are healing!), that goroutine
+// leaks but the peer is now fully reachable via the new listener.
+// No lock held by caller.
+func (m *Manager) closePeerConnBestEffort(mp *managedPeer) {
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                mp.peerCfg.Log.Errorf("PeerConnIdle panic: %v", r)
+            }
+        }()
+        m.peerStore.PeerConnIdle(mp.peerCfg.PublicKey)
+    }()
+}
+
 // recoverStuckPeer is the watchdog's recovery entry point. Runs in its own
 // goroutine (spawned by reconcileTick). Takes the FULL stuckBatch for
-// correct HA-defer semantics. Splits lock-acquisition from blocking I/O.
+// correct HA-defer semantics. Listener-first ordering: state-flip + listener
+// arm under/right after lock release, close fires-and-forgets in its own
+// goroutine.
 func (m *Manager) recoverStuckPeer(ctx context.Context, pubKey string, stuckBatch map[string]struct{}) {
     // Short lock for re-validation + state mutation
     m.managedPeersMu.Lock()
@@ -641,13 +672,18 @@ func (m *Manager) recoverStuckPeer(ctx context.Context, pubKey string, stuckBatc
     // Lock released. mp pointer is safe: managedPeer struct is only removed
     // via RemovePeer/ExcludePeer paths that both lock managedPeersMu.
 
-    // Blocking I/O OUTSIDE lock
-    m.transitionToActivityWatcherIOAfterUnlock(mp)
-    mp.peerCfg.Log.Infof("watchdog: recovery complete (watcherInactivity -> watcherActivity)")
+    // v0.4 listener-first ordering — arm BEFORE the (potentially blocking)
+    // close. If we did this in the opposite order and PeerConnIdle hung
+    // forever (the very symptom we are healing!), the peer would land in
+    // watcherActivity without a listener and would never wake up again.
+    m.armActivityListener(mp)
+    m.closePeerConnBestEffort(mp)
+    mp.peerCfg.Log.Infof("watchdog: recovery complete (watcherInactivity -> watcherActivity, listener armed, close best-effort)")
 }
 ```
 
-**Refaktor von `onPeerInactivityTimedOut`** (line 629) — Two-phase pattern:
+**Refaktor von `onPeerInactivityTimedOut`** (line 629) — Three-phase pattern,
+listener-first identical to the watchdog recovery path:
 
 ```go
 func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
@@ -673,23 +709,32 @@ func (m *Manager) onPeerInactivityTimedOut(peerIDs map[string]struct{}) {
     }
     m.managedPeersMu.Unlock()
 
-    // Phase 2: blocking I/O outside lock, sequential to match current behavior.
-    // Could be parallelized in a future patch; sequential keeps regressions low.
+    // Phase 2: arm activity listener first — survives a hanging close.
     for _, mp := range toTransition {
-        m.transitionToActivityWatcherIOAfterUnlock(mp)
+        m.armActivityListener(mp)
+    }
+    // Phase 3: close existing conn best-effort. Each peer's close runs in its
+    // own goroutine via closePeerConnBestEffort; the outer call returns once
+    // all goroutines are spawned.
+    for _, mp := range toTransition {
+        m.closePeerConnBestEffort(mp)
     }
 }
 ```
 
 **Behavior-Change-Warnung**: das ist ein **echter Behavior-Change** an
-`onPeerInactivityTimedOut`. Vorher lief `PeerConnIdle` unter Lock (per TODO
-`potentially can be optimized`); jetzt nicht mehr. Das ist eine **gewünschte
-Verbesserung**, aber muss in Tests sehr genau abgedeckt werden um Regressionen
-zu verhindern.
+`onPeerInactivityTimedOut`. Vorher lief `PeerConnIdle` synchron unter Lock
+(per TODO `potentially can be optimized`); jetzt async außerhalb Lock und nach
+Listener-Arm. Das ist eine **gewünschte Verbesserung**, aber muss in Tests sehr
+genau abgedeckt werden um Regressionen zu verhindern. Insbesondere: ein
+gleichzeitig feuernder Activity-Event (durch den neu armierten Listener) der
+auf eine teilweise-geclosete `*peer.Conn` zugreift muss von der existierenden
+`onPeerActivity`-Validierung (Re-Check via `expectedWatcher == watcherActivity`
+und Conn-Lookup in peerStore) abgefangen werden.
 
 Tests:
 - `TestRecoverStuckPeer_HappyPath`: State-Mutation läuft unter Lock, dann
-  `PeerConnIdle` außerhalb Lock.
+  Listener armiert, dann Close-Goroutine gespawnt.
 - `TestRecoverStuckPeer_AlreadyActivity_NoOp`: peer schon in watcherActivity,
   Idempotenz.
 - `TestRecoverStuckPeer_RespectsHA_FullBatch`: HA-defer mit Batch.
@@ -700,8 +745,17 @@ Tests:
   deferred werden.
 - `TestRecoverStuckPeer_PeerConnIdleOutsideLock`: instrument PeerConnIdle mit
   Sleep + assert dass `managedPeersMu` während Sleep nicht gehalten.
+- **`TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`** (Codex v0.4
+  BLOCKER): instrument `peerStore.PeerConnIdle` so dass es niemals returned;
+  assert dass (a) `activityManager.MonitorPeerActivity` aufgerufen wurde,
+  (b) `mp.expectedWatcher == watcherActivity`, (c) `recoverStuckPeer` returned
+  obwohl close noch hängt, (d) ein nachträglicher Activity-Event den Peer
+  erfolgreich wakeable macht.
 - `TestOnPeerInactivityTimedOut_AfterRefactor_HappyPath`: existierende
   Pfad-Semantik bleibt erhalten.
+- `TestOnPeerInactivityTimedOut_AfterRefactor_ListenerArmedBeforeClose`:
+  assert dass der refactored Pfad denselben listener-first-Ordering hat wie
+  recoverStuckPeer.
 - `TestOnPeerInactivityTimedOut_AfterRefactor_IOOutsideLock`: assert dass das
   refactored `onPeerInactivityTimedOut` das blocking I/O nach unlock geschoben hat.
 
@@ -715,48 +769,57 @@ go m.runReconcileWatchdog(ctx)
 ```
 Lebenszyklus identisch zum Start-Loop. Kein separater Knopf, kein Config-Toggle.
 
-#### Stufe 5: Read-only Transport-Snapshot API auf peer.Conn (v0.3 NEU)
+#### Stufe 5: Read-only Transport-Snapshot API auf peer.Conn (v0.4 reale Felder)
 **Datei**: `client/internal/peer/conn.go` (neue exported Methode)
-**Scope**: ~25 LOC
+**Scope**: ~20 LOC
 
-**Codex-Korrektur v0.3 (SHOULD-FIX)**: `conn.GetICEState()` / `conn.GetRelayState()`
+**Codex-Korrektur v0.4 (SHOULD-FIX 1)**: der v0.3-Stub nutzte fiktive Felder
+`iceConnected`/`relayConnected` und einen Lock `conn.mu`. Reale Implementation
+in `peer/conn.go` (line 125-140 verifiziert v0.4):
+- `statusRelay *worker.AtomicWorkerStatus`
+- `statusICE   *worker.AtomicWorkerStatus`
+- `AtomicWorkerStatus.Get() Status` (worker/state.go:40) lädt atomar via
+  `Status(acs.status.Load())`, kein Lock nötig
+- Enum: `StatusDisconnected Status = iota`, `StatusConnected`, … (worker/state.go:10)
+
+**v0.3-Befund (übernommen)**: `conn.GetICEState()` / `conn.GetRelayState()`
 existieren nicht. `isConnectedOnAllWay()` (conn.go:1027) ist private und ruft
 `logTraceConnState()` als Side-Effect bei disconnected (Log-Storm wenn Watchdog
-das alle 120s aufruft, mal 32 peers). Watchdog braucht eine saubere read-only API
-ohne Side-Effects.
+das alle 120s aufruft, mal 32 peers). Watchdog braucht eine saubere read-only
+API ohne Side-Effects.
 
 Neue exported API:
 ```go
 // TransportSnapshot returns the current connectivity state of both
-// transports (ICE and Relay) as boolean flags indicating disconnection.
+// transports (ICE and Relay) as boolean flags indicating "not connected".
 // Intended for external watchdogs and telemetry: pure read, no logging,
-// no state mutation.
+// no state mutation, no lock acquisition (atomic loads).
 //
-// Internally takes conn.mu briefly to read the iceConnected/relayConnected
-// fields without racing concurrent OnICEConnected/OnRelayDisconnected
-// handlers.
+// Returns (iceDisconnected, relayDisconnected) where each bool is true if
+// that transport is NOT in StatusConnected.
 func (conn *Conn) TransportSnapshot() (iceDisconnected, relayDisconnected bool) {
-    conn.mu.Lock()
-    defer conn.mu.Unlock()
-    // Field names to be verified at implementation time. The semantic
-    // intent: "ice not Connected" and "relay not Connected".
-    return !conn.iceConnected, !conn.relayConnected
+    return conn.statusICE.Get() != worker.StatusConnected,
+        conn.statusRelay.Get() != worker.StatusConnected
 }
 ```
 
-**Offene Frage Q5 v0.3** an Codex: ist `conn.mu` der richtige Lock für den
-read? Gibt es einen feineren read-lock auf den jeweiligen Transport-State?
-Aktuell vermute ich `conn.mu` ist der Lock — bitte verifizieren bei
-Implementation.
+**Lock-Garantien**: keine. `AtomicWorkerStatus.status` ist ein
+`atomic.Int32` (siehe worker/state.go:7-15) und wird ausschließlich via
+`Set()`/`Get()` atomic-load/store gelesen/geschrieben. Concurrent
+`OnICEConnected`/`OnRelayDisconnected`-Handler greifen über dieselben
+atomar-typed Methoden zu.
 
 Tests:
-- `TestTransportSnapshot_BothConnected`: assert `(false, false)`.
-- `TestTransportSnapshot_BothDisconnected`: assert `(true, true)`.
-- `TestTransportSnapshot_RelayOnly`: ICE down, Relay up → `(true, false)`.
+- `TestTransportSnapshot_BothConnected`: setze beide AtomicWorkerStatus auf
+  `StatusConnected`, assert `(false, false)`.
+- `TestTransportSnapshot_BothDisconnected`: beide auf `StatusDisconnected`,
+  assert `(true, true)`.
+- `TestTransportSnapshot_RelayOnly`: ICE=Disconnected, Relay=Connected →
+  `(true, false)`.
 - `TestTransportSnapshot_NoLogging`: via test-hook auf logger assert dass keine
   log-Aufrufe stattfinden.
 - `TestTransportSnapshot_RaceSafe`: `go test -race` mit konkurrenten
-  State-Mutations.
+  `statusICE.Set()` / `statusRelay.Set()` Mutations.
 
 ### 5.3 Was NICHT geändert wird (explizit)
 
@@ -785,8 +848,10 @@ Tests:
    relayDrops, drops auf iceInactiveChan zählen nur iceDrops.
 
 **Für Stufe 2 (Reconcile-Watchdog)**:
-7. `TestReconcileWatchdog_DetectsStuckPeer`: drop-delta > 0 + Peer disconnected +
-   panicCount > 0 → recoverStuckPeer wird aufgerufen.
+7. `TestReconcileWatchdog_DetectsStuckPeer`: drop-delta > 0 + Peer beide-
+   Transports disconnected (per TransportSnapshot) → recoverStuckPeer wird
+   aufgerufen (per v0.4 ist `panicCount` NICHT mehr Watchdog-Signal — Panic
+   crasht den Prozess und überlebt keinen Stuck-State).
 8. `TestReconcileWatchdog_IgnoresHealthyPeer`: peer mit recent state-transition
    wird NICHT geheilt.
 9. **`TestReconcileWatchdog_DropCounterAloneIsNotTrigger`** (Codex R5 v0.2):
@@ -808,14 +873,36 @@ Tests:
     `Start(ctx)` und stoppt bei `ctx.Done()`.
 
 **Für Stufe 3 (Refaktor + Helper)**:
-15. `TestTransitionToActivityWatcherLocked_HappyPath`: zentral getestet.
+15. `TestTransitionToActivityWatcherStateOnly_HappyPath`: zentral getestet.
 16. `TestRecoverStuckPeer_HappyPath`: peer in watcherInactivity →
-    recoverStuckPeer → watcherActivity.
+    recoverStuckPeer → watcherActivity + Listener armiert + Close-Goroutine
+    gespawnt.
 17. `TestRecoverStuckPeer_AlreadyActivity_NoOp`: peer schon in watcherActivity,
     Idempotenz.
-18. `TestRecoverStuckPeer_RespectsHA`: HA-defer in Recovery-Pfad.
-19. `TestOnPeerInactivityTimedOut_AfterRefactor`: existierender Test-Sweep auf
-    `onPeerInactivityTimedOut` nach Refaktor unverändert grün.
+18. `TestRecoverStuckPeer_RespectsHA_FullBatch`: HA-defer im Recovery-Pfad mit
+    vollem Batch.
+19. **`TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`** (Codex v0.4
+    BLOCKER-Fix): instrument `peerStore.PeerConnIdle` so dass es niemals
+    returned; assert (a) `armActivityListener` wurde aufgerufen,
+    (b) `mp.expectedWatcher == watcherActivity`, (c) `recoverStuckPeer`
+    selbst returned trotz hängendem Close, (d) ein nachträglicher
+    Activity-Event über den neu armierten Listener wakeable.
+20. `TestOnPeerInactivityTimedOut_AfterRefactor_HappyPath`: existierender
+    Test-Sweep nach Refaktor unverändert grün.
+21. `TestOnPeerInactivityTimedOut_AfterRefactor_ListenerArmedBeforeClose`:
+    assert dass der refactored Pfad denselben listener-first-Ordering hat
+    wie `recoverStuckPeer`.
+
+**Für Stufe 5 (TransportSnapshot)**:
+22. `TestTransportSnapshot_BothConnected`: `statusICE=StatusConnected`,
+    `statusRelay=StatusConnected` → `(false, false)`.
+23. `TestTransportSnapshot_BothDisconnected`: beide auf `StatusDisconnected` →
+    `(true, true)`.
+24. `TestTransportSnapshot_RelayOnly`: ICE disconnected, Relay connected →
+    `(true, false)`.
+25. `TestTransportSnapshot_NoLogging`: assert keine log-Aufrufe.
+26. `TestTransportSnapshot_RaceSafe`: `go test -race` mit konkurrenten
+    `statusICE.Set()`/`statusRelay.Set()`.
 
 Alle laufen mit `go test -race`. Bestehende Tests in
 `client/internal/lazyconn/inactivity/manager_test.go` und
@@ -849,7 +936,7 @@ Soak-Dauer: 72 h ohne Force-Stop. Erfolgs-Kriterien:
 
 | # | Risiko | Severity | Mitigation |
 |---|---|---|---|
-| R1 | Watchdog false-positive: gesunder Peer wird gestört | Mittel | Multi-Faktor-Heuristik in `isStuckPeer` (drop-delta > 0 UND conn-disconnected UND panicCount/threshold) + `shouldDeferIdleForHA`-Check + Re-Check `expectedWatcher == watcherInactivity` nach Lock-Reacquire |
+| R1 | Watchdog false-positive: gesunder Peer wird gestört | Mittel | Multi-Faktor-Heuristik in `isStuckPeer` (`iceDisc && relayDisc && (deltaRelay > 0 \|\| deltaICE > 0)` — beide Transports disconnected UND notifyChan dropt aktiv) + `shouldDeferIdleForHA`-Check + Re-Check `expectedWatcher == watcherInactivity` nach Lock-Reacquire |
 | R2 | Race zwischen `onPeerInactivityTimedOut` und Watchdog-Reconcile | Mittel | Beide nutzen `managedPeersMu`; Reconcile prüft `expectedWatcher == watcherInactivity` redundant nach Lock-Reacquire; `transitionToActivityWatcherLocked` shared zwischen beiden Pfaden |
 | R3 | Watchdog stört intentionale LazyTimeout-Konfig (z.B. Admin setzt RelayTimeout=24h für long-idle peers) | Niedrig | Trigger basiert auf `dropDelta > 0` (Indikator dass Events verloren gehen) + Disconnected-State, NICHT auf reiner Idle-Zeit. Admin-Config wird respektiert |
 | R4 | `PeerConnIdle` chain → `Conn.Close()` → `wgWatcherWg.Wait()` ist hart blocking; lief in v0.2-Stufe 3 unter `managedPeersMu` | **BLOCKER (Codex v0.3)** | **v0.3-Mitigation**: Split in `transitionToActivityWatcherStateOnly` (unter Lock) + `transitionToActivityWatcherIOAfterUnlock` (außerhalb Lock). Beide Recovery-Pfade (`onPeerInactivityTimedOut` + `recoverStuckPeer`) folgen diesem Pattern. Watchdog spawnt zusätzlich bounded async goroutines pro Peer → ein blockierender Peer blockiert weder Watchdog-Tick noch andere Recoveries. |
@@ -858,47 +945,52 @@ Soak-Dauer: 72 h ohne Force-Stop. Erfolgs-Kriterien:
 | **R7** | **Panic im Watchdog-Loop killt sich selbst dauerhaft** (gleicher Bug wie für Start-Loop in Stufe 0) | **Mittel (Codex v0.2)** | v0.3: `runReconcileWatchdog` hat eigenes `defer recover()` mit `go m.runReconcileWatchdog(ctx)`-Self-Restart. Pro-Peer-Recovery-goroutines haben eigenes `defer recover()`. |
 | **R8** | **HA-Defer mit Single-Peer-Map deferred ad infinitum** (Codex v0.3 BLOCKER): `shouldDeferIdleForHA` interpretiert „peer nicht im inactivePeers map" als „aktiv". Single-Peer-Map machte alle anderen HA-Member fälschlich aktiv | **BLOCKER (Codex v0.3)** | Watchdog sammelt vollen `stuckBatch` in Phase C/D und übergibt ihn an jede Recovery-goroutine. `shouldDeferIdleForHA` arbeitet wie beim regelmäßigen Pfad mit dem realen Batch der stuck-Peers. Test `TestRecoverStuckPeer_RespectsHA_SinglePeerBatch_RegressionGuard` deckt das ab. |
 | **R9** | **`onPeerInactivityTimedOut`-Refaktor verändert blocking-call-Ordnung** (Side-Effect des Stufe-3-Refaktors): `PeerConnIdle` läuft jetzt nach `expectedWatcher=activity`-Flip, nicht davor. Kann subtle Race mit `onPeerActivity` ergeben wenn der activity-Listener bereits feuert bevor `PeerConnIdle` abgeschlossen ist | **Mittel (v0.3 neu)** | Test-Coverage `TestOnPeerInactivityTimedOut_AfterRefactor_*`. Auch: das ist die intendierte Semantik (state-machine zuerst, I/O nachher) und entspricht dem TODO „potentially can be optimized" auf manager.go:659. Race mit activity-Listener ist tolerabel weil der `onPeerActivity`-Pfad selber `expectedWatcher == watcherActivity` als Vorbedingung prüft. |
+| **R10** | **Listener-armed-before-close lässt einen blockierenden `PeerConnIdle` als langlebige Leak-Goroutine zurück** (v0.4 BLOCKER-Fix Side-Effect): `closePeerConnBestEffort` spawnt eine goroutine die nie returned wenn `Conn.Close()` ewig hängt. Bei 32 stuck-Peers ergeben sich potentiell 32 leaked goroutines pro stuck-Cycle | **Mittel (Codex v0.4)** | Akzeptiert als Trade-Off — Alternative ist Peer ohne Listener. Mitigation Telemetrie: pro `closePeerConnBestEffort` ein atomic `pendingCloses`-Counter inc/dec, vom Watchdog im 120s-Tick mit-geloggt; Schwellwert (>10 pending closes über 10min) erzeugt Warn-Log und nimmt das in zukünftiges Debugging mit. **KEIN automatischer Kill der hängenden goroutine** — der Bug muss in Conn.Close()/wgWatcherWg.Wait() upstream gefixt werden. |
+| **R11** | **`TransportSnapshot` liest atomare Status-Felder ohne Lock — Race mit ICE-Reconnect Möglichkeit** (v0.4 SHOULD-FIX 1 Side-Effect): Watchdog könnte einen Peer „disconnected" sehen während er gerade in `StatusConnecting`/`StatusReconnecting` ist, und unnötig recovern | **Niedrig (v0.4)** | `isStuckPeer` verlangt BEIDE Transports disconnected UND drop-delta > 0 — die Wahrscheinlichkeit dass ein Peer GLEICHZEITIG ICE+Relay-Reconnect macht UND notifyChan dropt ist sehr klein. False-positive-Cost ist eine zusätzliche Recovery-Goroutine, kein State-Corruption. Test `TestTransportSnapshot_RaceSafe` deckt mit `-race` ab. |
 
-### 7.2 Offene Fragen für Codex
+### 7.2 Offene Fragen für Codex (v0.4 — auf 4 verbleibende reduziert)
 
-1. **~~Channel-Buffer-Größe~~** (selbst verifiziert): `iceInactiveChan` und
-   `inactivePeersChan` haben beide Buffer 1. Mit Buffer 1 ist Drop fast garantiert
-   bei jeder Consumer-Pause. Damit ist die silent-drop-These nicht mehr ein
-   Verdacht sondern strukturell zwingend. **Frage an Codex**: ist Buffer 1
-   absichtlich (z.B. um Backpressure auf den Producer zu üben), oder
-   konservative Default-Wahl? Falls absichtlich: bitte erklären, sonst sollte
-   Stufe 1 auch die Buffer-Erhöhung erwägen (z.B. auf len(managedPeers) oder
-   ein Vielfaches). Aktuell Spec geht NICHT mit Buffer-Erhöhung, weil das
-   Symptom (stuck Consumer) auch mit größerem Buffer irgendwann auftreten würde.
+Folgende Fragen aus v0.3 sind durch v0.4-Änderungen **geschlossen**:
+- ~~Q4 v0.3 (`RecoverPeerToIdle` vs. eigene Methode)~~ — entschieden: eigene
+  `recoverStuckPeer` + Helper-Triple in derselben Datei (cross-package-Calls
+  von `lazyconn/manager` nach `conn_mgr` würden Importzyklus erzeugen).
+- ~~Q5 v0.3 (single-peer-map für HA-Defer)~~ — durch v0.3 HA-Batch-Fix obsolet.
+- ~~Q5 v0.4 alt (Lock für TransportSnapshot)~~ — verifiziert: reale Felder sind
+  `statusICE/statusRelay *worker.AtomicWorkerStatus`, atomic, kein Lock nötig.
+- ~~Branch-Basis Q4 v0.3~~ — v0.4: `phase3.7i-runtime-bugfixes-v0.5` (siehe 8.1).
 
-2. **`PeerConnIdle` blocking behavior**: ist das echt blocking (Wireguard-Kernel-Call)
-   oder nur „blocking unter Last"? Wenn echt blocking, dann sollte
-   `forceReconcileToActivityWatcher` async laufen.
+Verbleibend für Codex round-4:
 
-3. **Consumer-Tod durch panic**: gibt es im Lazy-Manager-Code einen Pfad wo das
-   `select` in `manager.go:186` durch eine Panic in einem case komplett beendet
-   wird? Wenn ja, ist mein Watchdog-Fix unzureichend — wir bräuchten ZUSÄTZLICH
-   einen Goroutine-Liveness-Detector. Bitte das Panic-Handling im Select-Body
-   verifizieren.
+1. **`isStuckPeer`-Symmetrie**: aktuell verlangt `iceDisc && relayDisc &&
+   (deltaRelay > 0 || deltaICE > 0)`. Phase-3.7i p2p-dynamic kann Lazy-
+   Activation NUR ICE machen (kein Relay-Watcher), Relay bleibt dann
+   structurally „disconnected". Wenn Watchdog dieselbe Logik auf p2p-dynamic-
+   only-Peers anwendet, schlägt das fortwährend an. Soll der Watchdog die
+   ConnectionMode des Peers konsultieren und je nach Mode unterschiedlich
+   triggern?
 
-4. **`RecoverPeerToIdle` vs. `forceReconcileToActivityWatcher`**: kann ich
-   `conn_mgr.go:568 RecoverPeerToIdle` direkt aufrufen statt eine eigene Funktion
-   zu schreiben? Codex' frühere Empfehlung war diesen Pfad wiederzuverwenden. Ich
-   habe die Funktion ausgemodelliert — wenn semantisch identisch, einfacher.
-   Spec geht aktuell mit einer dedizierten `forceReconcileToActivityWatcher`-Methode
-   weil die Mutex-Hierarchie sauberer ist (caller hält bereits den Lock).
-
-5. **Default-Schwelle „2× relayTimeout"**: ist das die richtige Konstante? Soll
-   das konfigurierbar sein (via Account-Setting `legacy_lazy_fallback_timeout_seconds`
+2. **Default-Tick-Intervall 120 s**: ist das die richtige Konstante? Soll
+   das konfigurierbar sein (via Account-Setting `lazy_watchdog_interval_seconds`
    oder dediziertem Knopf), oder als Hartkodierung okay?
 
-6. **HA-Defer-Logik**: `onPeerInactivityTimedOut` hat eine `shouldDeferIdleForHA`-Logik
-   bei manager.go:648. Soll der Watchdog dieselbe Logik anwenden, oder ist
-   stuck-state ein „override" der HA-Defer-Logik?
+3. **Listener-armed-Leak-Mitigation (R10)**: aktuell akzeptiere ich, dass
+   `closePeerConnBestEffort` bei hängendem `Conn.Close()` eine leaked
+   goroutine hinterlässt, weil die Alternative (Peer ohne Listener) schlimmer
+   ist. Soll der Watchdog zusätzlich pro-Peer `pendingCloses`-Counter führen
+   und nach Schwellwert (z.B. >10 über 10 min) per Telemetrie warnen?
+   Oder soll ich gleich versuchen den Conn.Close()-Hang upstream zu beheben
+   (parallele Spec)?
+
+4. **Test-Strategie für blocking-call-outside-lock**: gibt es eine etablierte
+   Methode in NetBird-Tests einen `PeerConnIdle`-Call programmatisch zu
+   verzögern (für `TestRecoverStuckPeer_PeerConnIdleOutsideLock` und
+   `TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`)? Aktuell
+   denke ich an einen test-only `Conn.idleHookForTest func()` der vor dem
+   `Close` aufgerufen wird.
 
 ## 8. Rollout-Plan
 
-### 8.1 Branch + Commit-Struktur (v0.2 differenziert)
+### 8.1 Branch + Commit-Struktur (v0.4 — Base fixiert)
 
 **Codex-Befund v0.2**: `upstream/main` hat den alten Lazy-Manager und 1-slot
 `inactivePeersChan`, aber **nicht** die komplette Phase-3.7i-Zwei-Timer- /
@@ -915,29 +1007,36 @@ ICEInactive-Logik. Daher zwei verschiedene Branch-Strategien:
 - Upstream-PR-Strategie: separat einreichen als NICHT-Phase-3.7i-blockierender Fix
 
 **Stufen 0+2+3+4+5 (Panic-Recovery + Watchdog + Refaktor + Wiring + TransportSnapshot) — Phase-3.7i-Stack**:
-- Base: muss auf einem Branch sitzen der den vollen Phase-3.7i-Lazy-Manager-
-  Code-Stand hat (Zwei-Timer-Logik, expectedWatcher state machine, HA-defer-Logik)
-- **Frage an Codex Q4 v0.3**: welcher der pr/c/d/e bzw. runtime-bugfixes-v0.5 bzw.
-  test/plan1+plan2-combined ist der richtige Base?
-- Branch: `pr/g-phase3.7i-lazy-watchdog` (auf gewähltem Phase-3.7i-Base)
+- **Base v0.4 (Codex-Empfehlung)**: `phase3.7i-runtime-bugfixes-v0.5`
+  - enthält den relevanten Lazy-Manager-Stand: `NewManagerWithTwoTimers`,
+    `expectedWatcher`, HA-Defer-Logik, Activity-AttachICE
+  - sauberer als `test/plan1+plan2-combined` (das ist Deployment-Branch mit
+    Plan-2 mgmt-stream-watchdog/keepalive oben drauf — semantisch unverwandt)
+  - sauberer als `pr/c/d/e` (das sind upstream-PR-Branches für andere
+    Phase-3.7i-Subsysteme und enthalten den Lazy-Manager-Code nicht voll)
+- Branch: `pr/g-phase3.7i-lazy-watchdog` (auf `phase3.7i-runtime-bugfixes-v0.5`)
 - Commits (5 separate commits, jeder einzeln reviewbar):
-  1. `peer/conn: add TransportSnapshot accessor for external watchdogs` (Stufe 5)
-  2. `lazyconn/manager: defer recover() around consumer loop handlers` (Stufe 0)
-  3. `lazyconn/manager: split state-mutation from blocking I/O in inactivity-timeout path` (Stufe 3 Refaktor — Refaktor pur, behavior identisch wo möglich, blocking-I/O nach unlock geschoben)
+  1. `peer/conn: add TransportSnapshot accessor for external watchdogs` (Stufe 5 — lock-free atomic-load über `statusICE`/`statusRelay`)
+  2. `lazyconn/manager: defer recover() around consumer loop handlers` (Stufe 0 — pure Hardening, nicht Stuck-Fix)
+  3. `lazyconn/manager: split state-mutation from blocking I/O, listener-first ordering` (Stufe 3 Refaktor: state-only/listener/close-best-effort Triple; `onPeerInactivityTimedOut` folgt demselben Pattern)
   4. `lazyconn/manager: reconcile watchdog with phased lock-strategy + async recovery` (Stufe 2 + 4: Watchdog-goroutine + recoverStuckPeer + Inflight-Dedupe + Test-Suite)
-  5. `lazyconn/inactivity: count + log silent notifyChan drops` (Stufe 1 — ist eigentlich separater upstream-PR, kann aber als letzter Commit auch hier mitlaufen wenn das Phase-3.7i-Base nicht parallel upstream-merged wird)
-- Test-Coverage: ~21 neue Unit-Tests (siehe Section 6.1)
+  5. `lazyconn/inactivity: count + log silent notifyChan drops` (Stufe 1 — kann als letzter Commit auch hier mitlaufen wenn Stufe 1 nicht parallel upstream-merged ist)
+- Test-Coverage: ~26 neue Unit-Tests (siehe Section 6.1)
 
 Author + Committer für alle Commits:
 `Michael Uray <25169478+MichaelUray@users.noreply.github.com>`. Keine
 Co-Authored-By-Trailer.
 
 ### 8.2 Deployment-Stufen
-1. **Stage 1 (canary)**: Combined-Branch (test/plan1+plan2-combined inkl. dieser
-   Patches) auf S21 deployen. Monitor 72h auf:
+1. **Stage 1 (canary)**: Combined-Branch (`pr/g-phase3.7i-lazy-watchdog` auf
+   `phase3.7i-runtime-bugfixes-v0.5` + Plan-1/Plan-2-Stack) auf S21 deployen.
+   Monitor 72h auf:
    - Auftreten von „notifyChan ... full, dropped event" Warn-Logs
-   - Auftreten von „lazy-state stuck ... forcing reconciliation" Warn-Logs
+   - Auftreten von „lazyconn watchdog: N stuck peers ... spawning recovery"
+     Warn-Logs
+   - Auftreten von „watchdog: recovery complete" Info-Logs
    - VNC-Connect-Erfolgsrate zu Elmira ohne Force-Stop
+   - `pendingCloses`-Counter (siehe R10) — sollte ≤ 1 bei normalem Betrieb
 2. **Stage 2**: Auf alle 5 BM-Router + r1-pve5 ausrollen. Monitor 7 Tage.
 3. **Stage 3**: Upstream-PR an netbirdio/netbird (sobald separat Codex re-review +
    User-OK vorliegen).
@@ -971,119 +1070,70 @@ Dieser Patch ist semantisch unabhängig von den drei anderen.
   - w11-test1: NetBird IP 100.87.118.182 (0.68.0-dev-0ca25fe4c)
 - Code-Refs sind alle gegen `test/plan1+plan2-combined` Tip `1428d2831`
 
-## Codex-Review-Anfrage v0.3
+## Codex-Review-Anfrage v0.4
 
-**Status der v0.2-Findings (Codex round-2 vom 2026-05-23)**: alle 2 BLOCKERs +
-1 SHOULD-FIX + 1 HA-Korrektur adressiert:
-- ✅ BLOCKER 1 (Panic-Tod als Root-Cause technisch falsch): Section 4.3
-  reorganisiert — Panic-Hypothese verworfen weil Go-Goroutine-Panic den
-  gesamten Prozess crashed. Stufe 0 bleibt als REINES Hardening, NICHT als
-  Stuck-Fix.
-- ✅ BLOCKER 2 (`transitionToActivityWatcherLocked` held Lock + ruft blocking
-  `PeerConnIdle`): kompletter Rewrite Stufen 2+3 mit Phase-A/B/C/D-Architektur,
-  Split in `transitionToActivityWatcherStateOnly` + `transitionToActivityWatcherIOAfterUnlock`,
-  Watchdog-Recovery in bounded async goroutines pro Peer.
-- ✅ SHOULD-FIX (`GetICEState`/`GetRelayState` existieren nicht, `isConnectedOnAllWay`
-  hat Logging-Side-Effects): neue Stufe 5 `Conn.TransportSnapshot()` API ohne
-  Logging.
-- ✅ HA-Korrektur (`shouldDeferIdleForHA` mit Single-Peer-Map deferred ad
-  infinitum): Watchdog gibt vollen `stuckBatch` an `recoverStuckPeer`, R8 + Test
-  `TestRecoverStuckPeer_RespectsHA_SinglePeerBatch_RegressionGuard`.
+**Status der v0.3-Findings (Codex round-3 vom 2026-05-23 nachmittag)**: alle
+1 BLOCKER + 2 SHOULD-FIXes adressiert:
 
-**Neue Fragen v0.3 die ich Codex bitte zu reviewen**:
+- ✅ **BLOCKER (Recovery-Reihenfolge lässt Peer ohne Listener wenn `PeerConnIdle`
+  hängt)**: Stufe 3 komplett neu geschnitten. Statt
+  `transitionToActivityWatcherIOAfterUnlock(close → listen)` jetzt
+  Triple-Helper:
+  1. `transitionToActivityWatcherStateOnly` (unter Lock, state-flip)
+  2. `armActivityListener` (lock-free, Listener ZUERST armieren)
+  3. `closePeerConnBestEffort` (fire-and-forget goroutine, Close darf ewig
+     hängen ohne den Peer zu blockieren)
+  
+  Damit kann der nächste WG-Wake-Event auch dann den Peer in den
+  Activity-Pfad zurückbringen, wenn `Conn.Close()` strukturell hängt.
+  Neuer Test `TestRecoverStuckPeer_PeerConnIdleHangs_ListenerStillArmed`
+  verifiziert genau diesen Pfad. `onPeerInactivityTimedOut` folgt dem
+  gleichen Triple-Pattern für Symmetrie.
 
-1. **Reale API für ICE/Relay-State auf `*peer.Conn`** (Q5 neu, Section 5.2 Stufe 2):
-   Aktuell vermute ich `conn.dumpState`-bezogene Methoden oder einen
-   `statusRecorder`-Pfad. Welche read-safe API zum Lesen von ICE/Relay-State auf
-   einem `*peer.Conn` ist die richtige? Falls keine existiert: ist es OK einen
-   neuen read-only Accessor `conn.IsDisconnected() bool` zu exponieren?
+- ✅ **SHOULD-FIX 1 (TransportSnapshot fiktive Felder)**: Stufe 5 nutzt jetzt
+  die realen Felder `conn.statusICE *worker.AtomicWorkerStatus` und
+  `conn.statusRelay *worker.AtomicWorkerStatus` (verifiziert in
+  `peer/conn.go:125-140`). `AtomicWorkerStatus.Get() Status` lädt atomar
+  ohne Lock. `worker.StatusConnected`/`StatusDisconnected` als Enums
+  vorhanden (`worker/state.go:10-15`). Kein `conn.mu` mehr nötig.
 
-2. **`isStuckPeer`-Heuristik** (Stufe 2): die Multi-Faktor-Heuristik
-   (drop-delta > 0 UND conn-disconnected UND (panicCount > 0 OR idle ≥ 2×threshold))
-   — ist das die richtige Kombination? Soll `panicCount > 0` ein hard-Trigger sein
-   (auch wenn Conn nicht disconnected) oder nur additiv?
+- ✅ **SHOULD-FIX 2 (v0.2-Reste)**: `panicCount > 0` als Watchdog-Trigger aus
+  R1 und Test 7 entfernt (Panic crashed den Prozess, Counter überlebt
+  keinen Stuck-State). Single-Peer-Map-Frage aus 7.2 gestrichen (durch v0.3
+  HA-Batch-Fix obsolet).
 
-3. **Watchdog-Recovery in eigener goroutine** (R6 Mitigation): aktueller Vorschlag
-   ist `recoverStuckPeer` synchron im Tick-Handler laufen zu lassen. Wenn
-   `PeerConnIdle` hängt, blockiert das den ganzen Tick-Loop. Alternative: pro
-   stuck-Peer eine `go m.recoverStuckPeer(pubKey)` spawnen. Risiko: race conditions
-   wenn mehrere Watchdog-Ticks vor erstem Recovery-Result feuern. Welche Strategie
-   bevorzugt?
+- ✅ **Branch-Basis (Codex round-3 Q4 v0.3)**: explizit `phase3.7i-runtime-bugfixes-v0.5`
+  als Base für Stufen 0/2/3/4/5. Lokal verifiziert dass der Branch existiert
+  und enthält `NewManagerWithTwoTimers`, `expectedWatcher`-state-machine,
+  HA-Defer-Logik, Activity-AttachICE.
 
-4. **Phase-3.7i-Stack-Base** (Q8 neu, Section 8.1): pr/c-phase3.7i-routing-prefs,
-   pr/d-phase3.7i-network-controller, pr/e-phase3.7i-engine-glue,
-   phase3.7i-runtime-bugfixes-v0.5 — welcher ist der richtige Base für Stufen
-   0+2+3+4? Aktuell habe ich keinen klaren Pfad und der Code in
-   test/plan1+plan2-combined ist die einzige Stelle wo der volle Phase-3.7i-Stack
-   deployed läuft.
+**Neue Fragen v0.4 die ich Codex bitte zu reviewen** (4 statt 8):
 
-5. **`shouldDeferIdleForHA` mit single-Peer map**: in `recoverStuckPeer` (Stufe 3)
-   übergebe ich der HA-Check-Funktion eine `map[string]struct{}{pubKey: {}}`.
-   Das spiegelt das Verhalten von `onPeerInactivityTimedOut` für einen Single-Peer-
-   Batch. Ist semantisch korrekt? Oder erwartet `shouldDeferIdleForHA` den ganzen
-   Batch der gerade idle ist (für HA-Failover-Awareness über alle peers)?
+1. **Listener-armed-vor-Close-Reihenfolge** (Stufe 3, v0.4 BLOCKER-Fix):
+   Bin ich richtig dass das Pattern `armActivityListener()` → `closePeerConnBestEffort()`
+   keine subtle Race ergibt? Speziell: kann der neu armierte Listener feuern
+   während die zugehörige `*peer.Conn` noch nicht-vollständig-geclosed ist?
+   Die `onPeerActivity`-Validierung prüft `expectedWatcher == watcherActivity`
+   + Conn-Lookup im peerStore — sollte das tolerant decken, aber bitte das
+   Race-Modell sanity-checken.
 
-6. **`PeerConnIdle`-Latency-Profiling**: bevor wir den Watchdog deployen, sollte
-   ich `PeerConnIdle`-Latenz messen unter Last (z.B. mit 30 peers gleichzeitig)?
-   Falls > Watchdog-Tick-Intervall, dann muss Stufe 2 die Recovery in eigener
-   goroutine spawnen (siehe Q3). Wenn < 1s, dann reicht der synchrone Pfad.
+2. **`isStuckPeer` für p2p-dynamic-ICE-only-Peers** (Section 7.2 Q1): die
+   Heuristik verlangt `iceDisc && relayDisc`. Phase-3.7i p2p-dynamic-Peers
+   ohne Relay-Watcher haben strukturell `relayDisc == true`. Soll der
+   Watchdog die ConnectionMode des Peers konsultieren? Konkret: ist es
+   sicherer den Watchdog auf p2p-dynamic-Peers nur bei `iceDisc && deltaICE > 0`
+   triggern zu lassen?
 
-7. **Test-Strategie für Consumer-Blockade**: gibt es im NetBird-Test-Framework
-   eine etablierte Methode den Consumer im Lazy-Manager-Select-Loop zu blockieren
-   (für Integration-Tests)? Alternativ: ein Test-Hook der den onPeerActivity-
-   Handler durch einen blockierenden Mock ersetzt.
+3. **R10 — Leaked goroutines bei hängendem `Conn.Close()`**: aktuell
+   akzeptiere ich potentiell 32 leaked goroutines pro stuck-Cycle bei 32
+   Peers wenn `wgWatcherWg.Wait()` strukturell hängt. Alternative: zusätzlich
+   eine parallele Spec für den `Conn.Close()`-Hang upstream beheben. Welcher
+   Pfad ist sauberer — beides parallel, oder erst Watchdog deployen +
+   Telemetrie sammeln?
 
-8. **Klassifikation v0.2**: ist die Spec jetzt v0.2-implementierbar? Wenn nicht,
-   was sind die verbleibenden BLOCKERs?
+4. **Klassifikation v0.4**: ist die Spec jetzt v0.4-implementierbar? Wenn
+   nicht, was sind die verbleibenden BLOCKERs?
 
-**Reduzierte Fragenliste für v0.3-Review** (v0.2-Fragen die schon adressiert sind
-gestrichen):
-
-1. **Bin ich richtig dass Phase-A/B/C/D-Architektur (Stufe 2) keine Locks mehr
-   während blocking-calls hält?** Konkret bitte den Pseudocode bei Phase D
-   reviewen — die async-goroutine pro Peer hat ihren eigenen Lock-Cycle in
-   `recoverStuckPeer`.
-
-2. **`isStuckPeer`-Heuristik** (Stufe 2): `iceDisc && relayDisc &&
-   (deltaRelay>0 || deltaICE>0)` — ist das die richtige Kombination? Speziell:
-   soll der Watchdog auch greifen wenn drops > 0 aber nur ICE-disconnected
-   (Relay noch up)? Mein aktueller Vorschlag verlangt BOTH Transports
-   disconnected — das ist konservativ, schließt aber den Fall aus wo Lazy-
-   Activation NUR ICE benutzen will (Phase-3.7i p2p-dynamic kann das).
-
-3. **Behavior-Change in `onPeerInactivityTimedOut`** (Stufe 3 Refaktor):
-   `PeerConnIdle` läuft jetzt nach unlock, Sequenz `state-flip → unlock →
-   PeerConnIdle`. Vorher: `PeerConnIdle → state-flip` unter Lock. Ist diese
-   Reihenfolge-Umkehrung semantisch akzeptabel? Speziell: kann ein gleichzeitig
-   feuernder `onPeerActivity` (mit `expectedWatcher == watcherActivity` als
-   Vorbedingung) zwischen state-flip und PeerConnIdle eintreten und Probleme
-   verursachen? Tests 19+ versuchen das abzudecken, aber bitte das Race-Modell
-   sanity-checken.
-
-4. **Phase-3.7i-Stack-Base** (Frage offen aus v0.2): pr/c-phase3.7i-routing-prefs,
-   pr/d-phase3.7i-network-controller, pr/e-phase3.7i-engine-glue,
-   phase3.7i-runtime-bugfixes-v0.5, oder test/plan1+plan2-combined — welcher hat
-   den vollen Phase-3.7i-Lazy-Manager-Code-Stand (Zwei-Timer, expectedWatcher
-   state machine, HA-defer-Logik)?
-
-5. **`Conn.TransportSnapshot()` Lock**: ist `conn.mu` der einzige Lock auf
-   `iceConnected`/`relayConnected`? Gibt es feinere read-write-Locks die ich
-   nutzen sollte? (Vermutung: conn.mu reicht.)
-
-6. **Inflight-Dedupe-Map**: ist `recoveringPeers map[string]struct{}` mit
-   eigenem Mutex die richtige Lösung um Doppel-Spawning zu verhindern? Alternative
-   wäre per-Peer atomic.Bool, aber das müsste pro `managedPeer` gepflegt werden.
-   Map ist einfacher aber teilt sich einen Mutex über alle peers.
-
-7. **Test-Strategie für blocking-call-outside-lock**: gibt es eine etablierte
-   Methode in NetBird-Tests einen `PeerConnIdle`-Call programmatisch zu
-   verzögern (für `TestRecoverStuckPeer_PeerConnIdleOutsideLock`)? Aktuell denke
-   ich an einen test-only `Conn.idleHookForTest func()` der vor dem `Close`
-   aufgerufen wird.
-
-8. **Klassifikation v0.3**: ist die Spec jetzt v0.3-implementierbar? Falls
-   weitere BLOCKERs — was?
-
-Nach Codex-OK v0.3: Implementation in 5 Commits (1 Refaktor + 1 Stufe 0 + 1
-Stufe 1 + 1 Stufen 2+3+4 + 1 Stufe 5), Tests laut Section 6.1, Hardware-Soak
-laut Section 6.3.
+Nach Codex-OK v0.4: Implementation in 5 Commits (1 Refaktor + 1 Stufe 0 + 1
+Stufe 1 + 1 Stufen 2+3+4 + 1 Stufe 5), Tests laut Section 6.1 (26 Unit-Tests
++ 2 Integration-Tests), Hardware-Soak laut Section 6.3.
