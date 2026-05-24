@@ -10,6 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/client/internal/lazyconn/manager"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/peer/dispatcher"
@@ -19,19 +20,30 @@ import (
 	"github.com/netbirdio/netbird/monotime"
 )
 
-// stubWGIfaceForDeactivateTest is a no-op WGIface that satisfies
+// stubWGIfaceForDeactivateTest is a configurable WGIface that satisfies
 // lazyconn.WGIface for tests where we need to instantiate a real
-// *manager.Manager but never actually use it.
-type stubWGIfaceForDeactivateTest struct{}
+// *manager.Manager and/or exercise the local-activity-gate (Fix C).
+//
+// Tests must set Userspace explicitly: bool zero value is false, so
+// an uninitialized stub reports kernel mode. Dispatch tests that need
+// the userspace path set Userspace=true at construction; Fix-C tests
+// configure both fields explicitly.
+type stubWGIfaceForDeactivateTest struct {
+	Userspace  bool
+	Activities map[string]monotime.Time
+}
 
 func (stubWGIfaceForDeactivateTest) RemovePeer(string) error { return nil }
 func (stubWGIfaceForDeactivateTest) UpdatePeer(string, []netip.Prefix, time.Duration, *net.UDPAddr, *wgtypes.Key) error {
 	return nil
 }
-func (stubWGIfaceForDeactivateTest) IsUserspaceBind() bool   { return true }
+func (s stubWGIfaceForDeactivateTest) IsUserspaceBind() bool { return s.Userspace }
 func (stubWGIfaceForDeactivateTest) Address() wgaddr.Address { return wgaddr.Address{} }
-func (stubWGIfaceForDeactivateTest) LastActivities() map[string]monotime.Time {
-	return map[string]monotime.Time{}
+func (s stubWGIfaceForDeactivateTest) LastActivities() map[string]monotime.Time {
+	if s.Activities == nil {
+		return map[string]monotime.Time{}
+	}
+	return s.Activities
 }
 
 // newConnMgrWithLazyMgr returns a ConnMgr whose isStartedWithLazyMgr()
@@ -42,10 +54,11 @@ func newConnMgrWithLazyMgr(t *testing.T) *ConnMgr {
 	store := peerstore.NewConnStore()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	lazyMgr := manager.NewManager(manager.Config{}, ctx, store, stubWGIfaceForDeactivateTest{})
+	lazyMgr := manager.NewManager(manager.Config{}, ctx, store, stubWGIfaceForDeactivateTest{Userspace: true})
 
 	return &ConnMgr{
 		peerStore:     store,
+		iface:         stubWGIfaceForDeactivateTest{Userspace: true},
 		lazyConnMgr:   lazyMgr,
 		lazyCtxCancel: cancel,
 	}
@@ -234,5 +247,134 @@ func TestDeactivatePeer_RemoteUnspecified_NoLazyMgrNoops(t *testing.T) {
 
 	if conn.IsIntentionallyDetached() {
 		t.Fatalf("IsIntentionallyDetached() = true after noop dispatch; want false (no detach should have run)")
+	}
+}
+
+// --- Phase-3.7j Fix C: Local-Activity-Gate tests ---
+
+// newConnMgrForGateTest returns a ConnMgr wired with the given WGIface
+// stub and p2pTimeoutSecs. No LazyMgr is started; the deactivateICE
+// branch does not consult it.
+func newConnMgrForGateTest(iface lazyconn.WGIface, p2pTimeoutSecs uint32) *ConnMgr {
+	return &ConnMgr{
+		peerStore:      peerstore.NewConnStore(),
+		iface:          iface,
+		p2pTimeoutSecs: p2pTimeoutSecs,
+	}
+}
+
+// TestDeactivatePeer_LocalActivityGate_SkipsRecent: userspace bind +
+// recent local activity (within gate window) -> detach is skipped.
+// IsIntentionallyDetached() must remain false because DetachICEForPeer
+// was not invoked. Verifies the headline guarantee of Fix C: the
+// remote's stale-idle view does not tear down a tunnel we're still
+// actively using.
+func TestDeactivatePeer_LocalActivityGate_SkipsRecent(t *testing.T) {
+	peerKey := "peer-gate-recent"
+	iface := stubWGIfaceForDeactivateTest{
+		Userspace:  true,
+		Activities: map[string]monotime.Time{peerKey: monotime.Now()},
+	}
+	mgr := newConnMgrForGateTest(iface, 180) // gate = 90s
+	conn := newTestConnWithRemoteMode(t, peerKey, "p2p-dynamic")
+	mgr.peerStore.AddPeerConn(conn.GetKey(), conn)
+
+	mgr.DeactivatePeer(conn)
+
+	if conn.IsIntentionallyDetached() {
+		t.Fatalf("IsIntentionallyDetached() = true; gate should have skipped detach for recent local activity")
+	}
+}
+
+// TestDeactivatePeer_LocalActivityGate_ProceedsIfStale: userspace bind
+// + last activity older than the gate window -> detach proceeds and
+// IsIntentionallyDetached() flips to true. The "stale" timestamp is
+// computed as gate+1m to be robust against scheduling jitter.
+func TestDeactivatePeer_LocalActivityGate_ProceedsIfStale(t *testing.T) {
+	peerKey := "peer-gate-stale"
+	// p2pTimeoutSecs=180 -> gate=90s. Backdate by 3 minutes.
+	stale := monotime.Time(int64(monotime.Now()) - int64(3*time.Minute))
+	iface := stubWGIfaceForDeactivateTest{
+		Userspace:  true,
+		Activities: map[string]monotime.Time{peerKey: stale},
+	}
+	mgr := newConnMgrForGateTest(iface, 180)
+	conn := newTestConnWithRemoteMode(t, peerKey, "p2p-dynamic")
+	mgr.peerStore.AddPeerConn(conn.GetKey(), conn)
+
+	mgr.DeactivatePeer(conn)
+
+	if !conn.IsIntentionallyDetached() {
+		t.Fatalf("IsIntentionallyDetached() = false; detach should have proceeded for stale local activity")
+	}
+}
+
+// TestDeactivatePeer_LocalActivityGate_KernelMode_NoGate: kernel mode
+// (IsUserspaceBind == false) -> gate is skipped entirely (the kernel
+// configurer's LastActivities() returns nil so the gate has no signal
+// to act on). Even with a "recent" timestamp in the test stub, the
+// detach must proceed. Validates the caveat documented at the gate.
+func TestDeactivatePeer_LocalActivityGate_KernelMode_NoGate(t *testing.T) {
+	peerKey := "peer-gate-kernel"
+	iface := stubWGIfaceForDeactivateTest{
+		Userspace:  false, // kernel mode
+		Activities: map[string]monotime.Time{peerKey: monotime.Now()},
+	}
+	mgr := newConnMgrForGateTest(iface, 180)
+	conn := newTestConnWithRemoteMode(t, peerKey, "p2p-dynamic")
+	mgr.peerStore.AddPeerConn(conn.GetKey(), conn)
+
+	mgr.DeactivatePeer(conn)
+
+	if !conn.IsIntentionallyDetached() {
+		t.Fatalf("IsIntentionallyDetached() = false in kernel mode; gate should not fire and detach should proceed")
+	}
+}
+
+// TestDeactivatePeer_LocalActivityGate_NoActivityRecord: userspace
+// bind, but the ActivityRecorder has no entry for this peer (e.g. the
+// dynamic tunnel is up via relay only and no payload has crossed it
+// since the bind was reset). Detach proceeds.
+func TestDeactivatePeer_LocalActivityGate_NoActivityRecord(t *testing.T) {
+	peerKey := "peer-gate-no-record"
+	iface := stubWGIfaceForDeactivateTest{
+		Userspace:  true,
+		Activities: map[string]monotime.Time{}, // empty
+	}
+	mgr := newConnMgrForGateTest(iface, 180)
+	conn := newTestConnWithRemoteMode(t, peerKey, "p2p-dynamic")
+	mgr.peerStore.AddPeerConn(conn.GetKey(), conn)
+
+	mgr.DeactivatePeer(conn)
+
+	if !conn.IsIntentionallyDetached() {
+		t.Fatalf("IsIntentionallyDetached() = false with no activity record; detach should have proceeded")
+	}
+}
+
+// TestConnMgr_localActivityGateWindow: clamp-behaviour table for the
+// helper that derives the gate window from p2pTimeoutSecs/2.
+func TestConnMgr_localActivityGateWindow(t *testing.T) {
+	cases := []struct {
+		name           string
+		p2pTimeoutSecs uint32
+		want           time.Duration
+	}{
+		{"zero -> Min", 0, localActivityGateMinWindow},
+		{"60s -> Min (30s)", 60, localActivityGateMinWindow},
+		{"180s -> 90s", 180, 90 * time.Second},
+		{"600s -> 5m (=Max)", 600, localActivityGateMaxWindow},
+		{"86400s -> Max (clamp from 12h)", 86400, localActivityGateMaxWindow},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mgr := &ConnMgr{p2pTimeoutSecs: c.p2pTimeoutSecs}
+			got := mgr.localActivityGateWindow()
+			if got != c.want {
+				t.Errorf("localActivityGateWindow(p2pTimeoutSecs=%d) = %v, want %v",
+					c.p2pTimeoutSecs, got, c.want)
+			}
+		})
 	}
 }
