@@ -1,10 +1,16 @@
 # Phase-3.7j — GO_IDLE Mode-Aware Receiver + Guard Retry Hardening + Local-Activity-Gate
 
-**Status:** DRAFT v0.2 — Codex round-1-review eingearbeitet, ready for round 2
+**Status:** DRAFT v0.3 — Codex round-2-review eingearbeitet, **implementation-ready candidate**
 **Date:** 2026-05-24
 **Author:** Michael Uray (MichaelUray)
 
 ### Changelog
+- **v0.3 (2026-05-24)** — Codex round-2-review komplett eingearbeitet:
+  - **`localActivityGateWindow` dynamisch** aus `p2pTimeoutSecs / 2` mit `[30s, 300s]` Clamp (statt fix 90s).
+  - **`ModeUnspecified` Fallback geändert**: nicht mehr "lokal-Mode" sondern `deactivateLazy` (wenn LazyMgr aktiv) sonst `deactivateNoop` + diagnostisches Log. Vermeidet Phase-1/Phase-2-Cross-Talk während NetworkMap-Bootstrap-Race.
+  - **Pseudo-Code korrigiert**: `e.iface` statt `e.wgIface` (= echter Feldname in `ConnMgr`).
+  - **Userspace-only-Limit von Fix C explizit dokumentiert** in §3.3 Caveat-Box: Kernel-Mode `LastActivities()` returns nil, Gate greift dort nicht — Kernel-Mode-Geräte sollten ohnehin `NB_WG_KERNEL_DISABLED=true` setzen (cross-reference auf `reference_netbird_kernel_mode_pair_selection_bug`).
+  - **Implementation-Plan §5 umgestellt auf buildbare Commits**: kein absichtlich roter Tests-only-Commit. Tests werden in dem Code-Commit eingeführt der sie grün macht. PR-Stack ist jederzeit `go build ./...` und `go vet ./...` clean.
 - **v0.2 (2026-05-24)** — Codex round 1 review punkte eingearbeitet:
   - **Guard-Predicate-Callback statt direkter Conn-Zugriff:** Guard kennt Conn nicht; neuer `isIntentionalDetach func() bool` Konstruktor-Parameter (Codex Option 2).
   - **Fix C (echter Local-Activity-Gate) hinzugefügt:** für `RemoteEffectiveMode == ModeP2PDynamic` ist der GO_IDLE-Empfang gegated durch lokale Activity-Recorder-Prüfung. Damit decken wir das Phase-3.7i ↔ Phase-3.7i Cross-Site-Problem ab.
@@ -162,15 +168,21 @@ Beide Counter müssen unabhängig hardened werden:
 
 ### 3.1 Fix A — Mode-Aware `DeactivatePeer`
 
-**Idee:** `DeactivatePeer` dispatched nach **`conn.RemoteEffectiveMode()`** primär; der lokale Mode ist nur Fallback bei `ModeUnspecified` (Bootstrap-Race).
+**Idee:** `DeactivatePeer` dispatched nach **`conn.RemoteEffectiveMode()`** primär. Bei `ModeUnspecified` (NetworkMap-Bootstrap-Race) ist die **konservativste sichere Aktion lazy-full-close wenn LazyMgr aktiv, sonst noop** — **NICHT** lokal-dynamic-Detach. Damit ist die Phase-1/Phase-2-Cross-Talk-Lücke auch während des Bootstrap geschlossen.
 
 **Code-Änderung in [`conn_mgr.go`](../../client/internal/conn_mgr.go):**
 
 ```go
 // deactivatePeerActionFor returns the per-peer deactivation rule based
 // on the REMOTE peer's effective connection mode (server-resolved).
-// Local mode is only used as fallback when the remote effective mode
-// is unknown (status recorder bootstrap race before first NetworkMap).
+//
+// ModeUnspecified Fallback (Codex round 2): während des NetworkMap-
+// Bootstrap-Race ist RemoteEffectiveMode noch unbekannt. In dieser
+// kurzen Lücke ist die konservativ-sichere Aktion lazy-full-close
+// (wenn LazyMgr aktiv) — NICHT lokal-dynamic-Detach. Damit
+// vermeiden wir das in §2.1 dokumentierte Cross-Talk-Symptom auch
+// während des Bootstrap. Wenn LazyMgr nicht aktiv ist (eager modes)
+// ist die korrekte Aktion noop mit Diagnose-Log.
 func (e *ConnMgr) deactivatePeerActionFor(conn *peer.Conn) deactivateAction {
     remote := conn.RemoteEffectiveMode()
     switch remote {
@@ -179,8 +191,14 @@ func (e *ConnMgr) deactivatePeerActionFor(conn *peer.Conn) deactivateAction {
     case connectionmode.ModeP2PDynamic:
         return deactivateICE
     case connectionmode.ModeUnspecified:
-        // Status recorder not yet populated; fall back to local mode.
-        return e.deactivatePeerAction()
+        // Bootstrap race: prefer the safer lazy-full-close if we have a
+        // LazyMgr; otherwise emit a diagnostic and noop.
+        if e.isStartedWithLazyMgr() {
+            conn.Log.Debugf("GO_IDLE during RemoteEffectiveMode bootstrap race; using lazy-full-close fallback")
+            return deactivateLazy
+        }
+        conn.Log.Debugf("GO_IDLE during RemoteEffectiveMode bootstrap race + no LazyMgr; treating as noop")
+        return deactivateNoop
     default:
         return deactivateNoop
     }
@@ -324,11 +342,34 @@ case ConnStatusPartiallyConnected:
 
 ```go
 const (
-    // localActivityGateWindow ist die Toleranz für "lokal kürzlich Activity gesehen".
-    // Konservativ kurz wählen damit der Gate nicht zu lange aktive Sessions blockiert
-    // wenn Remote wirklich gehen will. ~iceTimeout/2 ist ein vernünftiger Default.
-    localActivityGateWindow = 90 * time.Second
+    // localActivityGateMinWindow ist die Untergrenze für die Toleranz.
+    // Verhindert dass bei sehr kurzem p2p_timeout_seconds (z. B. Tests) das
+    // Gate praktisch sofort offen ist und Detach-Storms verursacht.
+    localActivityGateMinWindow = 30 * time.Second
+    // localActivityGateMaxWindow ist die Obergrenze. Verhindert dass bei
+    // sehr großem p2p_timeout_seconds (z. B. 24h-Tweak) das Gate über
+    // sinnvolle WG-NAT-Mapping-Zeiten hinauswächst.
+    localActivityGateMaxWindow = 5 * time.Minute
 )
+
+// localActivityGateWindow leitet die Toleranz dynamisch aus dem aktuellen
+// p2pTimeoutSecs ab und clampt in [Min, Max]. p2pTimeoutSecs/2 als
+// Default-Halbschritt: wenn die andere Seite nach iceTimeout idle signal
+// sendet, hat die lokale Seite die ersten p2pTimeoutSecs/2 Sekunden noch
+// als "kürzlich aktiv" — ohne das Gate zu lang aufzudehnen.
+func (e *ConnMgr) localActivityGateWindow() time.Duration {
+    if e.p2pTimeoutSecs == 0 {
+        return localActivityGateMinWindow
+    }
+    w := time.Duration(e.p2pTimeoutSecs/2) * time.Second
+    if w < localActivityGateMinWindow {
+        return localActivityGateMinWindow
+    }
+    if w > localActivityGateMaxWindow {
+        return localActivityGateMaxWindow
+    }
+    return w
+}
 
 func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
     switch e.deactivatePeerActionFor(conn) {
@@ -339,17 +380,22 @@ func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
         // Wenn lokaler ActivityRecorder kürzlich Activity gesehen hat,
         // ist die P2P-Strecke wirklich aktiv und ein remote-stale-idle
         // Signal soll sie nicht detachen.
-        if e.wgIface != nil && e.wgIface.IsUserspaceBind() {
-            activities := e.wgIface.LastActivities()
+        //
+        // CAVEAT: LastActivities() ist nur im Userspace-Mode befüllt
+        // (Kernel-Mode kernel_unix.go:330 returns nil). Im Kernel-Mode
+        // greift dieser Gate nicht — siehe §3.3 Caveat-Box unten.
+        if e.iface != nil && e.iface.IsUserspaceBind() {
+            activities := e.iface.LastActivities()
             if last, ok := activities[conn.GetKey()]; ok {
-                if monotime.Since(last) < localActivityGateWindow {
+                gate := e.localActivityGateWindow()
+                if monotime.Since(last) < gate {
                     conn.Log.Infof("ICE detach skipped: remote GO_IDLE but local activity %v ago (within %v gate)",
-                        monotime.Since(last), localActivityGateWindow)
+                        monotime.Since(last), gate)
                     return
                 }
             }
         }
-        // Kein Activity-Eintrag ODER zu alt → Detach durchführen
+        // Kein Activity-Eintrag ODER zu alt ODER Kernel-Mode → Detach durchführen
         conn.Log.Infof("detaching ICE worker: remote peer signaled GO_IDLE (p2p-dynamic, mode-aware)")
         if err := e.DetachICEForPeer(conn.GetKey()); err != nil { ... }
     case deactivateNoop:
@@ -358,7 +404,11 @@ func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
 }
 ```
 
-**Caveat:** `LastActivities()` ist nur im Userspace-Mode befüllt ([`kernel_unix.go:330-331`](../../client/iface/configurer/kernel_unix.go#L330-L331) returns nil im Kernel-Mode). Im Kernel-Mode greift Fix C nicht und der detach läuft wie vor v0.1. Das ist akzeptabel — Kernel-Mode-Geräte sollten ohnehin `NB_WG_KERNEL_DISABLED=true` setzen (siehe `reference_netbird_kernel_mode_pair_selection_bug`).
+> **Caveat — Userspace-only Gate** (Codex round-2 hervorgehoben):
+>
+> `WGIface.LastActivities()` ist ausschließlich im **Userspace-Mode** befüllt. [`client/iface/configurer/kernel_unix.go:330-331`](../../client/iface/configurer/kernel_unix.go#L330-L331) returns `nil` im Kernel-Mode. Damit greift Fix C dort **nicht** und der `GO_IDLE`-Empfang führt direkt zum ICE-Detach (= alte v0.1-Semantik).
+>
+> Konsequenz: Kernel-Mode-Geräte profitieren nur von Fix A + B, nicht von Fix C. Sie sollten ohnehin `NB_WG_KERNEL_DISABLED=true` setzen — siehe Memory [`reference_netbird_kernel_mode_pair_selection_bug.md`](../../../../home/ai-agent/.claude/projects/-opt-infrastructure/memory/reference_netbird_kernel_mode_pair_selection_bug.md). Für die strukturelle Lösung im Kernel-Mode wäre ein separater Spec-Eintrag nötig (z. B. Phase-3.7k: Kernel-Mode-LastActivity-Wrapper über `wgctrl`-Statistiken).
 
 ### 3.4 Fix D (optional) — Detach-Reason im Log
 
@@ -472,18 +522,24 @@ Risiken:
 
 ---
 
-## 5. Implementation plan (TDD-Reihenfolge)
+## 5. Implementation plan (buildbare Commits)
 
-| Commit | Inhalt | Tests rot/grün nach Commit |
-|--------|--------|------------------------------|
-| 1 | Failing tests aus §4.1 (Fix-A + Fix-B + Fix-C-Tests) | compile-fail bzw. fail |
-| 2 | `Conn.MarkIntentionallyDetached/Clear/Is` Marker + 6 Clear-Points + `DetachICEForPeer` Hook + `onICEFailed` Clear | nur Fix-B-Marker-Cleanup-Tests grün, Rest rot |
-| 3 | `Guard.IsIntentionalDetachFunc` predicate-Callback + Konstruktor-Param + PartiallyConnected-Skip | Fix-B Guard-Tests grün |
-| 4 | `ConnMgr.deactivatePeerActionFor` + `DeactivatePeer` umstellen auf `RemoteEffectiveMode` | Fix-A Tests grün |
-| 5 | `ConnMgr.DeactivatePeer` Local-Activity-Gate (Fix C) — `LastActivities()`-Check vor `DetachICE` im dynamic branch | Fix-C Tests grün, alle 7 Tests grün |
-| 6 (optional) | Detach-Reason-Enum + Logging (Fix D) | nur Doku/Diag |
+**Codex round-2 Korrektur:** kein absichtlich roter Tests-only-Commit im publizierten PR-Stack. Tests werden in dem Code-Commit eingeführt, der sie grün macht. PR-Stack ist jederzeit `go build ./...` + `go vet ./...` + `go test ./...` clean.
 
-**Wichtig:** Commit 2 muss zuerst — der Guard braucht das Marker-Interface. Sonst kompiliert Commit 3 nicht. Ohne Fix B (Commit 3) bringt Fix A (Commit 4) zwar Mode-Awareness, aber Backoff-Eskalation bleibt offen wenn Fix-C-Gate nicht greift.
+| Commit | Inhalt | Build-State nach Commit | Test-State |
+|--------|--------|--------------------------|------------|
+| 1 | `Conn.{Mark,Clear,Is}IntentionallyDetached` + 6 Clear-Points + `DetachICEForPeer` Hook + `onICEFailed`-Clear **mit zugehörigen Marker-Lifecycle-Tests** | green | green (alle Marker-Tests grün; vorhandene Tests unverändert) |
+| 2 | `Guard.IsIntentionalDetachFunc` predicate-Callback + Konstruktor-Param + PartiallyConnected-Skip **mit Guard-Skip-Tests** | green | green (Guard-Tests grün; alle Aufrufer von `NewGuard` passen sich an) |
+| 3 | `ConnMgr.deactivatePeerActionFor` + `DeactivatePeer` umstellen auf `RemoteEffectiveMode` (Fix A) **mit Mode-Dispatch-Tests** | green | green (Fix-A Tests grün; ModeUnspecified-Bootstrap-Race-Test inkludiert) |
+| 4 | `ConnMgr.DeactivatePeer` Local-Activity-Gate (Fix C) + `localActivityGateWindow()` Helper **mit Activity-Gate-Tests** | green | green (Fix-C Tests grün; Userspace + Kernel-Mode-Fallback-Test) |
+| 5 (optional) | Detach-Reason-Enum + Logging (Fix D) **mit Reason-Tests** | green | green (Diag-Tests grün, kein funktionaler Wechsel) |
+
+**Build-Reihenfolge-Constraint:**
+- Commit 1 (Conn-Marker) muss vor Commit 2 (Guard-Predicate) — sonst hat der Predicate kein Implement.
+- Commit 2 muss vor Commit 3+4 — sonst können Fix-A/C-Tests den Guard-Verifikations-Pfad nicht aufrufen.
+- Commit 5 ist orthogonal und kann am Ende, vorne, oder weggelassen werden.
+
+**Rationale für buildbare Commits:** ein PR der mit `git bisect` durchlaufen werden kann braucht jeden Commit clean. Außerdem erlaubt es Reviewern den Stack inkrementell zu reviewen + kontextuell mergen, falls ein PR-Commit unabhängig ist.
 
 ---
 
