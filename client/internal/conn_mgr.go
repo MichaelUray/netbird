@@ -13,6 +13,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/lazyconn/manager"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/peerstore"
+	"github.com/netbirdio/netbird/monotime"
 	"github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/connectionmode"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
@@ -531,6 +532,26 @@ const (
 	deactivateICE
 )
 
+// Phase-3.7j Fix C: Local-Activity-Gate bounds.
+//
+// When a remote p2p-dynamic peer signals GO_IDLE we treat that as
+// advisory rather than authoritative: the remote's view of its own
+// idleness has no insight into our half of the tunnel. If our local
+// ActivityRecorder has seen packets for this peer recently, the
+// dynamic-tunnel is genuinely active locally and tearing the ICE
+// worker down would cause traffic to stall until the next remote
+// OFFER. The gate consults LastActivities() and skips the detach in
+// that case.
+//
+// The gate window is derived dynamically from p2pTimeoutSecs/2 (the
+// natural half-step: when the remote sends GO_IDLE after its own
+// iceTimeout, we consider the first half of that interval "still
+// recent locally") and clamped to a sensible operational range.
+const (
+	localActivityGateMinWindow = 30 * time.Second
+	localActivityGateMaxWindow = 5 * time.Minute
+)
+
 // deactivatePeerAction returns the per-LOCAL-mode deactivation rule.
 // Kept for backward-compat with the v0.1 dispatch contract; the live
 // DeactivatePeer path uses deactivatePeerActionFor instead (Phase 3.7j
@@ -591,6 +612,28 @@ func (e *ConnMgr) deactivatePeerActionFor(conn *peer.Conn) deactivateAction {
 	}
 }
 
+// localActivityGateWindow derives the gate tolerance dynamically from
+// the current p2pTimeoutSecs and clamps it to
+// [localActivityGateMinWindow, localActivityGateMaxWindow]. Using
+// p2pTimeoutSecs/2 as the natural half-step: if the remote side
+// sends GO_IDLE after its own iceTimeout, the local side considers
+// the first p2pTimeoutSecs/2 seconds as "recently active". A
+// p2pTimeoutSecs of 0 (ICE never times out locally) falls through to
+// the minimum gate window.
+func (e *ConnMgr) localActivityGateWindow() time.Duration {
+	if e.p2pTimeoutSecs == 0 {
+		return localActivityGateMinWindow
+	}
+	w := time.Duration(e.p2pTimeoutSecs/2) * time.Second
+	if w < localActivityGateMinWindow {
+		return localActivityGateMinWindow
+	}
+	if w > localActivityGateMaxWindow {
+		return localActivityGateMaxWindow
+	}
+	return w
+}
+
 // DeactivatePeer is invoked when the remote peer signals GO_IDLE. The
 // behavior is dispatched by the REMOTE peer's effective connection
 // mode (see deactivatePeerActionFor). Phase 3.7j Fix A for the
@@ -620,6 +663,29 @@ func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
 		conn.Log.Infof("closing peer connection: remote peer initiated inactive, idle lazy state and sent GOAWAY (mode-aware)")
 		e.lazyConnMgr.DeactivatePeer(conn.ConnID())
 	case deactivateICE:
+		// Phase-3.7j Fix C: Local-Activity-Gate for remote-dynamic
+		// GO_IDLE. If the local ActivityRecorder has seen packets for
+		// this peer within the gate window, the dynamic tunnel is
+		// genuinely active locally; the remote's stale idle view
+		// should not tear it down.
+		//
+		// CAVEAT: LastActivities() is only populated when the
+		// userspace bind is in use (KernelConfigurer.LastActivities
+		// returns nil -- see client/iface/configurer/kernel_unix.go).
+		// In kernel mode the gate cannot fire, so detach proceeds as
+		// before.
+		if e.iface != nil && e.iface.IsUserspaceBind() {
+			activities := e.iface.LastActivities()
+			if last, ok := activities[conn.GetKey()]; ok {
+				gate := e.localActivityGateWindow()
+				since := monotime.Since(last)
+				if since < gate {
+					conn.Log.Infof("ICE detach skipped: remote GO_IDLE but local activity %v ago (within %v gate)",
+						since, gate)
+					return
+				}
+			}
+		}
 		conn.Log.Infof("detaching ICE worker: remote peer signaled GO_IDLE (p2p-dynamic, mode-aware)")
 		if err := e.DetachICEForPeer(conn.GetKey()); err != nil {
 			conn.Log.Warnf("DetachICEForPeer failed: %v", err)
