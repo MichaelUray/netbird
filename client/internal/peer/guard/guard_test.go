@@ -17,8 +17,16 @@ import (
 // running).
 func newTestGuard(t *testing.T, status connStatusFunc) (*Guard, *SRWatcher) {
 	t.Helper()
+	return newTestGuardWithDetach(t, status, nil)
+}
+
+// newTestGuardWithDetach constructs a test Guard with an explicit
+// intentional-detach predicate, for Phase 3.7j Commit 2 tests. Passing
+// nil reproduces the legacy (pre-3.7j) retry-budget behaviour.
+func newTestGuardWithDetach(t *testing.T, status connStatusFunc, detach IsIntentionalDetachFunc) (*Guard, *SRWatcher) {
+	t.Helper()
 	sr := NewSRWatcher(nil, nil, nil, ice.Config{})
-	g := NewGuard(log.NewEntry(log.StandardLogger()), status, 30*time.Second, sr)
+	g := NewGuard(log.NewEntry(log.StandardLogger()), status, detach, 30*time.Second, sr)
 	return g, sr
 }
 

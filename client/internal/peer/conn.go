@@ -304,7 +304,12 @@ func (conn *Conn) Open(engineCtx context.Context) error {
 		conn.handshaker.AddICEListener(conn.workerICE.OnNewOffer)
 	}
 
-	conn.guard = guard.NewGuard(conn.Log, conn.isConnectedOnAllWay, conn.config.Timeout, conn.srWatcher)
+	// Phase 3.7j (#5989) Commit 2 of 5: wire the intentional-detach
+	// predicate so the guard can skip its retry budget when ICE was
+	// detached gracefully (GO_IDLE / local inactivity timeout). The
+	// marker is set/cleared by Conn (Commit 1); the guard reads it
+	// via this callback. nil-safe by design.
+	conn.guard = guard.NewGuard(conn.Log, conn.isConnectedOnAllWay, conn.IsIntentionallyDetached, conn.config.Timeout, conn.srWatcher)
 	// Phase 3.5 (#5989): reset ICE backoff + recreate workerICE on network change.
 	// Set before Start() is called so the goroutine sees it without races.
 	if !skipICE {
