@@ -286,9 +286,27 @@ func (m *Manager) checkStats() (iceIdle, relayIdle map[string]struct{}, err erro
 	for peerID, peerCfg := range m.interestedPeers {
 		lastActive, ok := lastActivities[peerID]
 		if !ok {
-			// when peer is in connecting state
-			peerCfg.Log.Warnf("peer not found in wg stats")
-			continue
+			// No ActivityRecorder entry yet — no WG endpoint was
+			// ever set for this peer. Normal short-lived state
+			// while ICE negotiates, but with permanently failing
+			// ICE (backoff stuck) the peer would stay in
+			// interestedPeers forever without ever crossing
+			// relayTimeout. Treat firstSeenAt as a synthetic
+			// last-activity so the existing two-timer logic below
+			// applies uniformly:
+			//   Phase-1 (iceTimeout=0): fires relayIdle after relayTimeout.
+			//   Phase-2 (iceTimeout>0): fires iceIdle, then relayIdle.
+			seen, seenOK := m.firstSeenAt[peerID]
+			if !seenOK {
+				// Defensive: matches the existing no-sync
+				// convention shared with interestedPeers. Skip
+				// defensively on transient mismatch — the next
+				// checkStats tick will see a consistent state.
+				peerCfg.Log.Warnf("inactivity: peer in interestedPeers without firstSeenAt entry")
+				continue
+			}
+			lastActive = seen
+			// Fall through to the shared two-timer logic below.
 		}
 
 		since := monotime.Since(lastActive)
