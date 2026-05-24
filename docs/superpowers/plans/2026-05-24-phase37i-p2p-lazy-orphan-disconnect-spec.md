@@ -1,6 +1,6 @@
 # Phase-3.7i — p2p-lazy "orphan peer" never-disconnect bug
 
-**Status:** DRAFT v0.3 — implementation-ready candidate (Codex review round 2 polish eingearbeitet)
+**Status:** v0.3.1 — IMPLEMENTATION-READY (Codex sign-off 2026-05-24, TDD-Hinweis eingearbeitet)
 **Date:** 2026-05-24
 **Author:** Michael Uray (MichaelUray)
 **Related:** [`2026-05-22-phase37i-lazy-watchdog-spec.md`](2026-05-22-phase37i-lazy-watchdog-spec.md) (deployed), [`2026-05-24-phase37i-lazy-watchdog-impl.md`](2026-05-24-phase37i-lazy-watchdog-impl.md)
@@ -8,6 +8,8 @@
 **NOT in scope:** Phase-2 two-timer behaviour change, server protocol change, p2p-dynamic mode
 
 ### Changelog
+- **v0.3.1 (2026-05-24)** — Codex sign-off + TDD-Hinweis aus Round-2-Review:
+  - §9 Commit-Granularität auf strikte TDD-Reihenfolge umgestellt (Test zuerst rot, dann Map-Refactor, dann checkStats-Fix). Alternative "Test + Fix gebündelt" als Note ergänzt.
 - **v0.3 (2026-05-24)** — Codex review round 2 polish:
   - Alle relativen Markdown-Links auf `../../../client/...` korrigiert (Spec liegt in `docs/superpowers/plans/`, also 3 Ebenen bis Repo-Root).
   - §2.2: `watchdog.go` → `client/internal/lazyconn/manager/manager.go` (der Watchdog lebt im manager-Package, nicht in eigener Datei).
@@ -448,10 +450,12 @@ Damit deckt der Stack alle drei aktuell bekannten Phase-3.7i-Disconnect-Lücken 
 - **Spec-only:** `spec/phase37i-orphan-disconnect` (nur dieses Markdown-File).
 - **Implementierung später:** `pr/h-phase37i-orphan-disconnect`.
   - **Base:** `pr/g-phase3.7i-lazy-watchdog` (dort enthält `inactivity/manager.go` bereits den `DropCounters`/Watchdog-Kontext; jeder andere Base produziert unnötige Konflikte).
-- **Commit-Granularität:**
-  1. `inactivity: track firstSeenAt per peer in Manager (no-op refactor)` — nur Map einführen, noch keine Verhaltensänderung.
-  2. `inactivity: mark orphan peers idle using firstSeenAt as synthetic last-activity` — der eigentliche Fix in `checkStats`.
-  3. `inactivity: tests for orphan-peer disconnect path` — die vier Unit-Tests aus §7.1.
+- **Commit-Granularität (TDD-Reihenfolge, Codex-Hinweis Round 2):**
+  1. `inactivity: failing test for orphan-peer disconnect (red)` — Red-Test-Commit: die vier Unit-Tests aus §7.1 zuerst hinzufügen. Sie compilieren noch nicht (`firstSeenAt`-Feld fehlt) bzw. schlagen fehl (`!ok`-Pfad ist `continue`). Erwartet: `go test ./client/internal/lazyconn/inactivity` rot.
+  2. `inactivity: track firstSeenAt per peer in Manager` — Feld + Map einführen, `AddPeer`/`RemovePeer` pflegen. Damit compilieren die Tests, einer (`TestRemovePeer_CleansFirstSeenAt`) wird grün. Die orphan-disconnect-Tests bleiben rot, weil `checkStats` noch nicht angepasst.
+  3. `inactivity: mark orphan peers idle using firstSeenAt as synthetic last-activity` — der eigentliche Fix in `checkStats`. Damit alle vier Tests grün.
+
+  Alternative kompakter (falls Reviewer-Lesbarkeit vorgeht): Test + Fix im selben Commit pro Test-Case bündeln. Variante hängt vom Reviewer-Stil ab — für Upstream-PR ist die obige Drei-Commit-Form sauber nachvollziehbar.
 - **Force-push:** nur mit `--force-with-lease`.
 - **Co-Author-Trailer:** keine. Author + committer beide `Michael Uray <25169478+MichaelUray@users.noreply.github.com>` (siehe `feedback_no_co_author_trailer`).
 - **Upstream-PR:** **nicht ohne explizite User-Freigabe** (siehe `feedback_pr_requires_explicit_confirmation`). Nur Push auf `MichaelUray/netbird`-Fork.
@@ -552,4 +556,4 @@ func (r *ActivityRecorder) UpsertAddress(publicKey string, address netip.AddrPor
 
 ---
 
-**ENDE Spec v0.3 — implementation-ready candidate, an Codex für Final-Sign-off.**
+**ENDE Spec v0.3.1 — IMPLEMENTATION-READY. Codex sign-off 2026-05-24.**
