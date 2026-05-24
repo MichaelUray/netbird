@@ -427,3 +427,39 @@ func TestDropCounters_RelayAndICESeparate(t *testing.T) {
 		t.Fatalf("expected (1,2), got (%d,%d)", relay, ice)
 	}
 }
+
+// --- firstSeenAt tracking (preparing for orphan-peer disconnect) ---
+
+// AddPeer must populate firstSeenAt and RemovePeer must clean it up,
+// otherwise the map grows unbounded as peers churn through the lazy
+// state machine.
+func TestRemovePeer_CleansFirstSeenAt(t *testing.T) {
+	iface := &mockWgInterface{lastActivities: map[string]monotime.Time{}}
+	mgr := newManager(iface, 0, time.Minute)
+
+	peerKey := "p1"
+	mgr.AddPeer(&lazyconn.PeerConfig{PublicKey: peerKey, Log: log.WithField("peer", peerKey)})
+	_, present := mgr.firstSeenAt[peerKey]
+	assert.True(t, present, "AddPeer must populate firstSeenAt")
+
+	mgr.RemovePeer(peerKey)
+	_, present = mgr.firstSeenAt[peerKey]
+	assert.False(t, present, "RemovePeer must clean up firstSeenAt")
+}
+
+// A fresh peer with no WG-stats entry (orphan) must not fire any timer
+// within its karenzfrist. This holds both with the old continue-skip
+// behavior and with the upcoming firstSeenAt-based fallback, so the
+// test belongs to the refactor commit and stays green afterwards.
+func TestCheckStats_OrphanPeerSilentBeforeTimeout(t *testing.T) {
+	iface := &mockWgInterface{lastActivities: map[string]monotime.Time{}}
+	mgr := newManager(iface, 0, 10*time.Minute)
+
+	peerKey := "freshOrphan"
+	mgr.AddPeer(&lazyconn.PeerConfig{PublicKey: peerKey, Log: log.WithField("peer", peerKey)})
+
+	iceIdle, relayIdle, err := mgr.checkStats()
+	assert.NoError(t, err)
+	assert.Empty(t, iceIdle)
+	assert.Empty(t, relayIdle, "must not fire within karenzfrist")
+}
