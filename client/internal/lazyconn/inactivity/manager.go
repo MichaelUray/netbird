@@ -64,6 +64,16 @@ type Manager struct {
 
 	interestedPeers map[string]*lazyconn.PeerConfig
 
+	// firstSeenAt records, per peer, the monotime when AddPeer was
+	// called. Used by checkStats as a synthetic last-activity for
+	// peers that never produced a WG-stats entry (no endpoint was
+	// ever set on the WG interface — typically: ICE permanently
+	// stuck in backoff). Without this fallback, such peers would
+	// stay in interestedPeers forever, since the !ok branch in
+	// checkStats would always skip them and relayTimeout would
+	// never fire.
+	firstSeenAt map[string]monotime.Time
+
 	iceInactiveChan   chan map[string]struct{}
 	inactivePeersChan chan map[string]struct{}
 
@@ -117,6 +127,7 @@ func newManager(iface WgInterface, iceTimeout, relayTimeout time.Duration) *Mana
 		iceTimeout:          iceTimeout,
 		relayTimeout:        relayTimeout,
 		interestedPeers:     make(map[string]*lazyconn.PeerConfig),
+		firstSeenAt:         make(map[string]monotime.Time),
 		iceInactiveChan:     make(chan map[string]struct{}, 1),
 		inactivePeersChan:   make(chan map[string]struct{}, 1),
 		inactivityThreshold: relayTimeout,
@@ -179,6 +190,7 @@ func (m *Manager) AddPeer(peerCfg *lazyconn.PeerConfig) {
 
 	peerCfg.Log.Infof("adding peer to inactivity manager")
 	m.interestedPeers[peerCfg.PublicKey] = peerCfg
+	m.firstSeenAt[peerCfg.PublicKey] = monotime.Now()
 }
 
 func (m *Manager) RemovePeer(peer string) {
@@ -193,6 +205,7 @@ func (m *Manager) RemovePeer(peer string) {
 
 	pi.Log.Debugf("remove peer from inactivity manager")
 	delete(m.interestedPeers, peer)
+	delete(m.firstSeenAt, peer)
 }
 
 func (m *Manager) Start(ctx context.Context) {
