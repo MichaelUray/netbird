@@ -22,6 +22,16 @@ const (
 
 type connStatusFunc func() ConnStatus
 
+// IsIntentionalDetachFunc reports whether the peer's current ICE-detached
+// state is the result of a graceful idle signal (GO_IDLE or local
+// inactivity timeout). The guard uses this predicate inside the
+// PartiallyConnected branch to skip the retry-budget increment when
+// the detach was intentional.
+//
+// Returning false (= default for new code paths) preserves the
+// existing retry semantics for actual ICE pair-check failures.
+type IsIntentionalDetachFunc func() bool
+
 // Guard is responsible for the reconnection logic.
 // It will trigger to send an offer to the peer then has connection issues.
 // Watch these events:
@@ -31,8 +41,15 @@ type connStatusFunc func() ConnStatus
 // - Relayed connection disconnected
 // - ICE candidate changes
 type Guard struct {
-	log                     *log.Entry
-	isConnectedOnAllWay     connStatusFunc
+	log                 *log.Entry
+	isConnectedOnAllWay connStatusFunc
+	// isIntentionalDetach reports whether the current ICE detach was
+	// intentional (GO_IDLE / local inactivity timeout). nil-safe: when
+	// unset (nil), the guard preserves the legacy retry-budget
+	// behaviour. Set by NewGuard at construction time. Phase 3.7j
+	// (#5989) Commit 2 of 5: consumes the marker introduced in Commit 1
+	// (Conn.IsIntentionallyDetached).
+	isIntentionalDetach     IsIntentionalDetachFunc
 	timeout                 time.Duration
 	srWatcher               *SRWatcher
 	relayedConnDisconnected chan struct{}
@@ -52,10 +69,16 @@ type Guard struct {
 	onNetworkChange func()
 }
 
-func NewGuard(log *log.Entry, isConnectedFn connStatusFunc, timeout time.Duration, srWatcher *SRWatcher) *Guard {
+// NewGuard constructs a Guard. isIntentionalDetachFn is an optional
+// predicate (may be nil) that lets the PartiallyConnected branch
+// distinguish a graceful idle detach from a real ICE failure; see
+// IsIntentionalDetachFunc for semantics. Phase 3.7j Commit 2 of 5
+// (#5989).
+func NewGuard(log *log.Entry, isConnectedFn connStatusFunc, isIntentionalDetachFn IsIntentionalDetachFunc, timeout time.Duration, srWatcher *SRWatcher) *Guard {
 	return &Guard{
 		log:                     log,
 		isConnectedOnAllWay:     isConnectedFn,
+		isIntentionalDetach:     isIntentionalDetachFn,
 		timeout:                 timeout,
 		srWatcher:               srWatcher,
 		relayedConnDisconnected: make(chan struct{}, 1),
@@ -141,7 +164,17 @@ func (g *Guard) reconnectLoopWithRetry(ctx context.Context, callback func()) {
 			case ConnStatusDisconnected:
 				callback()
 			case ConnStatusPartiallyConnected:
-				if iceState.shouldRetry() {
+				// Phase 3.7j (#5989) Commit 2 of 5: if the current
+				// ICE detach was triggered intentionally (GO_IDLE
+				// or local inactivity timeout), do NOT consume the
+				// retry budget. A real network event
+				// (peerActivity, ICE/Relay reconnect, candidate
+				// change) will reset the ticker and re-arm an ICE
+				// pair-check at the normal cadence instead of
+				// silently sliding into hourly mode after 3 ticks.
+				if g.isIntentionalDetach != nil && g.isIntentionalDetach() {
+					g.log.Debugf("guard: intentional detach active; skipping retry tick")
+				} else if iceState.shouldRetry() {
 					callback()
 				} else {
 					iceState.enterHourlyMode()
