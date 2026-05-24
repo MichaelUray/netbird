@@ -463,3 +463,54 @@ func TestCheckStats_OrphanPeerSilentBeforeTimeout(t *testing.T) {
 	assert.Empty(t, iceIdle)
 	assert.Empty(t, relayIdle, "must not fire within karenzfrist")
 }
+
+// --- Orphan-peer disconnect (Phase-3.7i fix) ---
+//
+// Phase-1 lazy mode (iceTimeout=0, relayTimeout=X): an orphan peer
+// whose firstSeenAt is older than relayTimeout must be marked
+// relayIdle. Before the fix, the !ok branch in checkStats issued a
+// bare continue and the peer stayed in interestedPeers indefinitely.
+func TestCheckStats_OrphanPeerMarksRelayIdleAfterTimeout(t *testing.T) {
+	iface := &mockWgInterface{lastActivities: map[string]monotime.Time{}}
+	relayTO := time.Minute
+	mgr := newManager(iface, 0, relayTO)
+
+	peerKey := "orphanPeer"
+	mgr.AddPeer(&lazyconn.PeerConfig{
+		PublicKey: peerKey,
+		Log:       log.WithField("peer", peerKey),
+	})
+
+	// Seed firstSeenAt into the past — deterministic, no time.Sleep.
+	mgr.firstSeenAt[peerKey] = pastActivity(2 * relayTO)
+
+	iceIdle, relayIdle, err := mgr.checkStats()
+	assert.NoError(t, err)
+	assert.Empty(t, iceIdle, "iceIdle must stay empty when iceTimeout=0")
+	assert.Contains(t, relayIdle, peerKey,
+		"orphan peer must be marked relayIdle after relayTimeout")
+}
+
+// Phase-2 lazy mode (both timers > 0): orphan peer hits iceIdle first,
+// then relayIdle after the longer timeout.
+func TestCheckStats_OrphanPeerTwoTimerPhase2(t *testing.T) {
+	iface := &mockWgInterface{lastActivities: map[string]monotime.Time{}}
+	iceTO := time.Minute
+	relayTO := 5 * time.Minute
+	mgr := newManager(iface, iceTO, relayTO)
+
+	peerKey := "orphan2"
+	mgr.AddPeer(&lazyconn.PeerConfig{PublicKey: peerKey, Log: log.WithField("peer", peerKey)})
+
+	// 2min into the past → past iceTimeout, well below relayTimeout.
+	mgr.firstSeenAt[peerKey] = pastActivity(2 * time.Minute)
+	iceIdle, relayIdle, _ := mgr.checkStats()
+	assert.Contains(t, iceIdle, peerKey, "must mark iceIdle after iceTimeout")
+	assert.NotContains(t, relayIdle, peerKey, "must not mark relayIdle yet")
+
+	// 6min into the past → past both timers.
+	mgr.firstSeenAt[peerKey] = pastActivity(6 * time.Minute)
+	iceIdle, relayIdle, _ = mgr.checkStats()
+	assert.Contains(t, iceIdle, peerKey)
+	assert.Contains(t, relayIdle, peerKey, "must mark relayIdle after relayTimeout")
+}
