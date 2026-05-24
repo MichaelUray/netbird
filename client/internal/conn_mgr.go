@@ -491,6 +491,13 @@ func (e *ConnMgr) ActivatePeer(ctx context.Context, conn *peer.Conn) {
 	}
 
 	if found := e.lazyConnMgr.ActivatePeer(conn.GetKey()); found {
+		// Phase 3.7j: clear the intentional-detach marker (clear-point #4).
+		// Signal-driven wake-up after a remote OFFER means a peer that
+		// was intentionally idle is being explicitly re-engaged; the
+		// upcoming Open() + AttachICE cycle must see a clean marker so
+		// the guard's retry budget is not skipped on any subsequent
+		// real pair-check failure.
+		conn.ClearIntentionallyDetached()
 		if err := conn.Open(ctx); err != nil {
 			conn.Log.Errorf("failed to open connection: %v", err)
 		}
@@ -599,6 +606,16 @@ func (e *ConnMgr) DetachICEForPeer(peerKey string) error {
 	if !ok {
 		return nil
 	}
+	// Phase 3.7j (#5989): mark the upcoming detach as intentional BEFORE
+	// invoking DetachICE so the guard's predicate (Commit 2) treats the
+	// resulting disconnected state as expected and does not consume its
+	// retry budget. Both DetachICEForPeer call sites are intentional
+	// teardowns: (1) remote GO_IDLE via DeactivatePeer, (2) local
+	// inactivity timeout via runDynamicInactivityLoop. The marker is
+	// cleared by every Attach-family method, ConnMgr.ActivatePeer,
+	// onNetworkChange and onICEFailed (see Conn.intentionallyDetached
+	// for the full list of clear-points).
+	conn.MarkIntentionallyDetached()
 	return conn.DetachICE()
 }
 
