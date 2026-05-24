@@ -531,11 +531,16 @@ const (
 	deactivateICE
 )
 
-// deactivatePeerAction returns the per-mode deactivation rule. Eager
-// modes (p2p, relay-forced, unspecified) ignore GO_IDLE because they
-// are meant to keep tunnels always-on. p2p-lazy delegates to the lazy
-// connection manager so the whole tunnel is torn down. p2p-dynamic
-// detaches only the ICE worker so the relay tunnel stays up.
+// deactivatePeerAction returns the per-LOCAL-mode deactivation rule.
+// Kept for backward-compat with the v0.1 dispatch contract; the live
+// DeactivatePeer path uses deactivatePeerActionFor instead (Phase 3.7j
+// Fix A, #5989) which dispatches by the REMOTE peer's effective mode.
+//
+// Eager modes (p2p, relay-forced, unspecified) ignore GO_IDLE because
+// they are meant to keep tunnels always-on. p2p-lazy delegates to the
+// lazy connection manager so the whole tunnel is torn down.
+// p2p-dynamic detaches only the ICE worker so the relay tunnel stays
+// up.
 func (e *ConnMgr) deactivatePeerAction() deactivateAction {
 	switch e.mode {
 	case connectionmode.ModeP2PLazy:
@@ -547,27 +552,80 @@ func (e *ConnMgr) deactivatePeerAction() deactivateAction {
 	}
 }
 
+// deactivatePeerActionFor returns the per-peer deactivation rule based
+// on the REMOTE peer's effective connection mode (server-resolved via
+// RemotePeerConfig.effective_connection_mode). This is the Phase 3.7j
+// Fix A replacement for the local-mode-driven deactivatePeerAction:
+// the old dispatch produced Phase-1/Phase-2 cross-talk when a remote
+// lazy peer signaled GO_IDLE to a local p2p-dynamic instance (or vice
+// versa). The local end has no way of knowing the remote's lifecycle
+// expectations without consulting RemoteEffectiveMode.
+//
+// ModeUnspecified Fallback (Codex round-2 v0.3): during the
+// NetworkMap-bootstrap race RemoteEffectiveMode is briefly unknown.
+// In that window the conservative-safe action is lazy-full-close when
+// a LazyMgr is active (mirrors what p2p-lazy would do), otherwise a
+// diagnostic noop. The previous "fall back to local mode" plan was
+// rejected because it reintroduced the exact cross-talk Fix A is
+// closing -- see spec §3.1.
+func (e *ConnMgr) deactivatePeerActionFor(conn *peer.Conn) deactivateAction {
+	remote := conn.RemoteEffectiveMode()
+	switch remote {
+	case connectionmode.ModeP2PLazy:
+		return deactivateLazy
+	case connectionmode.ModeP2PDynamic:
+		return deactivateICE
+	case connectionmode.ModeUnspecified:
+		// Bootstrap race: prefer the safer lazy-full-close if we have
+		// a LazyMgr; otherwise emit a diagnostic and noop.
+		if e.isStartedWithLazyMgr() {
+			conn.Log.Debugf("GO_IDLE during RemoteEffectiveMode bootstrap race; using lazy-full-close fallback")
+			return deactivateLazy
+		}
+		conn.Log.Debugf("GO_IDLE during RemoteEffectiveMode bootstrap race + no LazyMgr; treating as noop")
+		return deactivateNoop
+	default:
+		// Eager remote modes (p2p, relay-forced) keep the tunnel
+		// always-on and never expect a GO_IDLE-driven teardown.
+		return deactivateNoop
+	}
+}
+
 // DeactivatePeer is invoked when the remote peer signals GO_IDLE. The
-// behavior is per-mode (see deactivatePeerAction). Phase 2 fix for the
-// lazy/eager mismatch in #5989: previously this method silently no-op'd
-// whenever the local manager was not in lazy mode, so a remote lazy
-// peer's GO_IDLE was effectively dropped and the eager local end kept
-// the peer awake.
+// behavior is dispatched by the REMOTE peer's effective connection
+// mode (see deactivatePeerActionFor). Phase 3.7j Fix A for the
+// mode-cross-talk in #5989: the previous dispatch used the LOCAL
+// mode, so a v0.51.2 legacy peer that resolves to p2p-lazy server-side
+// caused a local p2p-dynamic instance to detach the ICE worker only --
+// the relay tunnel stayed up forever, ICE re-attach went into
+// exponential backoff, and the next remote OFFER was silently dropped.
+//
+// deactivateLazy + no LazyMgr is a graceful fallback to ICE detach
+// rather than a silent return: at least the ICE pair is freed and the
+// relay tunnel stays up; without this branch the eager local end would
+// hold a stale ICE pair forever until its own activity timer fired.
 func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
-	switch e.deactivatePeerAction() {
+	switch e.deactivatePeerActionFor(conn) {
 	case deactivateLazy:
 		if !e.isStartedWithLazyMgr() {
+			// Local manager is eager/dynamic but the remote peer wants
+			// a full close. Fall through to ICE detach so we at least
+			// free the ICE pair; the relay tunnel stays up.
+			conn.Log.Infof("remote peer signaled GO_IDLE (lazy semantics) but local mgr not lazy; falling back to ICE detach")
+			if err := e.DetachICEForPeer(conn.GetKey()); err != nil {
+				conn.Log.Warnf("DetachICEForPeer failed: %v", err)
+			}
 			return
 		}
-		conn.Log.Infof("closing peer connection: remote peer initiated inactive, idle lazy state and sent GOAWAY")
+		conn.Log.Infof("closing peer connection: remote peer initiated inactive, idle lazy state and sent GOAWAY (mode-aware)")
 		e.lazyConnMgr.DeactivatePeer(conn.ConnID())
 	case deactivateICE:
-		conn.Log.Infof("detaching ICE worker: remote peer signaled GO_IDLE (p2p-dynamic)")
+		conn.Log.Infof("detaching ICE worker: remote peer signaled GO_IDLE (p2p-dynamic, mode-aware)")
 		if err := e.DetachICEForPeer(conn.GetKey()); err != nil {
 			conn.Log.Warnf("DetachICEForPeer failed: %v", err)
 		}
 	case deactivateNoop:
-		// Eager modes keep the tunnel up unconditionally.
+		// Eager remote modes keep the tunnel up unconditionally.
 		return
 	}
 }
