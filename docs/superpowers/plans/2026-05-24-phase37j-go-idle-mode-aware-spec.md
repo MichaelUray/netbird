@@ -467,9 +467,17 @@ func TestDeactivatePeer_RemoteDynamic_DetachesICEOnly(t *testing.T) {
     // Assert: DetachICEForPeer aufgerufen
 }
 
-func TestDeactivatePeer_RemoteUnspecified_FallsBackToLocalMode(t *testing.T) {
-    // Status recorder hat RemoteEffectiveMode noch nicht gesetzt
-    // Assert: dispatched nach local mode (existing behavior)
+func TestDeactivatePeer_RemoteUnspecified_LazyMgrFallsBackToLazy(t *testing.T) {
+    // Status recorder hat RemoteEffectiveMode noch nicht gesetzt;
+    // ConnMgr läuft mit aktivem LazyMgr (p2p-lazy oder p2p-dynamic + Lazy).
+    // Assert: lazyConnMgr.DeactivatePeer aufgerufen (safer full-close),
+    //         NICHT DetachICEForPeer.
+}
+
+func TestDeactivatePeer_RemoteUnspecified_NoLazyMgrNoops(t *testing.T) {
+    // ConnMgr ohne LazyMgr (eager modes), RemoteEffectiveMode unspezifiziert.
+    // Assert: weder DetachICEForPeer noch lazyConnMgr.DeactivatePeer
+    //         aufgerufen; nur Diagnose-Log.
 }
 ```
 
@@ -556,7 +564,7 @@ Risiken:
 
 ---
 
-## 7. Offene Fragen für Codex-Review (Round 2)
+## 7. Designfragen — Status
 
 **Aus Round 1 final geklärt (in v0.2 eingearbeitet):**
 - Guard-Interface: predicate-Callback (Codex Option 2) statt direkter Conn-Zugriff ✓
@@ -564,23 +572,16 @@ Risiken:
 - Marker-Lifecycle: 6 explizite Clear-Points inkl. `onICEFailed` ✓
 - Counter-Trennung Guard-hourly vs `iceBackoff failure #N` als Begriffsglossar §2.4 ✓
 
-**Round-2-Fragen (noch offen):**
+**Aus Round 2 final geklärt (in v0.3 eingearbeitet):**
+- `localActivityGateWindow` ist dynamisch aus `p2pTimeoutSecs / 2` abgeleitet und auf `[30s, 5min]` geclampt (§3.3) ✓
+- `ModeUnspecified`-Fallback geht auf `deactivateLazy` (wenn LazyMgr aktiv) sonst `deactivateNoop` mit Diagnose-Log — nicht mehr lokal-dynamic-Detach (§3.1) ✓
+- Pseudo-Code auf `e.iface` korrigiert (`ConnMgr` hat `e.iface`, nicht `e.wgIface`) ✓
+- Userspace-only-Limit von Fix C explizit als Caveat-Box dokumentiert; Kernel-Mode greift Gate nicht (§3.3) ✓
+- Implementation-Plan §5 auf buildbare Commits umgestellt (kein roter Tests-only-Commit, Tests im jeweiligen Code-Commit grün) ✓
 
-1. **`localActivityGateWindow` Default-Wert** (§3.3): aktuell vorgeschlagen `90s = iceTimeout/2`. Sinnvoll? Sollte das ein Server-pushbares Setting werden?
+**Keine offenen Designfragen vor Implementierung.**
 
-2. **Fallback-Verhalten** bei `RemoteEffectiveMode == ModeUnspecified`:
-   - Aktueller Vorschlag: fällt auf lokal-Mode zurück (= current behavior in §3.1)
-   - Beim allerersten NetworkMap-Push ist das kurzzeitig der Fall. Akzeptable Race oder müssen wir auf `Connecting`-State warten?
-
-3. **Eager-Mode-Behandlung** (`p2p`, `relay-forced`): aktuell `deactivateNoop`. Soll Eager-Mode überhaupt jemals `GO_IDLE` empfangen (= Server-Push falsch konfiguriert)? Oder ist `noop` korrekt für alle Eager-Modes inkl. `ModeUnspecified` bei eager-config?
-
-4. **Fix D (Detach-Reason-Enum)**: in dieser Phase-3.7j-Spec mitnehmen oder als separate Diag-Spec? Aufwand klein, aber bewusst aus dem Critical-Path heraushalten?
-
-5. **Konsistenz mit Phase-3.7i orphan-disconnect-Fix**: dort haben wir `firstSeenAt` für Orphan-Peers eingeführt. Der GO_IDLE-Empfang triggert `lazyConnMgr.DeactivatePeer` (für `deactivateLazy`-Pfad). Gibt's eine Race zwischen `MarkIntentionallyDetached` und einer simultanen `addedAt`-Befüllung in `inactivity.Manager.AddPeer`?
-
-6. **Test-Naming-Konvention**: in Phase-3.7i waren Tests benannt nach `TestCheckStats_OrphanPeerXxx`. Hier wäre `TestDeactivatePeer_RemoteLazyXxx` / `TestGuard_IntentionalDetachXxx` / `TestConnMgr_LocalActivityGateXxx` konsistent?
-
-7. **Implementation-Reihenfolge in §5**: 6 Commits jetzt (statt 4 in v0.1). Soll Fix C als separater Commit am Schluss oder integriert mit Fix A? Für Reviewer-Lesbarkeit?
+Eager-Mode (`p2p`, `relay-forced`)-Behandlung bleibt bewusst bei `deactivateNoop` (über `default`-Branch in `deactivatePeerActionFor`) — Eager-Modes sollen kein `GO_IDLE` empfangen; falls doch, ist es ein Server-Config-Mismatch der per `noop` ignoriert wird (kein Detach, kein Hourly-Mode). Detach-Reason-Enum (Fix D) bleibt optional in dieser Spec und kann als letzter Commit weggelassen werden.
 
 ---
 
@@ -659,4 +660,4 @@ func (conn *Conn) RemoteEffectiveMode() connectionmode.Mode {
 
 ---
 
-**ENDE Spec v0.1 — Bitte zur Review an Codex.**
+**ENDE Spec v0.3 — implementation-ready candidate.**
