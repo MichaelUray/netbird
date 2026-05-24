@@ -1,17 +1,27 @@
-# Phase-3.7j — GO_IDLE Mode-Aware Receiver + Guard Retry Hardening
+# Phase-3.7j — GO_IDLE Mode-Aware Receiver + Guard Retry Hardening + Local-Activity-Gate
 
-**Status:** DRAFT v0.1 — for Codex review before implementation
+**Status:** DRAFT v0.2 — Codex round-1-review eingearbeitet, ready for round 2
 **Date:** 2026-05-24
 **Author:** Michael Uray (MichaelUray)
+
+### Changelog
+- **v0.2 (2026-05-24)** — Codex round 1 review punkte eingearbeitet:
+  - **Guard-Predicate-Callback statt direkter Conn-Zugriff:** Guard kennt Conn nicht; neuer `isIntentionalDetach func() bool` Konstruktor-Parameter (Codex Option 2).
+  - **Fix C (echter Local-Activity-Gate) hinzugefügt:** für `RemoteEffectiveMode == ModeP2PDynamic` ist der GO_IDLE-Empfang gegated durch lokale Activity-Recorder-Prüfung. Damit decken wir das Phase-3.7i ↔ Phase-3.7i Cross-Site-Problem ab.
+  - **Detach-Reason-Enum → Fix D (optional/nice-to-have)** umgekennzeichnet (war fälschlich als "C" benannt in v0.1).
+  - **Marker-Lifecycle präzisiert** in §3.2: 6 explizite Clear-Points (AttachICE / AttachICEUserInitiated / AttachICEOnRelayActivity / ActivatePeer / SR-reconnect / **onICEFailed**).
+  - **Counter-Trennung Guard-hourly vs `iceBackoff failure #N`** als Begriffsglossar in §2.4 ergänzt — die zwei Counter sind kausal verkettet aber nicht der gleiche Counter.
+- **v0.1 (2026-05-24)** — initiale Spec.
 **Related:**
 - Live-Test-Report: [`docs/test-reports/2026-05-24-codex-review-response-ice-detach-bug.md`](../../../docs/test-reports/2026-05-24-codex-review-response-ice-detach-bug.md) (Codex root-cause analysis)
 - Memory: `reference_netbird_p2p_dynamic_go_idle_drop.md`
 - Vorgänger-Spec: [`2026-05-24-phase37i-p2p-lazy-orphan-disconnect-spec.md`](2026-05-24-phase37i-p2p-lazy-orphan-disconnect-spec.md) (v0.3.1, implementiert in `pr/h-phase37i-orphan-disconnect@220914567`)
 
 **Scope:**
-- `client/internal/conn_mgr.go` (GO_IDLE-Dispatch nach RemoteEffectiveConnectionMode)
-- `client/internal/peer/guard/guard.go` + `ice_retry_state.go` (Retry-Accounting)
-- `client/internal/peer/conn.go` (Intentional-Detach-Marker)
+- `client/internal/conn_mgr.go` (GO_IDLE-Dispatch nach RemoteEffectiveConnectionMode + Local-Activity-Gate)
+- `client/internal/peer/guard/guard.go` (neuer `isIntentionalDetach` Predicate-Callback)
+- `client/internal/peer/conn.go` (Intentional-Detach-Marker + Clear-Points)
+- `client/iface/bind/activity.go` (Reader-Accessor für `LastActivity[peerKey]` von ConnMgr aus)
 
 **NOT in scope:**
 - v0.51.2-Client-Side-Änderungen (Legacy-Clients bleiben unverändert)
@@ -131,6 +141,21 @@ Codex hat verifiziert (gegen Source-Tag `v0.51.2`):
 
 → Elmira sendet GO_IDLE legitim aus ihrer eigenen Logik. Der Bug ist **ausschließlich auf der Empfänger-Seite** (Phase-3.7i `dk20`).
 
+### 2.4 Begriffsglossar — Guard-hourly vs. `iceBackoff failure #N`
+
+Diese zwei Counter sind **kausal verkettet** (eines triggert das andere) aber **nicht der gleiche Counter** — wichtig für sauberes Debugging:
+
+| Counter | Lebensort | Zählt was | Konsequenz bei Overflow |
+|---------|-----------|-----------|-------------------------|
+| **Guard `iceRetryState.retries`** | [`guard/ice_retry_state.go`](../../client/internal/peer/guard/ice_retry_state.go) | Jeder Tick im `ConnStatusPartiallyConnected`-State zählt | nach 3 ticks → `enterHourlyMode()` |
+| **`Conn.iceBackoff` failure-counter** | [`peer/conn.go`](../../client/internal/peer/conn.go) `onICEFailed` | Echte Pion-`ConnectionStateFailed`-Events | exponentieller Backoff, Logzeile `failure #N` |
+
+**Kausalkette in der Praxis:** Remote `GO_IDLE` → `DetachICEForPeer` (intentional) → Conn-State `PartiallyConnected` → Guard tickt → `shouldRetry()` inkrementiert (Bug B) → nach 3 Ticks `enterHourlyMode` → hourly callback → Conn versucht echtes ICE-Re-Pair → fails (oder hängt) → `onICEFailed` markiert `iceBackoff` → exponentielle `failure #N`-Eskalation.
+
+Beide Counter müssen unabhängig hardened werden:
+- **Bug B Fix** = Guard darf bei intentional detach `shouldRetry` NICHT inkrementieren.
+- **iceBackoff** ist bereits korrekt geschützt (siehe `conn.go:1605-1614` Codex-Kommentar) — kein zusätzlicher Fix nötig.
+
 ---
 
 ## 3. Proposed fix
@@ -189,9 +214,9 @@ func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
 
 **Backward-compat:** `deactivatePeerAction()` (das alte) bleibt unverändert für andere Aufrufer (gibt's? Eigentlich keine, aber sicher ist sicher).
 
-### 3.2 Fix B — Intentional-Detach-Marker für Guard
+### 3.2 Fix B — Intentional-Detach-Marker + Predicate-Callback im Guard
 
-**Idee:** `Conn` markiert sich nach `DetachICEForPeer` als `intentionallyDetached`. Der Guard-Loop schaut diesen Marker an im `ConnStatusPartiallyConnected`-Pfad und skipped `shouldRetry()`-Increment.
+**Idee:** `Conn` markiert sich nach `DetachICEForPeer` als `intentionallyDetached`. Der **Guard erhält einen neuen `isIntentionalDetach func() bool` Predicate-Callback** als Konstruktor-Parameter — Guard kennt `Conn` nicht direkt (siehe v0.1 Codex Review).
 
 **Code-Änderung in [`client/internal/peer/conn.go`](../../client/internal/peer/conn.go):**
 
@@ -203,8 +228,8 @@ type Conn struct {
     // local inactivity timeout — not a pair-check failure. The guard
     // must NOT consume its retry budget while this flag is set.
     //
-    // Cleared on next signal-driven activation (ActivatePeer) or
-    // on local network change (peerActivity event from guard).
+    // Cleared on the 6 explicit lifecycle points listed below
+    // (§3.2 Marker-Lifecycle).
     intentionallyDetached atomic.Bool
 }
 
@@ -223,15 +248,50 @@ func (conn *Conn) ClearIntentionallyDetached() {
 
 **Aufrufpunkt:** [`conn_mgr.go:DetachICEForPeer`](../../client/internal/conn_mgr.go) ruft `conn.MarkIntentionallyDetached()` direkt vor dem detach.
 
-**Code-Änderung in [`guard.go:140-150`](../../client/internal/peer/guard/guard.go#L140-L150):**
+**Code-Änderung in [`guard.go`](../../client/internal/peer/guard/guard.go):**
 
 ```go
+// IsIntentionalDetachFunc reports whether the peer's current ICE-detached
+// state is the result of a graceful idle signal (GO_IDLE or local
+// inactivity timeout). The guard uses this predicate inside the
+// PartiallyConnected branch to skip the retry-budget increment when
+// the detach was intentional.
+//
+// Returning false (= default for new code paths) preserves the
+// existing retry semantics for actual ICE pair-check failures.
+type IsIntentionalDetachFunc func() bool
+
+type Guard struct {
+    log                     *log.Entry
+    isConnectedOnAllWay     connStatusFunc
+    isIntentionalDetach     IsIntentionalDetachFunc   // NEW: nil-safe
+    timeout                 time.Duration
+    ...
+}
+
+func NewGuard(
+    log *log.Entry,
+    isConnectedFn connStatusFunc,
+    isIntentionalDetachFn IsIntentionalDetachFunc,   // NEW param
+    timeout time.Duration,
+    srWatcher *SRWatcher,
+) *Guard {
+    return &Guard{
+        log:                 log,
+        isConnectedOnAllWay: isConnectedFn,
+        isIntentionalDetach: isIntentionalDetachFn,
+        ...
+    }
+}
+
+// In the guard loop ConnStatusPartiallyConnected branch:
 case ConnStatusPartiallyConnected:
-    if g.conn.IsIntentionallyDetached() {
+    if g.isIntentionalDetach != nil && g.isIntentionalDetach() {
         // ICE was detached intentionally (GO_IDLE or local timeout).
-        // Do NOT burn the retry budget — wait for a real network event
-        // (peerActivity, srReconnected, or remote signal) to reset.
+        // Do NOT burn the retry budget — wait for a real network event.
         g.log.Debugf("guard: intentional detach active; skipping retry tick")
+        // NOTE: tickerChannel stays as-is (no reset, no enterHourlyMode);
+        // next periodic tick will re-check.
     } else if iceState.shouldRetry() {
         callback()
     } else {
@@ -241,15 +301,70 @@ case ConnStatusPartiallyConnected:
     }
 ```
 
-**Marker-Clear:**
-- In `ConnMgr.ActivatePeer` (signal-driven wake-up): `conn.ClearIntentionallyDetached()` vor `conn.Open(ctx)`.
-- In Guard `peerActivity`-handler: indirekt via Conn-State-Reset.
+**Marker-Lifecycle — 6 explizite Clear-Points** (v0.2 Korrektur):
 
-### 3.3 Fix C — Detach-Reason im Log
+| # | Wann clear | Code-Pfad | Begründung |
+|---|------------|-----------|------------|
+| 1 | Vor jedem `conn.AttachICE()` | [`conn.go:1450`](../../client/internal/peer/conn.go#L1450) | User-/Signal-getriebener ICE-Aufbau ist Gegenstück zum intentional detach |
+| 2 | Vor jedem `conn.AttachICEUserInitiated()` | [`conn.go:1497`](../../client/internal/peer/conn.go#L1497) | Lokaler-Traffic-getriebener wake-up |
+| 3 | Vor jedem `conn.AttachICEOnRelayActivity()` | [`conn.go:1341`](../../client/internal/peer/conn.go#L1341) | Relay-Activity-getriebener re-attach |
+| 4 | In `ConnMgr.ActivatePeer` direkt vor `conn.Open(ctx)` | [`conn_mgr.go`](../../client/internal/conn_mgr.go) | Signal-driven wake-up nach Remote-OFFER |
+| 5 | Beim SR-watcher reconnect (`srReconnected` event) | [`guard.go:175+`](../../client/internal/peer/guard/guard.go#L175) | Netzwerk-Change → frischer ICE-Cycle, Marker veraltet |
+| 6 | **In `Conn.onICEFailed` direkt nach `markFailure`** | [`conn.go:1615`](../../client/internal/peer/conn.go#L1615) | echte Pion-Failure muss als Failure sichtbar bleiben — darf NICHT durch einen stale intentional-Marker maskiert werden |
+
+**Wichtig** (Codex round-1 hervorgehoben): Punkt 6 ist nicht-optional. Ohne ihn könnte eine echte ICE-Failure direkt nach einem intentional Detach durch den Marker maskiert werden, und Guard würde nie auf legitime Failure-Eskalation umschalten.
+
+### 3.3 Fix C — Local-Activity-Gate für remote-dynamic GO_IDLE
+
+**Idee** (Codex round-1 echte Fix C): wenn `RemoteEffectiveMode == ModeP2PDynamic` und ein Remote sendet `GO_IDLE`, prüfe **vor dem ICE-Detach** ob der lokale `ActivityRecorder` für diesen Peer Aktivität in den letzten N Sekunden gesehen hat. Falls ja: skip detach (lokale Sicht weiß: Tunnel wird tatsächlich gerade benutzt).
+
+**Motivation:** Im Phase-3.7i ↔ Phase-3.7i Cross-Site-Pfad (z.B. CTB-Lebring ↔ PVE5) sendet eine Seite GO_IDLE basierend auf ihrer lokalen Activity-Sicht. Wenn aber die ANDERE Seite gerade aktiv ist (z.B. der Cross-Site VNC-Traffic läuft real), ist es falsch, eine aktive P2P-Strecke zu detachen — die lokale Activity-Sicht wissens besser.
+
+**Code-Änderung in [`conn_mgr.go:DeactivatePeer`](../../client/internal/conn_mgr.go):**
+
+```go
+const (
+    // localActivityGateWindow ist die Toleranz für "lokal kürzlich Activity gesehen".
+    // Konservativ kurz wählen damit der Gate nicht zu lange aktive Sessions blockiert
+    // wenn Remote wirklich gehen will. ~iceTimeout/2 ist ein vernünftiger Default.
+    localActivityGateWindow = 90 * time.Second
+)
+
+func (e *ConnMgr) DeactivatePeer(conn *peer.Conn) {
+    switch e.deactivatePeerActionFor(conn) {
+    case deactivateLazy:
+        // ... existing lazy-close path (Fix A) ...
+    case deactivateICE:
+        // Fix C: Local-Activity-Gate für remote-dynamic GO_IDLE.
+        // Wenn lokaler ActivityRecorder kürzlich Activity gesehen hat,
+        // ist die P2P-Strecke wirklich aktiv und ein remote-stale-idle
+        // Signal soll sie nicht detachen.
+        if e.wgIface != nil && e.wgIface.IsUserspaceBind() {
+            activities := e.wgIface.LastActivities()
+            if last, ok := activities[conn.GetKey()]; ok {
+                if monotime.Since(last) < localActivityGateWindow {
+                    conn.Log.Infof("ICE detach skipped: remote GO_IDLE but local activity %v ago (within %v gate)",
+                        monotime.Since(last), localActivityGateWindow)
+                    return
+                }
+            }
+        }
+        // Kein Activity-Eintrag ODER zu alt → Detach durchführen
+        conn.Log.Infof("detaching ICE worker: remote peer signaled GO_IDLE (p2p-dynamic, mode-aware)")
+        if err := e.DetachICEForPeer(conn.GetKey()); err != nil { ... }
+    case deactivateNoop:
+        return
+    }
+}
+```
+
+**Caveat:** `LastActivities()` ist nur im Userspace-Mode befüllt ([`kernel_unix.go:330-331`](../../client/iface/configurer/kernel_unix.go#L330-L331) returns nil im Kernel-Mode). Im Kernel-Mode greift Fix C nicht und der detach läuft wie vor v0.1. Das ist akzeptabel — Kernel-Mode-Geräte sollten ohnehin `NB_WG_KERNEL_DISABLED=true` setzen (siehe `reference_netbird_kernel_mode_pair_selection_bug`).
+
+### 3.4 Fix D (optional) — Detach-Reason im Log
 
 **Idee:** Bei jedem `DetachICEForPeer`-Aufruf wird ein Reason mitgegeben:
 - `remote-lazy-go-idle` (Mode-aware: Remote ist p2p-lazy)
-- `remote-dynamic-go-idle` (Remote ist p2p-dynamic)
+- `remote-dynamic-go-idle` (Remote ist p2p-dynamic, Fix C-Gate gepasst)
 - `local-ice-timeout` (lokaler Phase-2-Inactivity-Manager)
 - `failure` (ICE pair-check broken — von `onICEFailed`)
 - `network-reset` (manueller reset bei SR-watcher reconnect)
@@ -273,7 +388,7 @@ func (e *ConnMgr) DetachICEForPeerWithReason(peerKey string, reason DetachReason
 }
 ```
 
-Vorteile: bessere Diagnostik, einfachere Regression-Tests.
+**Optional**: kann in dieser Spec mitkommen oder als follow-up. Bringt Diagnose-Verbesserung, keine funktionale Änderung.
 
 ---
 
@@ -361,10 +476,14 @@ Risiken:
 
 | Commit | Inhalt | Tests rot/grün nach Commit |
 |--------|--------|------------------------------|
-| 1 | Failing tests aus §4.1 (alle 7 Tests) | compile-fail bzw. fail (kein RemoteEffectiveMode-aware dispatch, kein IntentionallyDetached marker) |
-| 2 | `Conn.MarkIntentionallyDetached/Clear/Is` Marker einführen + `DetachICEForPeer` ruft `MarkIntentionallyDetached()` | Guard-Tests grün, ConnMgr-Tests noch rot |
-| 3 | `ConnMgr.deactivatePeerActionFor` + `DeactivatePeer` umstellen auf `RemoteEffectiveMode` | alle Tests grün |
-| 4 (optional) | Detach-Reason-Enum + Logging | nur Doku-Fix |
+| 1 | Failing tests aus §4.1 (Fix-A + Fix-B + Fix-C-Tests) | compile-fail bzw. fail |
+| 2 | `Conn.MarkIntentionallyDetached/Clear/Is` Marker + 6 Clear-Points + `DetachICEForPeer` Hook + `onICEFailed` Clear | nur Fix-B-Marker-Cleanup-Tests grün, Rest rot |
+| 3 | `Guard.IsIntentionalDetachFunc` predicate-Callback + Konstruktor-Param + PartiallyConnected-Skip | Fix-B Guard-Tests grün |
+| 4 | `ConnMgr.deactivatePeerActionFor` + `DeactivatePeer` umstellen auf `RemoteEffectiveMode` | Fix-A Tests grün |
+| 5 | `ConnMgr.DeactivatePeer` Local-Activity-Gate (Fix C) — `LastActivities()`-Check vor `DetachICE` im dynamic branch | Fix-C Tests grün, alle 7 Tests grün |
+| 6 (optional) | Detach-Reason-Enum + Logging (Fix D) | nur Doku/Diag |
+
+**Wichtig:** Commit 2 muss zuerst — der Guard braucht das Marker-Interface. Sonst kompiliert Commit 3 nicht. Ohne Fix B (Commit 3) bringt Fix A (Commit 4) zwar Mode-Awareness, aber Backoff-Eskalation bleibt offen wenn Fix-C-Gate nicht greift.
 
 ---
 
@@ -381,26 +500,31 @@ Risiken:
 
 ---
 
-## 7. Offene Fragen für Codex-Review (Round 1)
+## 7. Offene Fragen für Codex-Review (Round 2)
 
-1. **Marker-Lifecycle**: `intentionallyDetached` Marker — welche Events sollten ihn EXPLIZIT clearen?
-   - Vorschlag: `ActivatePeer`, `peerActivity` (im Guard), `srReconnected`, `network-change`
-   - Alternative: nur 1 zentraler Clear-Pfad in `Conn.OpenICEWorker()` oder ähnlich
+**Aus Round 1 final geklärt (in v0.2 eingearbeitet):**
+- Guard-Interface: predicate-Callback (Codex Option 2) statt direkter Conn-Zugriff ✓
+- Fix C als echter Local-Activity-Gate eingeführt (war v0.1 falsch als "Detach-Reason" benannt) ✓
+- Marker-Lifecycle: 6 explizite Clear-Points inkl. `onICEFailed` ✓
+- Counter-Trennung Guard-hourly vs `iceBackoff failure #N` als Begriffsglossar §2.4 ✓
+
+**Round-2-Fragen (noch offen):**
+
+1. **`localActivityGateWindow` Default-Wert** (§3.3): aktuell vorgeschlagen `90s = iceTimeout/2`. Sinnvoll? Sollte das ein Server-pushbares Setting werden?
 
 2. **Fallback-Verhalten** bei `RemoteEffectiveMode == ModeUnspecified`:
-   - Aktueller Vorschlag: fällt auf lokal-Mode zurück (= current behavior)
-   - Codex-Hinweis war: "in onGuardEvent skip OFFER for RemoteEffectiveMode=p2p-lazy". Sollte für `Unspecified` ein Skip-Modus existieren?
+   - Aktueller Vorschlag: fällt auf lokal-Mode zurück (= current behavior in §3.1)
+   - Beim allerersten NetworkMap-Push ist das kurzzeitig der Fall. Akzeptable Race oder müssen wir auf `Connecting`-State warten?
 
-3. **Eager-Mode-Behandlung** (`p2p`, `relay-forced`): aktuell `deactivateNoop`. Soll Eager-Mode überhaupt jemals `GO_IDLE` empfangen (=Server-Push falsch konfiguriert)? Oder ist `noop` korrekt?
+3. **Eager-Mode-Behandlung** (`p2p`, `relay-forced`): aktuell `deactivateNoop`. Soll Eager-Mode überhaupt jemals `GO_IDLE` empfangen (= Server-Push falsch konfiguriert)? Oder ist `noop` korrekt für alle Eager-Modes inkl. `ModeUnspecified` bei eager-config?
 
-4. **Detach-Reason-Enum**: ist §3.3 ein nice-to-have oder zwingend für die Spec? Codex hat es vorgeschlagen ("Track why ICE is detached"). Einbauen oder separates Spec?
+4. **Fix D (Detach-Reason-Enum)**: in dieser Phase-3.7j-Spec mitnehmen oder als separate Diag-Spec? Aufwand klein, aber bewusst aus dem Critical-Path heraushalten?
 
-5. **Phase-2 Cross-Site (PVE5 ↔ CTB-Lebring) als gleiches Bug?**
-   - Codex hat es als gleiches Pattern beschrieben
-   - Mit `RemoteEffectiveConnectionMode = p2p-dynamic` (beide Phase-3.7i) würde Fix A nicht greifen (geht in den `deactivateICE`-Zweig)
-   - **Brauchen wir zusätzlich Fix B (Guard-Retry-Härtung) für Cross-Dynamic Same-Mode**? Codex' Empfehlung war "C: For RemoteEffectiveConnectionMode == p2p-dynamic, accept remote GO_IDLE only if local transport activity also looks idle". Soll das in dieser Spec rein?
+5. **Konsistenz mit Phase-3.7i orphan-disconnect-Fix**: dort haben wir `firstSeenAt` für Orphan-Peers eingeführt. Der GO_IDLE-Empfang triggert `lazyConnMgr.DeactivatePeer` (für `deactivateLazy`-Pfad). Gibt's eine Race zwischen `MarkIntentionallyDetached` und einer simultanen `addedAt`-Befüllung in `inactivity.Manager.AddPeer`?
 
-6. **Konsistenz mit Phase-3.7i orphan-disconnect-Fix**: dort haben wir `firstSeenAt` für Orphan-Peers eingeführt. Der GO_IDLE-Empfang triggert `lazyConnMgr.DeactivatePeer` (für `deactivateLazy`-Pfad). Ist das korrekt orchestriert oder gibt's eine Race?
+6. **Test-Naming-Konvention**: in Phase-3.7i waren Tests benannt nach `TestCheckStats_OrphanPeerXxx`. Hier wäre `TestDeactivatePeer_RemoteLazyXxx` / `TestGuard_IntentionalDetachXxx` / `TestConnMgr_LocalActivityGateXxx` konsistent?
+
+7. **Implementation-Reihenfolge in §5**: 6 Commits jetzt (statt 4 in v0.1). Soll Fix C als separater Commit am Schluss oder integriert mit Fix A? Für Reviewer-Lesbarkeit?
 
 ---
 
