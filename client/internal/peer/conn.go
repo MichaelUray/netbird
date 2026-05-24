@@ -174,6 +174,50 @@ type Conn struct {
 	// AttachICEUserInitiated bypass so subsequent user-initiated retries
 	// within minCooldown are rate-limited. Protected by conn.mu.
 	lastUserInitiatedAttachICE time.Time
+
+	// intentionallyDetached signals to the guard that the current ICE
+	// detached state is the result of a remote/local GO_IDLE or local
+	// inactivity timeout — not an ICE pair-check failure. The guard
+	// must NOT consume its retry budget while this flag is set
+	// (otherwise an intentional idle silently burns the 3-tries window
+	// and parks a healthy peer on the hourly schedule).
+	//
+	// Phase 3.7j (#5989): marker is SET in ConnMgr.DetachICEForPeer and
+	// CLEARED on every lifecycle point that legitimately re-engages ICE
+	// (AttachICE / AttachICEUserInitiated / AttachICEOnRelayActivity /
+	// ConnMgr.ActivatePeer pre-Open / onNetworkChange / onICEFailed).
+	intentionallyDetached atomic.Bool
+}
+
+// MarkIntentionallyDetached records that the current ICE detach is the
+// result of an explicit GO_IDLE (remote or local) or a local inactivity
+// timeout, rather than a pion ICE failure. The Phase-3.7j guard
+// predicate reads this flag via IsIntentionallyDetached to skip the
+// retry-budget consumption.
+//
+// Safe to call concurrently. Idempotent.
+func (conn *Conn) MarkIntentionallyDetached() {
+	conn.intentionallyDetached.Store(true)
+}
+
+// IsIntentionallyDetached returns true while the most recent ICE detach
+// is still flagged as intentional. Cleared by AttachICE-family methods,
+// ConnMgr.ActivatePeer, onNetworkChange and onICEFailed (see
+// intentionallyDetached field comment for the full list).
+//
+// Safe to call concurrently.
+func (conn *Conn) IsIntentionallyDetached() bool {
+	return conn.intentionallyDetached.Load()
+}
+
+// ClearIntentionallyDetached resets the marker. Called by every
+// lifecycle point that legitimately re-engages or invalidates the ICE
+// path so the next pion failure is not masked by a stale intentional-
+// detach state. Safe to call when the marker was never set.
+//
+// Safe to call concurrently. Idempotent.
+func (conn *Conn) ClearIntentionallyDetached() {
+	conn.intentionallyDetached.Store(false)
 }
 
 // NewConn creates a new not opened Conn to the remote peer.
@@ -1339,6 +1383,11 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 //
 // Phase 3.7i (#5989), Codex review 2026-05-05.
 func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
+	// Phase 3.7j: clear the intentional-detach marker here (clear-point #3).
+	// Relay activity is an unambiguous signal that the local stack is
+	// re-engaging ICE — any preceding intentional-detach is no longer
+	// the current truth.
+	conn.ClearIntentionallyDetached()
 	conn.mu.Lock()
 	if conn.config.Mode != connectionmode.ModeP2PDynamic {
 		conn.mu.Unlock()
@@ -1448,6 +1497,11 @@ func (conn *Conn) ResetIceBackoff() {
 // Used by p2p-dynamic mode: workerICE is created in Open() but the
 // handshaker dispatch is deferred until traffic activity is seen.
 func (conn *Conn) AttachICE() error {
+	// Phase 3.7j: clear the intentional-detach marker here (clear-point #1).
+	// Signal-driven ICE re-attach is the explicit counterpart to an
+	// intentional detach; once we re-attach the marker must not linger
+	// across the next pion lifecycle.
+	conn.ClearIntentionallyDetached()
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -1495,6 +1549,11 @@ func (conn *Conn) AttachICE() error {
 // path lets user activity drive at most one fresh ICE attempt per cooldown
 // without short-circuiting the failure schedule entirely.
 func (conn *Conn) AttachICEUserInitiated(minCooldown time.Duration) error {
+	// Phase 3.7j: clear the intentional-detach marker here (clear-point #2).
+	// Local user-traffic-driven wake-up is the activity counterpart to
+	// AttachICE; clearing here keeps the marker semantics symmetric
+	// across all three Attach-paths.
+	conn.ClearIntentionallyDetached()
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -1613,6 +1672,14 @@ func (conn *Conn) DetachICE() error {
 // measures "ICE pair-checks broke after a real attempt", never
 // "no traffic flowed for a while".
 func (conn *Conn) onICEFailed() {
+	// Phase 3.7j: clear the intentional-detach marker here (clear-point #6,
+	// non-optional). A real pion failure immediately after an intentional
+	// detach must remain visible to the guard; otherwise the marker would
+	// continue to suppress failure-handling and the peer would never
+	// escalate to the legitimate fail+backoff path. Done unconditionally
+	// at the top so even the "iceBackoff == nil" early-return path still
+	// surfaces the real failure to the guard predicate.
+	conn.ClearIntentionallyDetached()
 	if conn.iceBackoff == nil {
 		return
 	}
@@ -1716,6 +1783,14 @@ func (conn *Conn) IceBackoffSnapshot() BackoffSnapshot {
 // Called from Guard's goroutine; acquires conn.mu, so it must not be
 // invoked from a path that already holds conn.mu.
 func (conn *Conn) onNetworkChange() {
+	// Phase 3.7j: clear the intentional-detach marker here (clear-point #5,
+	// SR-watcher reconnect). A network event (LTE replug, WiFi roam)
+	// invalidates any previous "intentionally idle" reasoning -- the
+	// path may be entirely different now -- and the Guard about to
+	// drive a fresh ICE cycle must see a clean slate. Done before
+	// acquiring conn.mu because ClearIntentionallyDetached is atomic
+	// and lock-free; keeps ordering trivial.
+	conn.ClearIntentionallyDetached()
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
