@@ -1,6 +1,6 @@
 # Phase-3.7i — p2p-lazy "orphan peer" never-disconnect bug
 
-**Status:** DRAFT v0.2 — for Codex review before implementation
+**Status:** DRAFT v0.3 — implementation-ready candidate (Codex review round 2 polish eingearbeitet)
 **Date:** 2026-05-24
 **Author:** Michael Uray (MichaelUray)
 **Related:** [`2026-05-22-phase37i-lazy-watchdog-spec.md`](2026-05-22-phase37i-lazy-watchdog-spec.md) (deployed), [`2026-05-24-phase37i-lazy-watchdog-impl.md`](2026-05-24-phase37i-lazy-watchdog-impl.md)
@@ -8,10 +8,15 @@
 **NOT in scope:** Phase-2 two-timer behaviour change, server protocol change, p2p-dynamic mode
 
 ### Changelog
+- **v0.3 (2026-05-24)** — Codex review round 2 polish:
+  - Alle relativen Markdown-Links auf `../../../client/...` korrigiert (Spec liegt in `docs/superpowers/plans/`, also 3 Ebenen bis Repo-Root).
+  - §2.2: `watchdog.go` → `client/internal/lazyconn/manager/manager.go` (der Watchdog lebt im manager-Package, nicht in eigener Datei).
+  - Changelog (v0.2-Einträge): `addedAt` → `firstSeenAt` nachgezogen.
+  - §6 Locking-Text neutralisiert: kein Race-Freiheit-Claim mehr; explizit als "folgt bestehender no-sync-Konvention; transient fehlender Eintrag wird defensiv geloggt/übersprungen; race-clean = separater Mutex-Refactor".
 - **v0.2 (2026-05-24)** — Codex review round 1 reingearbeitet:
-  - Phase-2-Semantik (BLOCKER): Fix-Strategie umgestellt — `addedAt` wird als **synthetisches `lastActive`** verwendet, danach läuft die bestehende Zwei-Timer-Logik unverändert. Damit funktioniert iceTimeout in Phase-2 automatisch korrekt.
-  - WG-Stats-Semantik präzisiert: fehlender Eintrag heißt "kein ActivityRecorder-Eintrag", nicht zwingend "nie Bytes". `WGUSPConfigurer.UpdatePeer` legt bei Endpoint-Set bereits einen Eintrag mit `LastActivity=Now` an ([`usp.go:117-124`](../../client/iface/configurer/usp.go#L117-L124) + [`activity.go:81`](../../client/iface/bind/activity.go#L81)).
-  - Test-Snippets korrigiert: `mockWgInterface` (nicht `mockWGIface`), bestehende `assert`-Konvention statt `require`, kein `time.Sleep` — `addedAt`-Map direkt mit Vergangenheits-Wert seeden.
+  - Phase-2-Semantik (BLOCKER): Fix-Strategie umgestellt — `firstSeenAt` wird als **synthetisches `lastActive`** verwendet, danach läuft die bestehende Zwei-Timer-Logik unverändert. Damit funktioniert iceTimeout in Phase-2 automatisch korrekt.
+  - WG-Stats-Semantik präzisiert: fehlender Eintrag heißt "kein ActivityRecorder-Eintrag", nicht zwingend "nie Bytes". `WGUSPConfigurer.UpdatePeer` legt bei Endpoint-Set bereits einen Eintrag mit `LastActivity=Now` an ([`usp.go:117-124`](../../../client/iface/configurer/usp.go#L117-L124) + [`activity.go:81`](../../../client/iface/bind/activity.go#L81)).
+  - Test-Snippets korrigiert: `mockWgInterface` (nicht `mockWGIface`), bestehende `assert`-Konvention statt `require`, kein `time.Sleep` — `firstSeenAt`-Map direkt mit Vergangenheits-Wert seeden.
   - Locking-Text ehrlicher: kein "atomar"-Claim, sondern explizit "folgt der bestehenden no-mutex-Konvention für `interestedPeers`".
   - Branch-Strategie korrigiert: Spec-only auf `spec/phase37i-orphan-disconnect`, Implementierung später auf `pr/h-phase37i-orphan-disconnect` mit Base `pr/g-phase3.7i-lazy-watchdog` (nicht auf den Build-/Deploy-Zweig).
 - **v0.1 (2026-05-24)** — initiale Spec.
@@ -56,7 +61,7 @@ User-Quote:
 
 ## 2. Root cause (Code-Pfad)
 
-Datei: [`client/internal/lazyconn/inactivity/manager.go`](../../client/internal/lazyconn/inactivity/manager.go)
+Datei: [`client/internal/lazyconn/inactivity/manager.go`](../../../client/internal/lazyconn/inactivity/manager.go)
 Funktion: `(*Manager).checkStats`
 Zeilenbereich: 266–294, bug auf Zeile 273–279.
 
@@ -86,8 +91,8 @@ for peerID, peerCfg := range m.interestedPeers {
 
 `lastActivities` ist die per-peer-Map, die der WG-Interface-Treiber liefert (`m.iface.LastActivities()`). Im userspace-Pfad wird der Eintrag **bereits beim Endpoint-Set** angelegt:
 
-- [`WGUSPConfigurer.UpdatePeer`](../../client/iface/configurer/usp.go#L94-L126) ruft `c.activityRecorder.UpsertAddress(peerKey, addrPort)` auf, sobald ein `endpoint != nil` reingereicht wird.
-- [`ActivityRecorder.UpsertAddress`](../../client/iface/bind/activity.go#L67-L82) initialisiert dabei `record.LastActivity = monotime.Now()`.
+- [`WGUSPConfigurer.UpdatePeer`](../../../client/iface/configurer/usp.go#L94-L126) ruft `c.activityRecorder.UpsertAddress(peerKey, addrPort)` auf, sobald ein `endpoint != nil` reingereicht wird.
+- [`ActivityRecorder.UpsertAddress`](../../../client/iface/bind/activity.go#L67-L82) initialisiert dabei `record.LastActivity = monotime.Now()`.
 
 Ein fehlender Eintrag in `LastActivities()` bedeutet also **präzise**: für diesen Peer wurde noch nie `UpdatePeer` mit einem nicht-`nil`-Endpoint aufgerufen. Das passiert in genau diesen Fällen:
 
@@ -102,7 +107,7 @@ Case 2 ist der pathologische Pfad: Der Peer steht permanent im `interestedPeers`
 
 ### 2.2 Abgrenzung zum bereits gefixten Watchdog (v0.7.2)
 
-Der gerade deployte Phase-3.7i-Lazy-Watchdog (`watchdog.go`, `pr/g-phase3.7i-lazy-watchdog`) deckt **zwei andere** stuck-states ab:
+Der gerade deployte Phase-3.7i-Lazy-Watchdog (im `lazyconn.Manager` selbst, [`client/internal/lazyconn/manager/manager.go`](../../../client/internal/lazyconn/manager/manager.go) im Branch `pr/g-phase3.7i-lazy-watchdog`) deckt **zwei andere** stuck-states ab:
 
 - **Case-a**: `inactivePeersChan` voll → `notifyChan` dropt → Consumer kriegt das Event nicht.
 - **Case-b**: Consumer hat `Close()` aufgerufen, der WG-Removal hat eine Race, Peer bleibt halb-gehangen.
@@ -294,11 +299,11 @@ Der Consumer (`lazyconn.Manager`) verarbeitet `iceIdle` und `relayIdle` in seine
 
 ## 6. Race-Conditions und Konkurrenz-Sicht
 
-`checkStats` läuft seriell im einzigen `Start`-Goroutinen-Loop. `AddPeer` / `RemovePeer` werden vom `lazyconn.Manager` aus aufgerufen, der sein eigenes Locking hat (manager.go-side). Die `interestedPeers`-Map ist **nicht** mit einem Mutex geschützt im aktuellen Code — das war schon vor diesem Fix so und ist eine Annahme über die Aufrufer-Disziplin.
+`checkStats` läuft in der `inactivity.Manager.Start`-Goroutine. `AddPeer` / `RemovePeer` werden vom `lazyconn.Manager` aus aufgerufen — also von **außerhalb** dieser Goroutine. Der bestehende Code hat bereits **keine gemeinsame Synchronisierung** für `interestedPeers`; das ist eine Annahme über die Aufrufer-Disziplin im `lazyconn`-Paket, nicht eine garantierte Race-Freiheit.
 
-Die neue `firstSeenAt`-Map folgt **derselben Konvention** ohne neuen Mutex: zwei `delete`-Aufrufe in `RemovePeer` bzw. zwei `=`-Zuweisungen in `AddPeer` sind nicht "atomar" im Wortsinn — sie sind nur seriell unter dem bestehenden Aufrufer-Vertrag. Solange Aufrufer denselben Vertrag halten wie für `interestedPeers`, kann zwischen den beiden Operationen kein zweiter Aufrufer reingrätschen.
+Die neue `firstSeenAt`-Map folgt **derselben Konvention** ohne neuen Mutex: die zwei `delete`-Aufrufe in `RemovePeer` bzw. die zwei `=`-Zuweisungen in `AddPeer` sind nicht atomar zueinander, und auch nicht atomar gegenüber einem konkurrierenden `checkStats`-Lauf. Falls `interestedPeers` einen Peer enthält, dessen `firstSeenAt`-Eintrag (transient) fehlt, **loggt** der `!ok`-Pfad in §4.2 das defensiv und **überspringt** den Peer für diesen Tick — beim nächsten Tick ist die Map dann konsistent.
 
-Falls Codex das Locking-Modell für riskant hält, wäre der saubere Refactor: einen einzelnen `sync.Mutex` auf `interestedPeers` + `firstSeenAt` einführen. **Das gehört aber nicht in diesen Bugfix-Spec** — es wäre eine separate Aufräum-PR.
+Eine **race-clean** Lösung wäre ein einzelner `sync.Mutex` auf `interestedPeers` + `firstSeenAt`. Das ist ein **separater Mutex-Refactor**, der nicht in diesen Bugfix-Spec gehört: er würde auch den heutigen, unveränderten Lese-Pfad in `checkStats` betreffen und ist damit kein orphan-disconnect-Thema.
 
 ---
 
@@ -308,7 +313,7 @@ Falls Codex das Locking-Modell für riskant hält, wäre der saubere Refactor: e
 
 Datei: `client/internal/lazyconn/inactivity/manager_test.go`
 
-Bestehender Harness (verifiziert: [`manager_test.go:28-34`](../../client/internal/lazyconn/inactivity/manager_test.go#L28-L34)):
+Bestehender Harness (verifiziert: [`manager_test.go:28-34`](../../../client/internal/lazyconn/inactivity/manager_test.go#L28-L34)):
 
 ```go
 type mockWgInterface struct {
@@ -547,4 +552,4 @@ func (r *ActivityRecorder) UpsertAddress(publicKey string, address netip.AddrPor
 
 ---
 
-**ENDE Spec v0.2 — Bitte für Round 2 an Codex.**
+**ENDE Spec v0.3 — implementation-ready candidate, an Codex für Final-Sign-off.**
