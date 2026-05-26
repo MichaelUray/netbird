@@ -97,10 +97,15 @@ func (d *BindListener) setupLazyConn() error {
 }
 
 // ReadPackets blocks until activity is detected on the LazyConn or the listener is closed.
-func (d *BindListener) ReadPackets() {
+// The returned readResult tells the activity-manager whether it was a real
+// activity edge (readActivity) or a close/cancel-triggered exit (readClosed).
+func (d *BindListener) ReadPackets() readResult {
+	result := readClosed
+
 	select {
 	case <-d.lazyConn.ActivityChan():
 		d.peerCfg.Log.Infof("activity detected via LazyConn")
+		result = readActivity
 	case <-d.lazyConn.ctx.Done():
 		d.peerCfg.Log.Infof("exit from activity listener")
 	}
@@ -113,6 +118,7 @@ func (d *BindListener) ReadPackets() {
 	_ = d.lazyConn.Close()
 	d.bind.RemoveEndpoint(d.fakeIP)
 	d.done.Done()
+	return result
 }
 
 // Close stops the listener and cleans up resources.

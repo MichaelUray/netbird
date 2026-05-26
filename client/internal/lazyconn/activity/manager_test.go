@@ -315,10 +315,12 @@ func newFakeListener() *fakeListener {
 	}
 }
 
-func (f *fakeListener) ReadPackets() {
+func (f *fakeListener) ReadPackets() readResult {
 	select {
 	case <-f.activityCh:
+		return readActivity
 	case <-f.closeCh:
+		return readClosed
 	}
 }
 

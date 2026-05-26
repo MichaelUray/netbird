@@ -46,7 +46,11 @@ func NewUDPListener(wgIface WgInterface, cfg lazyconn.PeerConfig) (*UDPListener,
 }
 
 // ReadPackets blocks reading from the UDP socket until activity is detected or the listener is closed.
-func (d *UDPListener) ReadPackets() {
+// The returned readResult tells the activity-manager whether it was a real
+// activity edge (readActivity) or a close-triggered exit (readClosed).
+func (d *UDPListener) ReadPackets() readResult {
+	result := readClosed
+
 	for {
 		n, remoteAddr, err := d.conn.ReadFromUDP(make([]byte, 1))
 		if err != nil {
@@ -63,6 +67,7 @@ func (d *UDPListener) ReadPackets() {
 			continue
 		}
 		d.peerCfg.Log.Infof("activity detected")
+		result = readActivity
 		break
 	}
 
@@ -74,6 +79,7 @@ func (d *UDPListener) ReadPackets() {
 	// Ignore close error as it may return "use of closed network connection" if already closed.
 	_ = d.conn.Close()
 	d.done.Unlock()
+	return result
 }
 
 // Close stops the listener and cleans up resources.

@@ -15,9 +15,35 @@ import (
 	peerid "github.com/netbirdio/netbird/client/internal/peer/id"
 )
 
+// readResult tells the activity-manager why a listener's ReadPackets
+// returned. Without this distinction the manager cannot tell a real
+// activity edge apart from a close/cancel-driven return, which on
+// Android led to silently dropped activity events under network-change
+// pressure (Phase 3.7j-android-lazyconn-fix: production-reproduced on
+// Samsung Galaxy S21 + S24+).
+type readResult int
+
+const (
+	// readClosed indicates the listener exited because Close was called
+	// (or its context was cancelled). No activity occurred; the
+	// activity-manager MUST NOT publish a notification.
+	readClosed readResult = iota
+
+	// readActivity indicates the listener observed real transport
+	// activity. The activity-manager MUST publish a notification on
+	// OnActivityChan, even if the per-peer map-entry has already been
+	// removed by a concurrent RemovePeer call.
+	readActivity
+)
+
 // listener defines the contract for activity detection listeners.
 type listener interface {
-	ReadPackets()
+	// ReadPackets blocks until either real transport activity is
+	// observed (returns readActivity) or the listener is closed /
+	// cancelled (returns readClosed). The return value MUST reflect
+	// the actual wake reason so that the activity-manager can
+	// distinguish activity from teardown.
+	ReadPackets() readResult
 	Close()
 }
 
@@ -117,22 +143,46 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) waitForTraffic(l listener, peerConnID peerid.ConnID) {
-	l.ReadPackets()
-
-	m.mu.Lock()
-	if _, ok := m.peers[peerConnID]; !ok {
-		m.mu.Unlock()
+	result := l.ReadPackets()
+	if result != readActivity {
+		// Listener exited via Close/cancel. No real activity to report.
+		// The peer map-entry, if any, is owned by whoever triggered the
+		// close (Manager.Close, Manager.RemovePeer); they handled the
+		// delete. Returning here without notify preserves the "close
+		// does not synthesise activity" invariant.
 		return
 	}
+
+	// Real activity was observed. The notification edge MUST NOT be
+	// dropped just because the per-peer map-entry was concurrently
+	// removed (Phase 3.7j-android-lazyconn-fix). We still delete the
+	// entry idempotently in case we own it, so subsequent listener
+	// teardown is a no-op against m.peers.
+	m.mu.Lock()
+	_, wasRegistered := m.peers[peerConnID]
 	delete(m.peers, peerConnID)
 	m.mu.Unlock()
+
+	if !wasRegistered {
+		// Debug only: a concurrent removal beat us to the map entry but
+		// real activity arrived nonetheless. Kept at debug-level so
+		// production logs are not noisy; intended for Android
+		// validation builds and post-mortem analysis of the race.
+		log.Debugf("activity observed after listener-map entry was already removed for %v", peerConnID)
+	}
 
 	m.notify(peerConnID)
 }
 
 func (m *Manager) notify(peerConnID peerid.ConnID) {
+	// Debug-level diagnostic: the production-reproduced bug could
+	// theoretically also manifest as a blocked notify (OnActivityChan
+	// is buffer-1). before/after notify logs let the Android validation
+	// build distinguish blocked-delivery from the lost-edge race.
+	log.Debugf("waitForTraffic: notify enter peerConnID=%v chanLen=%d", peerConnID, len(m.OnActivityChan))
 	select {
 	case <-m.done:
 	case m.OnActivityChan <- peerConnID:
 	}
+	log.Debugf("waitForTraffic: notify return peerConnID=%v", peerConnID)
 }
