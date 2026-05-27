@@ -421,6 +421,20 @@ func (m *Manager) DeactivatePeer(peerID peerid.ConnID) {
 	}
 
 	if mp.expectedWatcher != watcherInactivity {
+		// Bootstrap-state (watcherActivity) peer: the activity listener
+		// is still in place but the WG-peer endpoint may have been
+		// switched to a relay-proxy that subsequently closed. Re-install
+		// the fake-IP endpoint so outbound traffic re-triggers the
+		// activity edge.
+		//
+		// Phase 3.7k Followup (2026-05-27): production-reproduced as
+		// S21 → Lethbridge v0.53 / Elmira v0.51 stuck-bootstrap. Without
+		// this refresh, peers in p2p-lazy bootstrap state stayed in
+		// "Connecting" forever after a transient relay-conn even though
+		// the user generated outbound traffic.
+		if err := m.activityManager.RefreshLazyEndpoint(*mp.peerCfg); err != nil {
+			mp.peerCfg.Log.Errorf("failed to refresh lazy endpoint: %v", err)
+		}
 		return
 	}
 

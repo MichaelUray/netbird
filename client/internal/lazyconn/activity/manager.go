@@ -94,6 +94,39 @@ func (m *Manager) MonitorPeerActivity(peerCfg lazyconn.PeerConfig) error {
 	return nil
 }
 
+// RefreshLazyEndpoint re-installs the lazy-bind fake-IP endpoint on the WG
+// peer for an already-monitored peer. Used when an external code path
+// (e.g., relay-conn establishment in worker_relay.go, or relay-disconnect
+// cleanup in handleRelayDisconnectedLocked) overrode the WG-peer endpoint
+// and we need to restore the lazy-bind activity-detection path so
+// subsequent outbound traffic re-triggers the manager.
+//
+// Phase 3.7k Followup (2026-05-27): without this refresh, bootstrap-state
+// (never-connected p2p-lazy remote) peers got stuck after a transient
+// relay-conn: lazy-bind activity-listener still alive in m.peers, but
+// WG-peer endpoint pointing at a closed relay-proxy or <nil>. Outbound
+// traffic from local user went to the broken endpoint, never hit
+// lazyConn.Write, activity-edge never fired, peer stayed in "Connecting"
+// forever (S21 → Lethbridge v0.53 / Elmira v0.51 production repro).
+//
+// Idempotent: no-op when no listener exists for the peer.
+func (m *Manager) RefreshLazyEndpoint(peerCfg lazyconn.PeerConfig) error {
+	m.mu.Lock()
+	listener, ok := m.peers[peerCfg.PeerConnID]
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	refresher, ok := listener.(interface{ refreshEndpoint() error })
+	if !ok {
+		// UDPListener (kernel mode) does not bind via ICEBind, so the
+		// endpoint can't be "stolen" by the relay-proxy path; no
+		// refresh needed.
+		return nil
+	}
+	return refresher.refreshEndpoint()
+}
+
 func (m *Manager) createListener(peerCfg lazyconn.PeerConfig) (listener, error) {
 	if !m.wgIface.IsUserspaceBind() {
 		return NewUDPListener(m.wgIface, peerCfg)

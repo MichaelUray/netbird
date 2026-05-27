@@ -96,6 +96,26 @@ func (d *BindListener) setupLazyConn() error {
 	return d.wgIface.UpdatePeer(d.peerCfg.PublicKey, d.peerCfg.AllowedIPs, 0, endpoint, nil)
 }
 
+// refreshEndpoint re-binds the fake-IP on the ICEBind and re-installs it
+// as the WG-peer endpoint. Used by activity.Manager.RefreshLazyEndpoint
+// to recover from an external path that overrode the WG-peer endpoint
+// (relay-proxy switch, then relay drop) and left the lazy-bind listener
+// orphaned.
+//
+// Reuses the existing lazyConn (no Close/recreate) so the running
+// ReadPackets goroutine continues to observe activity edges. Safe to
+// call concurrently with ReadPackets — bind.SetEndpoint and
+// wgIface.UpdatePeer are themselves idempotent.
+func (d *BindListener) refreshEndpoint() error {
+	d.bind.SetEndpoint(d.fakeIP, d.lazyConn)
+
+	endpoint := &net.UDPAddr{
+		IP:   d.fakeIP.AsSlice(),
+		Port: lazyBindPort,
+	}
+	return d.wgIface.UpdatePeer(d.peerCfg.PublicKey, d.peerCfg.AllowedIPs, 0, endpoint, nil)
+}
+
 // ReadPackets blocks until activity is detected on the LazyConn or the listener is closed.
 // The returned readResult tells the activity-manager whether it was a real
 // activity edge (readActivity) or a close/cancel-triggered exit (readClosed).
