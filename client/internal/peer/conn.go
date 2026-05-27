@@ -793,6 +793,38 @@ func (conn *Conn) handleRelayDisconnectedLocked() {
 	if err := conn.statusRecorder.UpdatePeerRelayedStateToDisconnected(peerState); err != nil {
 		conn.Log.Warnf("unable to save peer's state to Relay disconnected, got error: %v", err)
 	}
+
+	// Phase 3.7k stuck-state recovery: when the relay drops while the
+	// ICE worker is already in intentional-detach mode (remote/local
+	// GO_IDLE), the peer has no active path AND no activity listener
+	// armed. The Phase 3.7j guard would correctly skip offers under
+	// `intentionallyDetached=true` (assuming an activity edge will
+	// re-attach), but no such edge can fire while lazyconn has no
+	// fake-endpoint bind for this peer.
+	//
+	// Symptom (production-reproduced on dk20 against 80AFCAB57262 on
+	// 2026-05-27): peer stuck in "Status: Connecting, relay=Disconnected,
+	// ice=Disconnected" forever; guard logs "skip offer (ICE detached
+	// for inactivity, p2p-dynamic; will re-attach on real traffic)"
+	// every ~45s but no real traffic ever traverses the WG layer to
+	// trigger lazyconn. Manual `systemctl restart netbird` clears the
+	// state.
+	//
+	// Recovery: invoke the same callback the WG-handshake-timeout path
+	// uses (ConnMgr.RecoverPeerToIdle), which pushes the peer back into
+	// the lazy manager's activity-listening idle state. The next
+	// outbound packet then arms ICE via the lazyconn activity edge.
+	//
+	// Gated on IsIntentionallyDetached so normal mid-session relay
+	// drops (where the guard / ICE-state-disconnect path already
+	// handles recovery) remain untouched.
+	if conn.IsIntentionallyDetached() && conn.handshaker != nil && conn.handshaker.readICEListener() == nil {
+		cb := conn.onWGTimeoutRecover
+		if cb != nil {
+			conn.Log.Infof("relay disconnect while ICE intentionally-detached: pushing peer back to lazy-idle (activity listener will rearm)")
+			go cb()
+		}
+	}
 }
 
 // RemoteEffectiveMode is the public accessor used by ConnMgr.ActivatePeer
