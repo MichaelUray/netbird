@@ -107,25 +107,31 @@ func TestConn_OnGuardEvent_SkipOfferForRemoteLazy(t *testing.T) {
 	}
 	guardBody := extractFunctionBody(t, string(src), "onGuardEvent")
 	predicateBody := extractFunctionBody(t, string(src), "shouldSkipBootstrapOffer")
-	body := guardBody + "\n" + predicateBody
 
-	const modeCheck = "remoteEffectiveMode() == connectionmode.ModeP2PLazy"
-	const everConnectedGate = "!conn.everConnected.Load()"
+	// Phase 3.7k+ (2026-05-27): the predicate gates BOTH p2p-lazy and
+	// p2p-dynamic on the bootstrap (never-connected) path. The literal
+	// landmark is now the switch-case listing both modes.
+	const lazyMode = "ModeP2PLazy"
+	const dynamicMode = "ModeP2PDynamic"
+	const everConnectedGate = "conn.everConnected.Load()"
 	const skipTrace = "skip offer (remote peer is p2p-lazy"
 	const helperCall = "shouldSkipBootstrapOffer()"
-	if !strings.Contains(body, modeCheck) {
-		t.Fatalf("missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", modeCheck)
+	if !strings.Contains(predicateBody, lazyMode) {
+		t.Fatalf("missing %q — remote p2p-lazy gate is gone; eager bootstrap regressed", lazyMode)
+	}
+	if !strings.Contains(predicateBody, dynamicMode) {
+		t.Fatalf("missing %q — p2p-dynamic bootstrap gate is gone; app will eager-establish P2P to all peers on connect (2026-05-27 requirement)", dynamicMode)
 	}
 	// The everConnected gate is REQUIRED so the guard does not silently
 	// suppress recovery offers for peers that already had a tunnel and
 	// then lost it (relay reconnect, network change, daemon resume from
 	// standby). Without this, post-standby S26 was stuck with all legacy
 	// peers in idle/disconnected forever — 2026-05-17 regression.
-	if !strings.Contains(body, everConnectedGate) {
-		t.Fatalf("missing %q in p2p-lazy gate — recovery after relay/ICE reconnect will be silently suppressed for any peer that was once connected", everConnectedGate)
+	if !strings.Contains(predicateBody, everConnectedGate) {
+		t.Fatalf("missing %q in bootstrap gate — recovery after relay/ICE reconnect will be silently suppressed for any peer that was once connected", everConnectedGate)
 	}
 	if !strings.Contains(guardBody, skipTrace) {
-		t.Fatalf("onGuardEvent missing %q trace — remote p2p-lazy gate trace landmark is gone", skipTrace)
+		t.Fatalf("onGuardEvent missing %q trace — bootstrap gate trace landmark is gone", skipTrace)
 	}
 	if !strings.Contains(guardBody, helperCall) {
 		t.Fatalf("onGuardEvent must call %s -- predicate was bypassed", helperCall)

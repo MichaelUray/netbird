@@ -854,19 +854,58 @@ func (conn *Conn) remoteEffectiveMode() connectionmode.Mode {
 }
 
 // shouldSkipBootstrapOffer mirrors the gate at the top of onGuardEvent:
-// the guard must suppress the bootstrap offer ONLY when the remote
-// peer is resolved to p2p-lazy AND this Conn has never connected.
+// the guard must suppress the bootstrap offer when the remote peer is
+// resolved to p2p-lazy OR p2p-dynamic AND this Conn has never connected.
+//
 // For peers that WERE connected and then lost their relay/ICE path
-// (network change, signal/relay reconnect, daemon resume from
-// standby) the guard MUST still send recovery offers, otherwise the
-// tunnel stays cold forever -- see the 2026-05-17 S26 stuck-peer
-// incident.
+// (network change, signal/relay reconnect, daemon resume from standby)
+// the guard MUST still send recovery offers — the everConnected
+// short-circuit below guarantees that — otherwise the tunnel stays cold
+// forever (see the 2026-05-17 S26 stuck-peer incident).
+//
+// Phase 3.7k+ (2026-05-27): p2p-dynamic now also gates the BOOTSTRAP
+// offer. Rationale from the user-confirmed semantics:
+//
+//	p2p          = eager: connect to every peer at startup, stay on
+//	p2p-lazy     = strict: never connect until traffic
+//	p2p-dynamic  = lazy on bootstrap + active while traffic flows +
+//	               teardown on idle  <-- THIS is the change
+//
+// Previously p2p-dynamic fired a bootstrap offer per peer on the first
+// guard tick after startup, which signalled every remote out of its
+// lazy-idle state (ConnMgr.ActivatePeer on the receiving side) and
+// produced the "all peers go P2P immediately on app connect" burst —
+// dozens of ICE establishments with zero user traffic.
+//
+// With the gate, a freshly-connected p2p-dynamic client establishes a
+// peer connection ONLY when there is real traffic, from either side:
+//   - local user traffic  -> lazy-bind activity-listener fires ->
+//     lazyconn.Manager.onPeerActivity -> AttachICE + SendOffer
+//     (independent of this gate; see manager.onPeerActivity)
+//   - remote user traffic  -> remote's own activity edge makes it send
+//     us an offer -> engine signal-receive -> ConnMgr.ActivatePeer ->
+//     Open + AttachICE
+//
+// No bootstrap deadlock: the gate only suppresses the unsolicited
+// periodic guard tick. The two traffic-driven paths above remain fully
+// functional, and whichever side first sees traffic breaks the symmetry.
+//
+// Eager mode (ModeP2P) and relay-forced are unaffected — explicit
+// always-on opt-ins.
 //
 // Extracted into a method (Phase-3.7i v0.5) so the gate logic can be
 // behaviourally unit-tested without driving through the full
 // Handshaker + Signaler call chain.
 func (conn *Conn) shouldSkipBootstrapOffer() bool {
-	return conn.remoteEffectiveMode() == connectionmode.ModeP2PLazy && !conn.everConnected.Load()
+	if conn.everConnected.Load() {
+		return false
+	}
+	switch conn.remoteEffectiveMode() {
+	case connectionmode.ModeP2PLazy, connectionmode.ModeP2PDynamic:
+		return true
+	default:
+		return false
+	}
 }
 
 func (conn *Conn) onGuardEvent() {
@@ -895,7 +934,7 @@ func (conn *Conn) onGuardEvent() {
 	// this), and we still bootstrap when local user traffic triggers
 	// the local lazy manager (manager.onPeerActivity -> AttachICE).
 	if conn.shouldSkipBootstrapOffer() {
-		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy AND never connected; wait for remote OFFER or local activity)")
+		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy/p2p-dynamic AND never connected; wait for remote OFFER or local activity)")
 		return
 	}
 

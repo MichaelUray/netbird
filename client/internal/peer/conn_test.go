@@ -922,7 +922,16 @@ func TestConn_ShouldSkipBootstrapOffer(t *testing.T) {
 		{"fresh peer, remote unknown -> bootstrap fires", false, "", false, false},
 		{"fresh peer, remote p2p-lazy -> SKIP", false, "p2p-lazy", true, true},
 		{"recovered peer, remote p2p-lazy -> bootstrap fires (recovery)", true, "p2p-lazy", true, false},
-		{"fresh peer, remote p2p-dynamic -> bootstrap fires", false, "p2p-dynamic", true, false},
+		// Phase 3.7k+ (2026-05-27): fresh p2p-dynamic peers must ALSO skip
+		// the bootstrap offer. p2p-dynamic = lazy-on-bootstrap + dynamic
+		// teardown on idle. The connection is established only on real
+		// traffic (local activity edge OR remote-initiated offer), not by
+		// the periodic guard tick firing at startup. Prevents the
+		// "all peers go P2P immediately on app connect" burst.
+		{"fresh peer, remote p2p-dynamic -> SKIP", false, "p2p-dynamic", true, true},
+		// recovered p2p-dynamic still fires recovery offers (everConnected
+		// short-circuit) so reconnect after network change / relay drop works.
+		{"recovered peer, remote p2p-dynamic -> bootstrap fires (recovery)", true, "p2p-dynamic", true, false},
 		{"fresh peer, remote p2p -> bootstrap fires", false, "p2p", true, false},
 		{"fresh peer, remote relay-forced -> bootstrap fires", false, "relay-forced", true, false},
 	}
