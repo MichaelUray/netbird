@@ -230,6 +230,46 @@ func (w *WorkerICE) IsConnected() bool {
 	return w.agent != nil && w.lastKnownState == ice.ConnectionStateConnected
 }
 
+// IsRetrySafe returns true when the ICE agent is in a state where it is
+// safe to tear down the current listener / agent and start a fresh ICE
+// negotiation cycle. Concretely: NOT currently mid-connect (agentConnecting)
+// AND NOT already Connected. Phase 3.7k+ (Fix B for relay-activity
+// stale-listener-gate): used by Conn.AttachICEOnRelayActivity so a
+// user-traffic-triggered upgrade can re-attempt ICE when the previous
+// agent ended in Failed/Disconnected/Closed without waiting for the
+// p2p-dynamic idle-teardown window (~3 min) to clear the stale listener.
+//
+// State semantics:
+//
+//	agent == nil              -> retry-safe (no agent at all)
+//	agentConnecting == true   -> NOT retry-safe (would race in-flight connect)
+//	lastKnownState == Connected -> NOT retry-safe (already P2P, do not disturb)
+//	Failed/Disconnected/Closed -> retry-safe (stale, ok to recreate)
+//	Checking/New              -> NOT retry-safe (agent making progress)
+//
+// The Connected vs Checking/New distinction matters: agentConnecting flips
+// to false once `connect()` returns even if the state is still in
+// transition. Treating Checking/New as retry-safe would create a race
+// where the relay-activity path tears down a still-converging agent.
+func (w *WorkerICE) IsRetrySafe() bool {
+	w.muxAgent.Lock()
+	defer w.muxAgent.Unlock()
+	if w.agentConnecting {
+		return false
+	}
+	if w.agent == nil {
+		return true
+	}
+	switch w.lastKnownState {
+	case ice.ConnectionStateFailed,
+		ice.ConnectionStateDisconnected,
+		ice.ConnectionStateClosed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (w *WorkerICE) Close() {
 	w.muxAgent.Lock()
 	defer w.muxAgent.Unlock()

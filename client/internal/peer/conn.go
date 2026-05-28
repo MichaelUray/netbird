@@ -1477,9 +1477,30 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 		conn.mu.Unlock()
 		return false
 	}
-	if conn.handshaker == nil || conn.handshaker.readICEListener() != nil {
+	if conn.handshaker == nil {
 		conn.mu.Unlock()
 		return false
+	}
+	// Phase 3.7k+ (Fix B for stale-listener-gate): when the previous ICE
+	// agent ended in Failed/Disconnected/Closed without the listener being
+	// detached, the old `handshaker.readICEListener() != nil` blanket-reject
+	// left the peer on Relay until the p2p-dynamic idle-teardown (~3 min)
+	// finally cleared the listener. With WorkerICE.IsRetrySafe() we can
+	// distinguish "ICE actively working" from "ICE stale-attached" and
+	// release the stale state immediately on relay-activity so the user
+	// gets a P2P upgrade attempt without the 3-minute wait.
+	//
+	// Healthy / mid-connect ICE is still NOT disturbed:
+	//   - agentConnecting=true       -> would race in-flight connect
+	//   - lastKnownState=Connected   -> already P2P, no need to retry
+	//   - lastKnownState=Checking/New -> agent making progress
+	staleListener := false
+	if listener := conn.handshaker.readICEListener(); listener != nil {
+		if conn.workerICE == nil || !conn.workerICE.IsRetrySafe() {
+			conn.mu.Unlock()
+			return false
+		}
+		staleListener = true
 	}
 	if conn.iceBackoff != nil && conn.iceBackoff.IsSuspended() {
 		// Phase 3.7i (#5989), Codex review point 5 follow-up: activity-
@@ -1508,6 +1529,18 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	// All gates passed; release the lock before calling AttachICE
 	// because AttachICE re-acquires it.
 	conn.mu.Unlock()
+	// Fix B: if a stale listener was attached (ICE in Failed/Disconnected/
+	// Closed state), clear it first so AttachICE -> attachICEListenerLocked
+	// will install a fresh listener and trigger SendOffer. DetachICE is
+	// idempotent if there is nothing to clear, so the call is safe even if
+	// the state changed between the check and here.
+	if staleListener {
+		if err := conn.DetachICE(); err != nil {
+			conn.Log.Warnf("DetachICE on stale-listener relay-activity retry: %v", err)
+			return false
+		}
+		conn.Log.Debugf("relay-activity: cleared stale ICE listener before re-attach")
+	}
 	if err := conn.AttachICE(); err != nil {
 		conn.Log.Warnf("AttachICE on relay-activity: %v", err)
 		return false
