@@ -49,6 +49,12 @@ func (w *WorkerRelay) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 	if !w.isRelaySupported(remoteOfferAnswer) {
 		w.log.Infof("Relay is not supported by remote peer")
 		w.relaySupportedOnRemotePeer.Store(false)
+		// Fix-D D1: snapshot conn state so offline analysis can detect
+		// the stuck-state hypothesis (no Relay fallback AND ICE
+		// Failed/backed-off AND remote-lazy AND everConnected=false).
+		if w.conn != nil {
+			w.conn.logDiagSnapshot("relay-not-supported-by-remote")
+		}
 		return
 	}
 	w.relaySupportedOnRemotePeer.Store(true)

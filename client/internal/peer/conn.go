@@ -935,6 +935,7 @@ func (conn *Conn) onGuardEvent() {
 	// the local lazy manager (manager.onPeerActivity -> AttachICE).
 	if conn.shouldSkipBootstrapOffer() {
 		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy/p2p-dynamic AND never connected; wait for remote OFFER or local activity)")
+		conn.logDiagSnapshot("guard-skip-bootstrap-offer")
 		return
 	}
 
@@ -950,6 +951,7 @@ func (conn *Conn) onGuardEvent() {
 		if state, err := conn.statusRecorder.GetPeer(conn.config.Key); err == nil {
 			if state.RemoteServerLivenessKnown && !state.RemoteLiveOnline {
 				conn.Log.Tracef("guard: skip offer (remote peer offline, p2p-dynamic)")
+				conn.logDiagSnapshot("guard-skip-remote-offline")
 				return
 			}
 		}
@@ -979,6 +981,7 @@ func (conn *Conn) onGuardEvent() {
 			if state, err := conn.statusRecorder.GetPeer(conn.config.Key); err == nil {
 				if !state.IceBackoffSuspended && state.IceBackoffFailures == 0 {
 					conn.Log.Tracef("guard: skip offer (ICE detached for inactivity, p2p-dynamic; will re-attach on real traffic)")
+					conn.logDiagSnapshot("guard-skip-ice-detached-inactivity")
 					return
 				}
 			}
@@ -1037,6 +1040,7 @@ func (conn *Conn) onWGDisconnected() {
 			if conn.statusRecorder != nil {
 				conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, snap)
 			}
+			conn.logDiagSnapshot("markFailure-wg-handshake-timeout")
 		}
 	default:
 		conn.Log.Debugf("No active connection to close on WG timeout")
@@ -1466,18 +1470,22 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	conn.ClearIntentionallyDetached()
 	conn.mu.Lock()
 	if conn.config.Mode != connectionmode.ModeP2PDynamic {
+		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-mode-not-p2p-dynamic")
 		conn.mu.Unlock()
 		return false
 	}
 	if !conn.opened {
+		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-not-opened")
 		conn.mu.Unlock()
 		return false
 	}
 	if conn.currentConnPriority != conntype.Relay {
+		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-priority-not-relay")
 		conn.mu.Unlock()
 		return false
 	}
 	if conn.handshaker == nil {
+		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-no-handshaker")
 		conn.mu.Unlock()
 		return false
 	}
@@ -1497,6 +1505,7 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	staleListener := false
 	if listener := conn.handshaker.readICEListener(); listener != nil {
 		if conn.workerICE == nil || !conn.workerICE.IsRetrySafe() {
+			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-listener-not-retry-safe")
 			conn.mu.Unlock()
 			return false
 		}
@@ -1517,12 +1526,15 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 				conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, conn.iceBackoff.Snapshot())
 			}
 			conn.Log.Infof("ICE backoff override on relay-activity (1x per %s rate limit)", "5min")
+			conn.logDiagSnapshot("AttachICEOnRelayActivity-backoff-override-allowed")
 		} else {
+			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-backoff-override-cooldown")
 			conn.mu.Unlock()
 			return false
 		}
 	}
 	if !conn.everConnected.Load() {
+		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-never-connected")
 		conn.mu.Unlock()
 		return false
 	}
@@ -1619,6 +1631,7 @@ func (conn *Conn) AttachICE() error {
 		conn.Log.Debugf("ICE backoff active (failure #%d, retry at %s), staying on relay",
 			snap.Failures,
 			snap.NextRetry.Format("15:04:05"))
+		conn.logDiagSnapshot("AttachICE-blocked-backoff-suspended")
 		return nil
 	}
 	if conn.handshaker == nil {
@@ -1817,6 +1830,7 @@ func (conn *Conn) onICEFailed() {
 	if conn.statusRecorder != nil {
 		conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, snap)
 	}
+	conn.logDiagSnapshot("markFailure-on-ice-failed-" + failType)
 	// Tear down ICE. Idempotent. Conn stays on relay.
 	if err := conn.DetachICE(); err != nil {
 		conn.Log.Warnf("DetachICE after onICEFailed: %v", err)
