@@ -649,10 +649,20 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	// iceTimeout fired (D95820 ↔ w11-test1 hop reproduced 2026-05-05).
 	if bind := wgIface.GetBind(); bind != nil {
 		if rec := bind.ActivityRecorder(); rec != nil {
+			// Codex review-polish 2026-05-29: dispatch asynchronously.
+			// After Fix-D D2a the activity-recorder also fires from the
+			// WG send-goroutine (ICEBind.Send). Calling
+			// AttachICEOnRelayActivity inline can chain into conn.mu,
+			// handshaker.SendOffer (signal.Send), and DetachICE — any
+			// of which can block the WG send-path under contention.
+			// Decoupling via a goroutine keeps user-traffic strictly
+			// non-blocking from the control-plane.
 			rec.SetOnActivity(func(pubKey string) {
-				if conn, ok := e.peerStore.PeerConn(pubKey); ok {
-					conn.AttachICEOnRelayActivity()
+				conn, ok := e.peerStore.PeerConn(pubKey)
+				if !ok {
+					return
 				}
+				go conn.AttachICEOnRelayActivity()
 			})
 		}
 	}

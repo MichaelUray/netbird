@@ -198,6 +198,41 @@ func TestConn_AttachICEOnRemoteOffer_ListenerAttached_Blocks(t *testing.T) {
 	}
 }
 
+// TestConn_AttachICEOnRemoteOffer_CooldownClearedOnICESuccess is the
+// Codex review-polish 2026-05-29 contract: when ICE actually connects
+// after a successful bypass, onICEConnected must clear
+// lastRemoteOfferAttach so a subsequent failure within 60 s gets a
+// fresh bypass slot instead of being silenced by stale cooldown.
+func TestConn_AttachICEOnRemoteOffer_CooldownClearedOnICESuccess(t *testing.T) {
+	c := makeRemoteOfferConn(t)
+	c.iceBackoff.markFailure()
+	if err := c.AttachICEOnRemoteOffer(60 * time.Second); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if c.lastRemoteOfferAttach.IsZero() {
+		t.Fatal("precondition: lastRemoteOfferAttach must be set after bypass")
+	}
+
+	// Simulate ICE success.
+	c.onICEConnected()
+
+	if !c.lastRemoteOfferAttach.IsZero() {
+		t.Errorf("lastRemoteOfferAttach not cleared after onICEConnected: still %s",
+			c.lastRemoteOfferAttach.Format(time.StampMicro))
+	}
+
+	// Confirm a subsequent bypass within the cooldown window now goes
+	// through (because the stamp is back to zero).
+	c.handshaker.RemoveICEListener()
+	c.iceBackoff.markFailure()
+	if err := c.AttachICEOnRemoteOffer(60 * time.Second); err != nil {
+		t.Fatalf("post-success call: %v", err)
+	}
+	if c.lastRemoteOfferAttach.IsZero() {
+		t.Error("post-success bypass should have set lastRemoteOfferAttach again")
+	}
+}
+
 // TestConn_AttachICEOnRemoteOffer_NilHandshaker_Errors verifies the
 // error-path: no handshaker → caller gets an error so it can defer.
 func TestConn_AttachICEOnRemoteOffer_NilHandshaker_Errors(t *testing.T) {

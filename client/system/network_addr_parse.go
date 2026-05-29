@@ -12,6 +12,15 @@ import (
 // Kept in an OS-agnostic file so the Linux CI can unit-test it without
 // an Android build environment. Codex recommendation 2026-05-29.
 
+// maxAndroidReportedAddresses is the conservative cap on how many
+// distinct NetworkAddress entries Fix-A reports to the management
+// server. Codex review-polish 2026-05-29: Android can rotate IPv6
+// privacy/temporary addresses every few hours, so an uncapped report
+// could grow unboundedly over a long-running daemon session. 32 is
+// well above the realistic count (typical: 6-12 across WiFi + cellular
+// + virtual interfaces) and far below any practical concern.
+const maxAndroidReportedAddresses = 32
+
 // parseAndroidIFacesNetworkAddresses parses the newline-separated,
 // pipe-delimited interface description produced by
 // io.netbird.client.tool.IFaceDiscover.iFaces() (the Java side) and
@@ -22,13 +31,17 @@ import (
 //
 //	<name> <idx> <mtu> <up> <bcast> <loop> <p2p> <mcast>|<cidr1> <cidr2> ...
 //
-// Filter rules (Codex Fix-A):
+// Filter rules (Codex Fix-A + 2026-05-29 review-polish):
 //   - skip loopback (lo)
 //   - skip down interfaces
-//   - skip tun/wg (netbird's own overlay)
+//   - skip overlay interfaces (tun, wg, utun, ipsec, zt, tailscale,
+//     nordlynx) — these all carry encapsulated traffic and should not
+//     contribute to posture-check evaluation
 //   - skip empty / unparseable lines
 //   - skip IPv6 link-local (fe80::/10) and IPv4 169.254/16
 //   - drop CIDR entries with the special "%" zone-id suffix (link-scoped)
+//   - de-duplicate identical prefixes within a single call
+//   - cap output at maxAndroidReportedAddresses to bound memory growth
 //
 // MAC address is left blank — Android does not surface it through this
 // channel, and the iOS/Desktop paths already tolerate that.
@@ -36,6 +49,11 @@ func parseAndroidIFacesNetworkAddresses(raw string) []NetworkAddress {
 	if raw == "" {
 		return nil
 	}
+	// seen tracks already-emitted prefixes to dedupe across interfaces.
+	// Android often reports the same global IPv6 on multiple aliases
+	// (e.g. rmnet0 + rmnet_data0); the management server only needs
+	// to see each unique prefix once.
+	seen := make(map[string]struct{})
 	var out []NetworkAddress
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
@@ -78,28 +96,57 @@ func parseAndroidIFacesNetworkAddresses(raw string) []NetworkAddress {
 			if isLinkLocal(prefix.Addr()) {
 				continue
 			}
+			key := prefix.String()
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
 			out = append(out, NetworkAddress{
 				NetIP: prefix,
 			})
+			// Cap defence: stop adding entries once we hit the cap.
+			// We DON'T early-return because the outer loop's bookkeeping
+			// (dedupe map, malformed-line skip log) stays useful for
+			// diagnostic purposes; just stop appending.
+			if len(out) >= maxAndroidReportedAddresses {
+				log.Warnf("parseAndroidIFacesNetworkAddresses: capped at %d entries (more available; check IPv6 privacy-addr churn)",
+					maxAndroidReportedAddresses)
+				return out
+			}
 		}
 	}
 	return out
 }
 
+// overlayInterfacePrefixes lists name prefixes that identify
+// encapsulated / overlay interfaces. Anything matching is excluded from
+// the posture-check report because the addresses on these devices are
+// VPN-internal and would either pollute the report or create
+// posture-check loops (NetBird's own tun, other WG/Tailscale/ZeroTier
+// overlays, etc.).
+//
+// Codex review-polish 2026-05-29: extended beyond {tun, wg, lo} to also
+// cover utun (macOS-style), ipsec (Android StrongSwan/IPsec), zt
+// (ZeroTier), tailscale, nordlynx (NordVPN WG).
+var overlayInterfacePrefixes = []string{
+	"tun",
+	"wg",
+	"lo",
+	"utun",
+	"ipsec",
+	"zt",
+	"tailscale",
+	"nordlynx",
+}
+
 // isInterfaceFiltered returns true for interface names that should NOT
-// be reported to the management server.
-//
-//   - tun*    -> NetBird's own overlay
-//   - wg*     -> other WireGuard interfaces (loop concern)
-//   - lo*     -> loopback
-//
-// Other prefixes (wlan, rmnet, ccmni, eth, usb, dummy, ...) are kept.
+// be reported to the management server. See overlayInterfacePrefixes for
+// the rationale of each prefix.
 func isInterfaceFiltered(name string) bool {
 	if name == "" {
 		return true
 	}
-	prefixes := []string{"tun", "wg", "lo"}
-	for _, p := range prefixes {
+	for _, p := range overlayInterfacePrefixes {
 		if strings.HasPrefix(name, p) {
 			return true
 		}

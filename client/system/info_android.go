@@ -75,7 +75,12 @@ func androidNetworkAddresses(ctx context.Context) []NetworkAddress {
 		return nil
 	}
 	addrs := parseAndroidIFacesNetworkAddresses(raw)
-	log.Debugf("Fix-A: reported %d Android network address(es) to mgmt: %v", len(addrs), addrs)
+	// Privacy: only log the COUNT, never the actual prefixes. The
+	// addresses themselves include LAN and Cellular IPv6 information
+	// which is privacy-sensitive when an admin or aggregator reads
+	// device logs (e.g. crash dumps shared with support). Codex review
+	// 2026-05-29 — verbose debug-log dropped before upstream-merge.
+	log.Debugf("Fix-A: reporting %d Android network address(es) to mgmt", len(addrs))
 	return addrs
 }
 

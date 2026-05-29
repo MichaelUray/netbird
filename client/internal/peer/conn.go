@@ -1719,6 +1719,11 @@ func (conn *Conn) AttachICEUserInitiated(minCooldown time.Duration) error {
 				now.Sub(conn.lastUserInitiatedAttachICE).Round(time.Second),
 				minCooldown,
 				snap.Failures)
+			// Codex review-polish 2026-05-29: emit a source-labeled
+			// DIAG marker on the user-initiated cooldown-block so the
+			// AttachICESourceUserInitiated enum value is observable in
+			// offline analysis (previously this path had no [DIAG]).
+			conn.logDiagSnapshotDedup("AttachICEUserInitiated-blocked-cooldown-source-"+AttachICESourceUserInitiated.String(), diagDedupWindow)
 			return nil
 		}
 		// Outside cooldown: take a single bypass slot.
@@ -1989,6 +1994,20 @@ func (conn *Conn) onICEConnected() {
 	if conn.statusRecorder != nil {
 		conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, conn.iceBackoff.Snapshot())
 	}
+	// Codex review-polish 2026-05-29: clear the D3b remote-offer
+	// cooldown stamp on ICE-success. The cooldown exists to rate-limit
+	// bypass spam during chronic-failure windows; once ICE actually
+	// connects, the previous bypass-burn is done and a future ICE-drop
+	// (e.g. network change a minute later) should be allowed to bypass
+	// immediately rather than waiting out a stale 60 s window.
+	//
+	// Protected by conn.mu because lastRemoteOfferAttach is mutated
+	// under the same lock from AttachICEOnRemoteOffer. Use a short
+	// critical section to avoid contention with the WG transport hot
+	// path that may be unwinding the previous Relay session.
+	conn.mu.Lock()
+	conn.lastRemoteOfferAttach = time.Time{}
+	conn.mu.Unlock()
 }
 
 // initIceBackoffFromConfig (re-)initializes conn.iceBackoff from

@@ -174,9 +174,20 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	//
 	// Codex D2a recommendation (2026-05-29) — code-pointer
 	// client/iface/bind/ice_bind.go:159 + activity.go:98.
-	if len(bufs) > 0 && isTransportPkg(bufs, len(bufs[0])) {
-		if stdEp, isStd := ep.(*Endpoint); isStd {
-			b.activityRecorder.record(stdEp.AddrPort)
+	//
+	// Codex review-polish 2026-05-29: scan the FULL batch instead of
+	// only bufs[0]. WireGuard can batch handshake/keepalive packets
+	// alongside transport packets (GSO/UDP_SEGMENT, ROAM events). If
+	// bufs[0] is the handshake but bufs[1..N] are real payload, the
+	// activity edge would be lost. One record() per Send call is
+	// sufficient — saveFrequency=5s in the recorder already collapses
+	// per-burst spam.
+	if stdEp, isStd := ep.(*Endpoint); isStd {
+		for _, buf := range bufs {
+			if isTransportPkg([][]byte{buf}, len(buf)) {
+				b.activityRecorder.record(stdEp.AddrPort)
+				break
+			}
 		}
 	}
 
