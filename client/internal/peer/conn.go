@@ -1567,6 +1567,7 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 		conn.guard.NotifyPeerActivity()
 	}
 	conn.Log.Debugf("ICE re-attached on relay-activity (relay -> P2P upgrade attempt)")
+	conn.logDiagSnapshot("AttachICEOnRelayActivity-success-ice-reattached")
 	return true
 }
 
