@@ -1869,7 +1869,10 @@ func (e *Engine) receiveSignalEvents() {
 
 			msgType := msg.GetBody().GetType()
 			if msgType != sProto.Body_GO_IDLE {
-				e.connMgr.ActivatePeer(e.ctx, conn)
+				// Fix-D D3b: pass msgType so an OFFER can drive the
+				// one-shot backoff bypass; other types stay on the
+				// standard AttachICE path.
+				e.connMgr.ActivatePeerForMessage(e.ctx, conn, msgType)
 			}
 
 			switch msg.GetBody().Type {

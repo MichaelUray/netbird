@@ -180,6 +180,12 @@ type Conn struct {
 	// within minCooldown are rate-limited. Protected by conn.mu.
 	lastUserInitiatedAttachICE time.Time
 
+	// lastRemoteOfferAttach stamps the most recent successful
+	// AttachICEOnRemoteOffer bypass. Used by D3b's one-shot-per-cooldown
+	// gate so a flood of incoming OFFERs (legacy guard spam) cannot
+	// rapidly drain backoff bypass slots. Protected by conn.mu.
+	lastRemoteOfferAttach time.Time
+
 	// intentionallyDetached signals to the guard that the current ICE
 	// detached state is the result of a remote/local GO_IDLE or local
 	// inactivity timeout — not an ICE pair-check failure. The guard
@@ -1744,6 +1750,118 @@ func (conn *Conn) AttachICEUserInitiated(minCooldown time.Duration) error {
 
 	if err := conn.handshaker.SendOffer(); err != nil {
 		conn.Log.Warnf("AttachICEUserInitiated: SendOffer failed: %v", err)
+	}
+	return nil
+}
+
+// AttachICEOnRemoteOffer is the Fix-D D3b path: when a remote OFFER
+// arrives via signal and the local backoff is currently suspended, allow
+// ONE schedule-preserving ICE retry per minCooldown window. The intuition:
+// a remote-side OFFER is itself a "the other side wants to talk to you"
+// signal that's at least as strong as a local user-traffic edge, and the
+// chronic ICE failures that drove the backoff into suspension may have
+// nothing to do with that remote's current network state — give the
+// recovery one shot.
+//
+// Risk-control vs. the more permissive AttachICEUserInitiated:
+//   - mode MUST be p2p-dynamic (D2a/D2b paths are scoped here too)
+//   - handshaker.iceListener MUST be nil (no in-flight ICE to disturb)
+//   - rate-limited by minCooldown per Conn so an offer-storm from a
+//     buggy/legacy remote does not drain the backoff bypass slot every
+//     few seconds
+//   - schedule-preserving: uses markUserInitiatedRetry, never Reset(),
+//     so the long-term exponential schedule keeps growing for genuinely
+//     unreachable peers
+//
+// Codex D3b recommendation (2026-05-29).
+func (conn *Conn) AttachICEOnRemoteOffer(minCooldown time.Duration) error {
+	// Symmetric with the other Attach-paths: clear the intentional-detach
+	// marker since a remote OFFER is an explicit re-engage signal.
+	conn.ClearIntentionallyDetached()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if conn.config.Mode != connectionmode.ModeP2PDynamic {
+		// Not our mode, no bypass intended. Defer to the standard
+		// signal-driven AttachICE path.
+		return conn.attachICEFromLocked(AttachICESourceRemoteOffer)
+	}
+	if conn.handshaker == nil {
+		return fmt.Errorf("AttachICEOnRemoteOffer: handshaker not initialized (Open not called)")
+	}
+	if conn.workerICE == nil {
+		// Relay-forced mode: nothing to attach.
+		return fmt.Errorf("AttachICEOnRemoteOffer: workerICE is nil (relay-forced mode)")
+	}
+
+	// Gate 1: don't disturb in-flight ICE.
+	if conn.handshaker.readICEListener() != nil {
+		conn.logDiagSnapshotDedup("AttachICEOnRemoteOffer-blocked-listener-attached", diagDedupWindow)
+		return nil
+	}
+
+	// Gate 2: only useful when backoff is currently suspended. If it
+	// isn't, the standard signal-driven AttachICE path can run without
+	// any bypass.
+	if conn.iceBackoff == nil || !conn.iceBackoff.IsSuspended() {
+		return conn.attachICEFromLocked(AttachICESourceRemoteOffer)
+	}
+
+	// Gate 3: rate-limit one bypass per minCooldown window.
+	now := time.Now()
+	if !conn.lastRemoteOfferAttach.IsZero() && now.Sub(conn.lastRemoteOfferAttach) < minCooldown {
+		conn.logDiagSnapshotDedup("AttachICEOnRemoteOffer-blocked-cooldown", diagDedupWindow)
+		return nil
+	}
+
+	// Take the bypass: schedule-preserving (NOT Reset). markUserInitiated-
+	// Retry returns false if the backoff is no longer actually suspended
+	// (e.g. expired naturally between IsSuspended()==true above and now);
+	// in that case fall through to the normal attach path without
+	// consuming the cooldown slot.
+	if !conn.iceBackoff.markUserInitiatedRetry() {
+		return conn.attachICEFromLocked(AttachICESourceRemoteOffer)
+	}
+	conn.lastRemoteOfferAttach = now
+	conn.Log.Infof("ICE backoff active but remote OFFER triggers user-initiated bypass (schedule preserved)")
+	conn.logDiagSnapshot("AttachICEOnRemoteOffer-backoff-bypass-allowed")
+
+	if !conn.attachICEListenerLocked() {
+		return nil
+	}
+	if err := conn.handshaker.SendOffer(); err != nil {
+		conn.Log.Warnf("AttachICEOnRemoteOffer: SendOffer failed: %v", err)
+	}
+	return nil
+}
+
+// attachICEFromLocked is the locked-state core used by AttachICEOnRemoteOffer
+// to fall through to the normal attach path while the caller already holds
+// conn.mu. It mirrors the body of AttachICEFrom MINUS the
+// ClearIntentionallyDetached / mu.Lock prelude (already done by the caller).
+//
+// Returns nil on success (including the no-op cases: listener already
+// attached, backoff suspended without bypass).
+func (conn *Conn) attachICEFromLocked(src AttachICESource) error {
+	if conn.iceBackoff != nil && conn.iceBackoff.IsSuspended() {
+		snap := conn.iceBackoff.Snapshot()
+		conn.Log.Debugf("ICE backoff active (failure #%d, retry at %s), staying on relay",
+			snap.Failures,
+			snap.NextRetry.Format("15:04:05"))
+		conn.logDiagSnapshotDedup("AttachICE-blocked-backoff-suspended-source-"+src.String(), diagDedupWindow)
+		return nil
+	}
+	if conn.handshaker == nil {
+		return fmt.Errorf("AttachICEFromLocked: handshaker not initialized")
+	}
+	if conn.workerICE == nil {
+		return fmt.Errorf("AttachICEFromLocked: workerICE is nil")
+	}
+	if !conn.attachICEListenerLocked() {
+		return nil
+	}
+	if err := conn.handshaker.SendOffer(); err != nil {
+		conn.Log.Warnf("attachICEFromLocked: SendOffer failed: %v", err)
 	}
 	return nil
 }

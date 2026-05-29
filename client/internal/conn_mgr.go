@@ -17,6 +17,7 @@ import (
 	"github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/connectionmode"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
+	sProto "github.com/netbirdio/netbird/shared/signal/proto"
 )
 
 // ConnMgr coordinates both lazy connections (established on-demand) and permanent peer connections.
@@ -486,7 +487,35 @@ func (e *ConnMgr) RemovePeerConn(peerKey string) {
 	conn.Log.Infof("removed peer from lazy conn manager")
 }
 
+// remoteOfferBypassCooldown is the rate-limit window for D3b's
+// AttachICEOnRemoteOffer one-shot bypass. Chosen as 60 s: short enough
+// that a legitimate "remote came back online" event gets a quick retry,
+// long enough to absorb signal-server-driven offer storms from a buggy
+// or legacy peer without draining the bypass slot every few seconds.
+//
+// Codex D3b recommendation (2026-05-29).
+const remoteOfferBypassCooldown = 60 * time.Second
+
+// ActivatePeer is the legacy entry kept for callers without a msgType
+// context. Treats the activation as if it came from a non-OFFER signal
+// (the most conservative interpretation — no D3b bypass).
 func (e *ConnMgr) ActivatePeer(ctx context.Context, conn *peer.Conn) {
+	e.ActivatePeerForMessage(ctx, conn, sProto.Body_MODE)
+}
+
+// ActivatePeerForMessage is the source-labeled variant. msgType tells
+// us which signal payload triggered the activation; OFFER takes the
+// Fix-D D3b path (AttachICEOnRemoteOffer with backoff bypass), every
+// other type takes the standard signal-driven AttachICE path.
+//
+// Why differentiate: a remote OFFER carries semantic intent
+// ("I want to talk to you, please negotiate"), whereas other types
+// (ANSWER / CANDIDATE / MODE) are protocol continuations. A pending
+// backoff that suppresses retry on every type slows down legitimate
+// re-establishment by minutes; the OFFER-only bypass lets the chronic
+// retry-budget hold for ANSWER/CANDIDATE while still letting fresh
+// connection attempts through.
+func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, msgType sProto.Body_Type) {
 	if !e.isStartedWithLazyMgr() {
 		return
 	}
@@ -515,10 +544,19 @@ func (e *ConnMgr) ActivatePeer(ctx context.Context, conn *peer.Conn) {
 	// already attached) and honors iceBackoff.IsSuspended() so the
 	// failure-backoff is not bypassed.
 	if e.mode == connectionmode.ModeP2PDynamic {
-		// Fix-D D1.1: source-labeled so blocked-backoff DIAG markers
-		// can tell signal-driven retries apart from guard/lazy bursts.
-		if err := conn.AttachICEFrom(peer.AttachICESourceSignal); err != nil {
-			conn.Log.Warnf("AttachICE on signal activity: %v", err)
+		if msgType == sProto.Body_OFFER {
+			// Fix-D D3b: incoming OFFER takes the one-shot bypass path
+			// when backoff is suspended. Cooldown-rate-limited and
+			// schedule-preserving.
+			if err := conn.AttachICEOnRemoteOffer(remoteOfferBypassCooldown); err != nil {
+				conn.Log.Warnf("AttachICEOnRemoteOffer: %v", err)
+			}
+		} else {
+			// Fix-D D1.1: source-labeled so blocked-backoff DIAG markers
+			// can tell signal-driven retries apart from guard/lazy bursts.
+			if err := conn.AttachICEFrom(peer.AttachICESourceSignal); err != nil {
+				conn.Log.Warnf("AttachICE on signal activity: %v", err)
+			}
 		}
 	}
 }
