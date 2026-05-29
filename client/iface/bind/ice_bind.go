@@ -159,6 +159,27 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 		return b.StdNetBind.Send(bufs, ep)
 	}
 
+	// Phase 3.7l (Fix-D D2a): record outbound activity on the relay-send
+	// path. Without this, AttachICEOnRelayActivity never fires for user-
+	// initiated traffic — the activity-recorder only saw inbound (receive)
+	// edges, which never appear when a peer is chronically unreachable
+	// and stuck on Relay (no replies come back). User pings then never
+	// trigger an ICE-retry, leaving the peer permanently relay-only even
+	// when network conditions have changed and P2P would now succeed.
+	//
+	// Scope is limited to relay-endpoint sends (the `ok` branch — fake-IP
+	// 127.1.x.y lookups in b.endpoints) so direct ICE-pair UDP traffic is
+	// unaffected. isTransportPkg keeps WG handshake/keepalive frames out
+	// of the user-activity signal.
+	//
+	// Codex D2a recommendation (2026-05-29) — code-pointer
+	// client/iface/bind/ice_bind.go:159 + activity.go:98.
+	if len(bufs) > 0 && isTransportPkg(bufs, len(bufs[0])) {
+		if stdEp, isStd := ep.(*Endpoint); isStd {
+			b.activityRecorder.record(stdEp.AddrPort)
+		}
+	}
+
 	for _, buf := range bufs {
 		if _, err := conn.Write(buf); err != nil {
 			return err
