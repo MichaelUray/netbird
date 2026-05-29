@@ -11,6 +11,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/client/internal/lazyconn/activity"
 	"github.com/netbirdio/netbird/client/internal/lazyconn/inactivity"
+	"github.com/netbirdio/netbird/client/internal/peer"
 	peerid "github.com/netbirdio/netbird/client/internal/peer/id"
 	"github.com/netbirdio/netbird/client/internal/peerstore"
 	"github.com/netbirdio/netbird/route"
@@ -717,7 +718,10 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 
 	if conn, ok := m.peerStore.PeerConn(mp.peerCfg.PublicKey); ok {
 		conn.ResetIceBackoff()
-		if err := conn.AttachICE(); err != nil {
+		// Fix-D D1.1: source-labeled — lazy-mgr activity wake is the
+		// strongest local-traffic signal we have, distinct from
+		// signal-driven retries.
+		if err := conn.AttachICEFrom(peer.AttachICESourceLazyActivity); err != nil {
 			mp.peerCfg.Log.Warnf("AttachICE on activity wake: %v", err)
 		}
 		// Phase 3.7i (#5989), Codex review 2026-05-05: also reset the

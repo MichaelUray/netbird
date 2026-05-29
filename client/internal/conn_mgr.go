@@ -515,7 +515,9 @@ func (e *ConnMgr) ActivatePeer(ctx context.Context, conn *peer.Conn) {
 	// already attached) and honors iceBackoff.IsSuspended() so the
 	// failure-backoff is not bypassed.
 	if e.mode == connectionmode.ModeP2PDynamic {
-		if err := conn.AttachICE(); err != nil {
+		// Fix-D D1.1: source-labeled so blocked-backoff DIAG markers
+		// can tell signal-driven retries apart from guard/lazy bursts.
+		if err := conn.AttachICEFrom(peer.AttachICESourceSignal); err != nil {
 			conn.Log.Warnf("AttachICE on signal activity: %v", err)
 		}
 	}

@@ -164,6 +164,11 @@ type Conn struct {
 	// debug purpose
 	dumpState *stateDump
 
+	// diagLastEmit holds the time of the last [DIAG] line emitted for each
+	// reason. Used by logDiagSnapshotDedup to suppress burst-duplicates
+	// within diagDedupWindow. See conn_state_snapshot.go. Fix-D D1.1.
+	diagLastEmit sync.Map
+
 	endpointUpdater *EndpointUpdater
 
 	// Connection stage timestamps for metrics
@@ -1553,7 +1558,9 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 		}
 		conn.Log.Debugf("relay-activity: cleared stale ICE listener before re-attach")
 	}
-	if err := conn.AttachICE(); err != nil {
+	// Fix-D D1.1: source-labeled — this is the relay-activity recovery
+	// path (D2a-fed via ICEBind.Send activity recorder).
+	if err := conn.AttachICEFrom(AttachICESourceRelayActivity); err != nil {
 		conn.Log.Warnf("AttachICE on relay-activity: %v", err)
 		return false
 	}
@@ -1618,7 +1625,19 @@ func (conn *Conn) ResetIceBackoff() {
 //
 // Used by p2p-dynamic mode: workerICE is created in Open() but the
 // handshaker dispatch is deferred until traffic activity is seen.
+//
+// Backward-compatible wrapper around AttachICEFrom. New call sites
+// SHOULD use AttachICEFrom with an explicit source label so the
+// blocked-backoff DIAG marker can distinguish guard-driven, signal-
+// driven, lazy-activity and relay-activity retry storms.
 func (conn *Conn) AttachICE() error {
+	return conn.AttachICEFrom(AttachICESourceUnknown)
+}
+
+// AttachICEFrom is the source-labeled variant of AttachICE. The source
+// is recorded in the blocked-backoff DIAG marker for offline analysis
+// (Fix-D D1.1, Codex 2026-05-29).
+func (conn *Conn) AttachICEFrom(src AttachICESource) error {
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #1).
 	// Signal-driven ICE re-attach is the explicit counterpart to an
 	// intentional detach; once we re-attach the marker must not linger
@@ -1632,7 +1651,7 @@ func (conn *Conn) AttachICE() error {
 		conn.Log.Debugf("ICE backoff active (failure #%d, retry at %s), staying on relay",
 			snap.Failures,
 			snap.NextRetry.Format("15:04:05"))
-		conn.logDiagSnapshot("AttachICE-blocked-backoff-suspended")
+		conn.logDiagSnapshotDedup("AttachICE-blocked-backoff-suspended-source-"+src.String(), diagDedupWindow)
 		return nil
 	}
 	if conn.handshaker == nil {

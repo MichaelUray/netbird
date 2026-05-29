@@ -2,10 +2,25 @@ package peer
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	pionice "github.com/pion/ice/v4"
 )
+
+// diagDedupWindow is the minimum interval between two DIAG snapshot lines
+// for the SAME reason on the SAME peer. Live-D1 captures showed bursts
+// of 6+ identical "AttachICE-blocked-backoff-suspended" lines within
+// ~200 ms, all driven by independent recovery paths hammering against
+// the same backoff. The dedupe keeps the offline timeline readable
+// without losing event coverage — the first occurrence per window is
+// emitted, subsequent ones in the same window drop silently.
+//
+// 1 s is short enough that legitimate state-change cadences (guard
+// tick ≥ 30 s, lazy-mgr activity edge ≥ saveFrequency=5 s) are unaffected,
+// and long enough to absorb the natural micro-burst patterns seen in
+// the wild. Fix-D D1.1 (Codex 2026-05-29).
+const diagDedupWindow = 1 * time.Second
 
 // Phase 3.7l (Fix-D D1): per-peer state-snapshot helper for stuck-state
 // diagnosis.
@@ -187,3 +202,37 @@ func (conn *Conn) logDiagSnapshot(reason string) {
 	s := conn.snapshotForDiagnosis(reason)
 	conn.Log.Debugf("[DIAG] %s", s.String())
 }
+
+// logDiagSnapshotDedup emits the same one-line DIAG snapshot as
+// logDiagSnapshot, but only if the same reason has not been emitted on
+// this conn within the last `window`. Fix-D D1.1: lets us label every
+// blocked-backoff DIAG with its calling source (signal / guard / lazy-
+// activity / etc.) without flooding the log when multiple sources race
+// against the same backoff.
+//
+// The per-reason last-emit timestamp lives in conn.diagLastEmit
+// (lazy-initialised sync.Map). Memory cost is bounded by the small set
+// of distinct reason strings the code uses.
+func (conn *Conn) logDiagSnapshotDedup(reason string, window time.Duration) {
+	if window <= 0 {
+		conn.logDiagSnapshot(reason)
+		return
+	}
+	now := time.Now()
+	if v, loaded := conn.diagLastEmit.Load(reason); loaded {
+		if last, ok := v.(time.Time); ok && now.Sub(last) < window {
+			return
+		}
+	}
+	conn.diagLastEmit.Store(reason, now)
+	conn.logDiagSnapshot(reason)
+}
+
+// diagLastEmitMap is the per-Conn dedupe storage for logDiagSnapshotDedup.
+// Embedded as a sync.Map field on Conn (declared in conn.go) so it is
+// per-instance, not global.
+//
+// Declared here purely as documentation — the actual field declaration
+// lives on the Conn struct in conn.go to keep that struct's complete
+// field list in one place.
+var _ = sync.Map{}
