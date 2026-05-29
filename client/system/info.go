@@ -11,6 +11,60 @@ import (
 	"github.com/netbirdio/netbird/shared/management/proto"
 )
 
+// AndroidNetworkAddressProvider is the bridge through which the Android
+// daemon surfaces its local network-interface inventory to the
+// system.GetInfo() population path. Without this bridge the embedded
+// Go runtime's net.Interfaces() inside the VpnService sandbox returns
+// only the tun device (no wlan0 / rmnet*), and the management server's
+// posture-check `peer_network_range_check` cannot evaluate any real
+// LAN prefix → `action=deny` rules are silently bypassed (Fix-A scope).
+//
+// Reuses the existing IFaceDiscover.IFaces() format already maintained
+// by netbird-android/tool/.../IFaceDiscover.java for the ICE-candidate
+// gather path — same wire-format, same Java callsite, just a new
+// reader on the Go side. Fix-A Codex recommendation (2026-05-29).
+type AndroidNetworkAddressProvider interface {
+	// IFaces returns the same newline-separated, pipe-delimited
+	// interface description that ICE consumes:
+	//   name idx mtu up bcast loop p2p mcast|<cidr1> <cidr2> ...
+	IFaces() (string, error)
+}
+
+// androidNetworkAddressProviderCtxKey is the context-bag slot for
+// AndroidNetworkAddressProvider. Private so callers must use the
+// WithAndroidNetworkAddressProvider / androidNetworkAddressProviderFromContext
+// helpers.
+type androidNetworkAddressProviderCtxKey struct{}
+
+// WithAndroidNetworkAddressProvider attaches the bridge to ctx so that
+// info_android.go's GetInfo() can read it without taking a direct
+// dependency on the netbird/client/android package (which would create
+// an import cycle for non-android builds).
+func WithAndroidNetworkAddressProvider(ctx context.Context, p AndroidNetworkAddressProvider) context.Context {
+	if p == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, androidNetworkAddressProviderCtxKey{}, p)
+}
+
+// androidNetworkAddressProviderFromContext is the matched reader. Returns
+// nil + false when no provider has been attached (desktop / iOS builds,
+// or Android tests that don't wire one up).
+func androidNetworkAddressProviderFromContext(ctx context.Context) (AndroidNetworkAddressProvider, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	v := ctx.Value(androidNetworkAddressProviderCtxKey{})
+	if v == nil {
+		return nil, false
+	}
+	p, ok := v.(AndroidNetworkAddressProvider)
+	if !ok || p == nil {
+		return nil, false
+	}
+	return p, true
+}
+
 // DeviceNameCtxKey context key for device name
 const DeviceNameCtxKey = "deviceName"
 

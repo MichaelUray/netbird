@@ -138,6 +138,12 @@ func (c *Client) Run(platformFiles PlatformFiles, urlOpener URLOpener, isAndroid
 	ctxWithValues := context.WithValue(context.Background(), system.DeviceNameCtxKey, c.deviceName)
 	//nolint
 	ctxWithValues = context.WithValue(ctxWithValues, system.UiVersionCtxKey, c.uiVersion)
+	// Fix-A (2026-05-29): wire the same IFaceDiscover already consumed
+	// by ICE candidate gather into system.GetInfo() so meta_network_
+	// addresses on the mgmt server is no longer permanently empty on
+	// Android. Without this, posture-check peer_network_range_check
+	// action=deny rules silently fail open for every Android peer.
+	ctxWithValues = system.WithAndroidNetworkAddressProvider(ctxWithValues, c.iFaceDiscover)
 
 	c.ctxCancelLock.Lock()
 	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
@@ -180,6 +186,10 @@ func (c *Client) RunWithoutLogin(platformFiles PlatformFiles, dns *DNSList, dnsR
 	var ctx context.Context
 	//nolint
 	ctxWithValues := context.WithValue(context.Background(), system.DeviceNameCtxKey, c.deviceName)
+	// Fix-A (2026-05-29): same provider injection on the without-login
+	// boot path so a daemon-restart triggered by a phone reboot also
+	// reports its Android NICs to mgmt.
+	ctxWithValues = system.WithAndroidNetworkAddressProvider(ctxWithValues, c.iFaceDiscover)
 	c.ctxCancelLock.Lock()
 	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
 	defer c.ctxCancel()

@@ -46,7 +46,37 @@ func GetInfo(ctx context.Context) *Info {
 		SystemManufacturer: productManufacturer(),
 	}
 
+	// Fix-A (2026-05-29): populate NetworkAddresses from the
+	// Android-specific provider in ctx, if one was attached by
+	// client/android/client.go. Without this, meta_network_addresses
+	// on the mgmt server is permanently empty for Android peers and
+	// every posture-check peer_network_range_check with action=deny
+	// fails open. The provider reuses the same IFaceDiscover bridge
+	// the ICE-candidate-gather path already consumes.
+	gio.NetworkAddresses = androidNetworkAddresses(ctx)
+
 	return gio
+}
+
+// androidNetworkAddresses is the Fix-A bridge consumer. Returns nil
+// (no addresses, do not break the rest of Info population) if the
+// provider is missing or errors — the management server will simply
+// see an empty list, which is the pre-fix behaviour. Errors are
+// logged at WARN so a misconfigured Android build is visible without
+// hard-failing daemon startup.
+func androidNetworkAddresses(ctx context.Context) []NetworkAddress {
+	p, ok := androidNetworkAddressProviderFromContext(ctx)
+	if !ok || p == nil {
+		return nil
+	}
+	raw, err := p.IFaces()
+	if err != nil {
+		log.Warnf("Fix-A: AndroidNetworkAddressProvider.IFaces() failed: %v (meta_network_addresses will be empty)", err)
+		return nil
+	}
+	addrs := parseAndroidIFacesNetworkAddresses(raw)
+	log.Debugf("Fix-A: reported %d Android network address(es) to mgmt: %v", len(addrs), addrs)
+	return addrs
 }
 
 // checkFileAndProcess checks if the file path exists and if a process is running at that path.
