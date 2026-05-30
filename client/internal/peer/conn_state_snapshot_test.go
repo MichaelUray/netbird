@@ -284,6 +284,10 @@ func TestConn_SnapshotForDiagnosis_SrflxFieldsFormatted(t *testing.T) {
 		"srflx_same_failures=3",
 		// Format uses time.TimeOnly = "15:04:05"; stamp is 11:56:40 UTC.
 		"srflx_last_changed=11:56:40",
+		// srflx_stable_for_seconds is derived from now - lastChanged.
+		// Since `stamp` is way in the past (2026-05-30), the diff is
+		// a positive integer. Just assert the key is present.
+		"srflx_stable_for_seconds=",
 	} {
 		if !strings.Contains(str, must) {
 			t.Errorf("srflx fields missing %q\ngot: %s", must, str)
@@ -310,6 +314,10 @@ func TestConn_SnapshotForDiagnosis_SrflxNoneAndNeverWhenUntouched(t *testing.T) 
 		"srflx_local=none",
 		"srflx_same_failures=0",
 		"srflx_last_changed=never",
+		// Codex follow-up: untouched state surfaces -1 sentinel so
+		// offline tooling can distinguish "no observation possible"
+		// from "0 seconds stable".
+		"srflx_stable_for_seconds=-1",
 	} {
 		if !strings.Contains(str, must) {
 			t.Errorf("zero-srflx-state token missing %q\ngot: %s", must, str)
