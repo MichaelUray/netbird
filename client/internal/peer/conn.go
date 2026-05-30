@@ -198,6 +198,13 @@ type Conn struct {
 	// (AttachICE / AttachICEUserInitiated / AttachICEOnRelayActivity /
 	// ConnMgr.ActivatePeer pre-Open / onNetworkChange / onICEFailed).
 	intentionallyDetached atomic.Bool
+
+	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
+	// across consecutive ICE failures". Mutated under its own mutex
+	// from onICEFailed / onICEConnected; snapshot-read from
+	// snapshotForDiagnosis. See conn_srflx_state.go for the rationale
+	// (Codex 2026-05-30 stuck-srflx investigation).
+	srflxState srflxStateSync
 }
 
 // MarkIntentionallyDetached records that the current ICE detach is the
@@ -1973,6 +1980,18 @@ func (conn *Conn) onICEFailed() {
 	if conn.statusRecorder != nil {
 		conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, snap)
 	}
+
+	// Phase 3.7l Fix-D Phase 1: record this ICE failure against the
+	// current local srflx so snapshotForDiagnosis can surface "N
+	// consecutive failures with identical srflx port" in the DIAG line.
+	// Pure observation — no recovery action in Phase 1. workerICE may
+	// be nil in relay-forced mode; LastLocalSrflx is then the zero
+	// AddrPort, which the same-srflx logic treats as "still no public
+	// port observed" (itself a diagnostic signal).
+	if conn.workerICE != nil {
+		conn.srflxState.observeFailure(conn.workerICE.LastLocalSrflx(), time.Now())
+	}
+
 	conn.logDiagSnapshot("markFailure-on-ice-failed-" + failType)
 	// Tear down ICE. Idempotent. Conn stays on relay.
 	if err := conn.DetachICE(); err != nil {
@@ -1993,6 +2012,13 @@ func (conn *Conn) onICEConnected() {
 	conn.iceBackoff.markSuccess()
 	if conn.statusRecorder != nil {
 		conn.statusRecorder.UpdatePeerIceBackoff(conn.config.Key, conn.iceBackoff.Snapshot())
+	}
+
+	// Phase 3.7l Fix-D Phase 1: reset the stuck-srflx counter on every
+	// real ICE-Connected transition. A subsequent failure starts a
+	// fresh streak against the new local srflx.
+	if conn.workerICE != nil {
+		conn.srflxState.observeSuccess(conn.workerICE.LastLocalSrflx(), time.Now())
 	}
 	// Codex review-polish 2026-05-29: clear the D3b remote-offer
 	// cooldown stamp on ICE-success. The cooldown exists to rate-limit

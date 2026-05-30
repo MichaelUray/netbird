@@ -76,6 +76,17 @@ type stateSnapshot struct {
 	intentDetached bool
 	openedFlag     bool
 	wgIfaceUp      string
+
+	// Phase 3.7l Fix-D Phase 1 — stuck-srflx observation.
+	// srflxLocal is the last seen local server-reflexive AddrPort
+	// (formatted; "none" if pion has not yet surfaced a srflx
+	// candidate); srflxSameFailures is the count of consecutive ICE
+	// failures with that same AddrPort (1 on first failure, ++ on
+	// subsequent same-srflx failures, reset to 0 on ICE-Connected);
+	// srflxLastChanged is the timestamp of the last srflx change.
+	srflxLocal         string
+	srflxSameFailures  int
+	srflxLastChanged   string
 }
 
 func (s stateSnapshot) String() string {
@@ -84,7 +95,8 @@ func (s stateSnapshot) String() string {
 			"ice_state=%s ice_retry_safe=%v ice_in_progress=%v "+
 			"listener=%s backoff=[fail=%d,suspended=%v,next=%s] "+
 			"remote_relay_supported=%s intent_detached=%v opened=%v "+
-			"wg_iface=%s",
+			"wg_iface=%s "+
+			"srflx_local=%s srflx_same_failures=%d srflx_last_changed=%s",
 		s.reason, s.everConnected, s.priority,
 		s.modeLocal, s.modeRemote,
 		s.iceState, s.iceRetrySafe, s.iceInProgress,
@@ -92,6 +104,7 @@ func (s stateSnapshot) String() string {
 		s.backoffFail, s.backoffSuspend, s.backoffNext,
 		s.relaySupported, s.intentDetached, s.openedFlag,
 		s.wgIfaceUp,
+		s.srflxLocal, s.srflxSameFailures, s.srflxLastChanged,
 	)
 }
 
@@ -119,6 +132,23 @@ func (conn *Conn) snapshotForDiagnosis(reason string) stateSnapshot {
 		intentDetached: conn.IsIntentionallyDetached(),
 		openedFlag:     conn.opened,
 		wgIfaceUp:      "unknown",
+		srflxLocal:        "none",
+		srflxSameFailures: 0,
+		srflxLastChanged:  "never",
+	}
+
+	// Phase 3.7l Fix-D Phase 1: surface the stuck-srflx state. A
+	// "high samePortFailures with non-zero srflx" pattern is the
+	// signal Codex' 2026-05-30 investigation is looking for; a "high
+	// samePortFailures with srflx=invalid AddrPort" is the secondary
+	// pattern where pion never observes any public mapping at all.
+	srflx := conn.srflxState.snapshot()
+	if srflx.lastSrflx.IsValid() {
+		s.srflxLocal = srflx.lastSrflx.String()
+	}
+	s.srflxSameFailures = srflx.samePortFailures
+	if !srflx.lastChanged.IsZero() {
+		s.srflxLastChanged = srflx.lastChanged.Format(time.TimeOnly)
 	}
 
 	if conn.workerICE != nil {

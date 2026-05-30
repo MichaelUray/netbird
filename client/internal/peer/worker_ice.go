@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/ice/v4"
@@ -65,6 +66,20 @@ type WorkerICE struct {
 
 	// portForwardAttempted tracks if we've already tried port forwarding this session
 	portForwardAttempted bool
+
+	// lastLocalSrflx is the most recently discovered server-reflexive
+	// candidate's AddrPort. Recorded by onICECandidate when pion reports
+	// a CandidateTypeServerReflexive entry. Read by Conn's diagnostic
+	// snapshot to detect the "stuck-srflx" pattern (Codex review
+	// 2026-05-30): D3b/D2a recreate the agent on retry but the
+	// underlying UDP-Mux stays the same, so the srflx port keeps
+	// reappearing across retries unless something at NAT/VPN-level
+	// rebinds the socket. Tracking this is Phase 1 of the recovery
+	// path — pure observation, no behaviour change.
+	//
+	// Stored as atomic.Value of netip.AddrPort so cross-goroutine reads
+	// from snapshotForDiagnosis don't need muxAgent.
+	lastLocalSrflx atomic.Value // netip.AddrPort
 }
 
 func NewWorkerICE(ctx context.Context, log *log.Entry, config ConnConfig, conn *Conn, signaler *Signaler, ifaceDiscover stdnet.ExternalIFaceDiscover, statusRecorder *Status, hasRelayOnLocally bool) (*WorkerICE, error) {
@@ -151,6 +166,20 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 	if remoteOfferAnswer.SessionID != nil {
 		w.log.Debugf("recreate ICE agent: %s / %s", w.sessionID, *remoteOfferAnswer.SessionID)
 	}
+
+	// Phase 3.7l Fix-D Phase 1 — log the underlying UDP-Mux LocalAddr
+	// at every agent recreate so offline analysis can confirm Codex'
+	// 2026-05-30 hypothesis: the pion Agent is rebuilt on each
+	// retry, but the shared UDPMuxSrflx is NOT cycled, so the
+	// resulting srflx candidate keeps coming back with the same
+	// public port. Two consecutive [DIAG]-recreate lines on the same
+	// peer with identical mux_local_addr but a fresh agent instance
+	// is the smoking gun. Best-effort: muxLocalAddr returns "n/a" if
+	// the mux is not a UniversalUDPMuxDefault or its shared conn is
+	// not addressable.
+	w.log.Debugf("[DIAG] ice-agent-recreate mux_local_addr=%s prev_local_srflx=%s",
+		w.muxLocalAddrStr(), w.lastLocalSrflxOrNone())
+
 	dialerCtx, dialerCancel := context.WithCancel(w.ctx)
 	agent, err := w.reCreateAgent(dialerCancel, preferredCandidateTypes)
 	if err != nil {
@@ -447,8 +476,65 @@ func (w *WorkerICE) onICECandidate(candidate ice.Candidate) {
 	}()
 
 	if candidate.Type() == ice.CandidateTypeServerReflexive {
+		// Phase 3.7l Phase-1 srflx-tracking (Codex 2026-05-30):
+		// record the most recent srflx AddrPort so the per-peer
+		// diagnostic snapshot can compare it across retries and
+		// detect the "stuck-srflx" pattern (same Magenta-NAT port
+		// reappearing across N consecutive ICE failures). pion's
+		// ice.Candidate.Address() returns the dotted-string form.
+		if a, err := netip.ParseAddr(candidate.Address()); err == nil {
+			w.lastLocalSrflx.Store(netip.AddrPortFrom(a.Unmap(), uint16(candidate.Port())))
+		}
 		w.injectPortForwardedCandidate(candidate)
 	}
+}
+
+// muxLocalAddrStr returns the LocalAddr of the underlying
+// UniversalUDPMuxDefault.GetSharedConn() formatted as a string, or
+// "n/a" if the mux is missing / not the expected type / its shared
+// conn has no addressable local end. Phase-1 diagnostic helper; not
+// hot-path. See [DIAG] ice-agent-recreate.
+func (w *WorkerICE) muxLocalAddrStr() string {
+	mux, ok := w.config.ICEConfig.UDPMuxSrflx.(*udpmux.UniversalUDPMuxDefault)
+	if !ok {
+		return "n/a"
+	}
+	conn := mux.GetSharedConn()
+	if conn == nil {
+		return "n/a"
+	}
+	la := conn.LocalAddr()
+	if la == nil {
+		return "n/a"
+	}
+	return la.String()
+}
+
+// lastLocalSrflxOrNone is the string form of LastLocalSrflx with
+// "none" instead of a zero AddrPort. Diagnostic-only convenience.
+func (w *WorkerICE) lastLocalSrflxOrNone() string {
+	ap := w.LastLocalSrflx()
+	if !ap.IsValid() {
+		return "none"
+	}
+	return ap.String()
+}
+
+// LastLocalSrflx returns the AddrPort of the most recently discovered
+// server-reflexive candidate, or the zero value if none has been
+// observed yet. Phase 3.7l Phase-1 helper for Conn.snapshotForDiagnosis
+// (Codex 2026-05-30): "tracke pro Peer letzter srflx AddrPort". Safe
+// to call concurrently with onICECandidate (atomic.Value).
+func (w *WorkerICE) LastLocalSrflx() netip.AddrPort {
+	v := w.lastLocalSrflx.Load()
+	if v == nil {
+		return netip.AddrPort{}
+	}
+	ap, ok := v.(netip.AddrPort)
+	if !ok {
+		return netip.AddrPort{}
+	}
+	return ap
 }
 
 // injectPortForwardedCandidate signals an additional candidate using the pre-created port mapping.
