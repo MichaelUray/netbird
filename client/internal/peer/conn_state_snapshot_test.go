@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -251,5 +252,140 @@ func TestConn_SnapshotForDiagnosis_StuckStateSignature(t *testing.T) {
 		if !strings.Contains(str, must) {
 			t.Errorf("stuck-state signature missing %q\ngot: %s", must, str)
 		}
+	}
+}
+
+// TestConn_SnapshotForDiagnosis_SrflxFieldsFormatted verifies that the
+// three Phase-1 stuck-srflx fields land in the one-line DIAG string in
+// the expected key=value form. Codex 2026-05-30 polish — without this
+// test the wiring between Conn.srflxState and stateSnapshot.String()
+// is only covered indirectly by hardware logs.
+func TestConn_SnapshotForDiagnosis_SrflxFieldsFormatted(t *testing.T) {
+	c := &Conn{
+		Log: log.WithField("peer", "test"),
+		config: ConnConfig{
+			Mode: connectionmode.ModeP2PDynamic,
+		},
+		currentConnPriority: conntype.None,
+	}
+	// Seed the srflx state with a known stuck pattern: real public
+	// port, three same-port failures, lastChanged stamped at a fixed
+	// instant we can grep for in the formatted output.
+	ap := netip.MustParseAddrPort("41.66.90.21:32038")
+	stamp := time.Date(2026, 5, 30, 11, 56, 40, 0, time.UTC)
+	c.srflxState.observeFailure(ap, stamp)
+	c.srflxState.observeFailure(ap, stamp.Add(15*time.Second))
+	c.srflxState.observeFailure(ap, stamp.Add(30*time.Second))
+
+	str := c.snapshotForDiagnosis("srflx-format-test").String()
+
+	for _, must := range []string{
+		"srflx_local=41.66.90.21:32038",
+		"srflx_same_failures=3",
+		// Format uses time.TimeOnly = "15:04:05"; stamp is 11:56:40 UTC.
+		"srflx_last_changed=11:56:40",
+	} {
+		if !strings.Contains(str, must) {
+			t.Errorf("srflx fields missing %q\ngot: %s", must, str)
+		}
+	}
+}
+
+// TestConn_SnapshotForDiagnosis_SrflxNoneAndNeverWhenUntouched covers
+// the documented zero-state of stateSnapshot before any
+// observeFailure/observeSuccess call: the DIAG line must show
+// srflx_local=none and srflx_last_changed=never so offline tooling
+// can distinguish "never observed" from "stuck on a real port".
+func TestConn_SnapshotForDiagnosis_SrflxNoneAndNeverWhenUntouched(t *testing.T) {
+	c := &Conn{
+		Log: log.WithField("peer", "test"),
+		config: ConnConfig{
+			Mode: connectionmode.ModeP2PDynamic,
+		},
+		currentConnPriority: conntype.None,
+	}
+	str := c.snapshotForDiagnosis("srflx-zero-state").String()
+
+	for _, must := range []string{
+		"srflx_local=none",
+		"srflx_same_failures=0",
+		"srflx_last_changed=never",
+	} {
+		if !strings.Contains(str, must) {
+			t.Errorf("zero-srflx-state token missing %q\ngot: %s", must, str)
+		}
+	}
+}
+
+// TestConn_OnICEFailedIncrementsSrflxCounter verifies the wiring
+// between Conn.onICEFailed and Conn.srflxState. Codex 2026-05-30 Q5:
+// without this test the hook-up is only verified by source inspection
+// and end-to-end hardware capture, not at the unit level.
+//
+// The test seeds a known LastLocalSrflx via a hand-constructed
+// WorkerICE (we intentionally do NOT call Open() — that path requires
+// the full ICE/relay pipeline and is unrelated to the assertion).
+// onICEFailed then runs through its early-return-on-nil-backoff guard
+// via a real iceBackoff, hits the srflxState.observeFailure call, and
+// the counter must advance from 0 to 1 with lastSrflx == the seeded
+// value.
+func TestConn_OnICEFailedIncrementsSrflxCounter(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	// onICEFailed early-returns when iceBackoff == nil. Initialise it
+	// so the srflxState hook actually runs.
+	conn.iceBackoff = newIceBackoff(30 * time.Second)
+
+	// Seed a srflx value in a minimal WorkerICE. The Conn.workerICE !=
+	// nil branch is the path under test.
+	ap := netip.MustParseAddrPort("203.0.113.7:17692")
+	conn.workerICE = &WorkerICE{}
+	conn.workerICE.lastLocalSrflx.Store(ap)
+
+	if got := conn.srflxState.snapshot().samePortFailures; got != 0 {
+		t.Fatalf("pre-condition: samePortFailures=%d, want 0", got)
+	}
+
+	conn.onICEFailed()
+
+	snap := conn.srflxState.snapshot()
+	if snap.samePortFailures != 1 {
+		t.Errorf("samePortFailures after onICEFailed = %d, want 1",
+			snap.samePortFailures)
+	}
+	if snap.lastSrflx != ap {
+		t.Errorf("lastSrflx after onICEFailed = %v, want %v",
+			snap.lastSrflx, ap)
+	}
+}
+
+// TestConn_OnICEConnectedResetsSrflxCounter is the matching hook-
+// wiring assertion for the success path. Codex 2026-05-30 Q5 polish.
+func TestConn_OnICEConnectedResetsSrflxCounter(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	conn.iceBackoff = newIceBackoff(30 * time.Second)
+
+	ap := netip.MustParseAddrPort("203.0.113.7:17692")
+	conn.workerICE = &WorkerICE{}
+	conn.workerICE.lastLocalSrflx.Store(ap)
+
+	// Pre-seed a non-zero failure streak directly so we can observe the
+	// reset action.
+	conn.srflxState.observeFailure(ap, time.Now())
+	conn.srflxState.observeFailure(ap, time.Now())
+	if got := conn.srflxState.snapshot().samePortFailures; got != 2 {
+		t.Fatalf("pre-condition: samePortFailures=%d, want 2", got)
+	}
+
+	conn.onICEConnected()
+
+	snap := conn.srflxState.snapshot()
+	if snap.samePortFailures != 0 {
+		t.Errorf("samePortFailures after onICEConnected = %d, want 0",
+			snap.samePortFailures)
+	}
+	if snap.lastSrflx != ap {
+		t.Errorf("lastSrflx after onICEConnected = %v, want %v "+
+			"(success path records the current AddrPort)",
+			snap.lastSrflx, ap)
 	}
 }

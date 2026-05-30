@@ -54,6 +54,15 @@ type srflxFailureState struct {
 func (s *srflxFailureState) observeICEFailure(currentSrflx netip.AddrPort, now time.Time) {
 	if currentSrflx == s.lastSrflx {
 		s.samePortFailures++
+		// Codex review 2026-05-30 polish: on the very first observation
+		// (lastChanged still zero), stamp `now` even though we took the
+		// same-srflx branch. Without this the DIAG line shows
+		// `srflx_same_failures=1 srflx_last_changed=never`, which looks
+		// like a missing timestamp rather than the documented "first
+		// failure with zero AddrPort starts a same-streak" semantics.
+		if s.lastChanged.IsZero() {
+			s.lastChanged = now
+		}
 		return
 	}
 	s.lastSrflx = currentSrflx

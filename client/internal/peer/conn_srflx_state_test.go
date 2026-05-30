@@ -117,6 +117,37 @@ func TestSrflxFailureState_ZeroAddrPortBehaviour(t *testing.T) {
 	}
 }
 
+// TestSrflxFailureState_FirstZeroFailureStampsLastChanged covers the
+// Codex 2026-05-30 polish: the very first observation must stamp
+// lastChanged even when it takes the same-srflx branch (because both
+// the prior state and the current observation are the zero AddrPort).
+// Without the polish the DIAG line would surface
+// "srflx_same_failures=1 srflx_last_changed=never" on first failure
+// which looks like a missing timestamp rather than the documented
+// "no-srflx-observed-yet" semantics.
+func TestSrflxFailureState_FirstZeroFailureStampsLastChanged(t *testing.T) {
+	var s srflxFailureState
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+
+	s.observeICEFailure(netip.AddrPort{}, now)
+
+	if s.lastChanged.IsZero() {
+		t.Fatal("lastChanged must be set on first failure even with zero AddrPort (Q4 polish)")
+	}
+	if !s.lastChanged.Equal(now) {
+		t.Fatalf("lastChanged = %v, want %v", s.lastChanged, now)
+	}
+
+	// Subsequent same-zero failures must NOT bump lastChanged — only the
+	// very first observation does.
+	later := now.Add(30 * time.Second)
+	s.observeICEFailure(netip.AddrPort{}, later)
+	if !s.lastChanged.Equal(now) {
+		t.Fatalf("lastChanged drifted on later zero-same-streak failure; got %v want %v",
+			s.lastChanged, now)
+	}
+}
+
 // TestSrflxStateSync_ConcurrentAccess is a smoke test for the
 // per-Conn lock. 100 goroutines hammer failure+snapshot in parallel
 // against the same srflx; the final counter must equal the number of
