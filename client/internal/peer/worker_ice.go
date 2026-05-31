@@ -80,6 +80,27 @@ type WorkerICE struct {
 	// Stored as atomic.Value of netip.AddrPort so cross-goroutine reads
 	// from snapshotForDiagnosis don't need muxAgent.
 	lastLocalSrflx atomic.Value // netip.AddrPort
+
+	// Track C 2026-05-31: legacy-scoped Candidate-Replay state.
+	//
+	// All locally-gathered ICE candidates that we have sent (or attempted
+	// to send) over the Signaler are also appended to sentCandidates so
+	// MaybeReplayCandidates() can re-send them to legacy peers that
+	// suffer the v0.51.2 OnRemoteCandidate "agent==nil → drop" bug
+	// (see docs/test-reports/2026-05-31-elmira-ice-init-race-android-
+	// vs-legacy/ for the full investigation + Codex Plan v4 spec).
+	//
+	// The replayedThisSession bool is a per-session one-shot gate so
+	// repeated triggers (D3b-bypass-spam, OnRemoteOffer + OnRemoteAnswer
+	// both firing) only produce a single replay per session.
+	// replaySkippedAttempts counts how many additional triggers came in
+	// after the gate was consumed — purely diagnostic.
+	//
+	// Reset in reCreateAgent so a new session starts with a clean slate.
+	sentCandidatesMu      sync.Mutex
+	sentCandidates        []ice.Candidate
+	replayedThisSession   bool
+	replaySkippedAttempts int
 }
 
 func NewWorkerICE(ctx context.Context, log *log.Entry, config ConnConfig, conn *Conn, signaler *Signaler, ifaceDiscover stdnet.ExternalIFaceDiscover, statusRecorder *Status, hasRelayOnLocally bool) (*WorkerICE, error) {
@@ -318,6 +339,16 @@ func (w *WorkerICE) Close() {
 func (w *WorkerICE) reCreateAgent(dialerCancel context.CancelFunc, candidates []ice.CandidateType) (*icemaker.ThreadSafeAgent, error) {
 	w.portForwardAttempted = false
 
+	// Track C 2026-05-31: clear the sentCandidates ring AND reset the
+	// per-session replay-once gate on each new agent. Replay-Once is
+	// per-session, not per-peer-lifetime — a new ICE session must
+	// have a fresh chance to replay (Codex Plan v3+v4 review).
+	w.sentCandidatesMu.Lock()
+	w.sentCandidates = w.sentCandidates[:0]
+	w.replayedThisSession = false
+	w.replaySkippedAttempts = 0
+	w.sentCandidatesMu.Unlock()
+
 	agent, err := icemaker.NewAgent(w.ctx, w.iFaceDiscover, w.config.ICEConfig, candidates, w.localUfrag, w.localPwd)
 	if err != nil {
 		return nil, fmt.Errorf("create agent: %w", err)
@@ -468,12 +499,7 @@ func (w *WorkerICE) onICECandidate(candidate ice.Candidate) {
 
 	// TODO: reported port is incorrect for CandidateTypeHost, makes understanding ICE use via logs confusing as port is ignored
 	w.log.Debugf("discovered local candidate %s", candidate.String())
-	go func() {
-		err := w.signaler.SignalICECandidate(candidate, w.config.Key)
-		if err != nil {
-			w.log.Errorf("failed signaling candidate to the remote peer %s %s", w.config.Key, err)
-		}
-	}()
+	w.signalAndRemember(candidate)
 
 	if candidate.Type() == ice.CandidateTypeServerReflexive {
 		// Phase 3.7l Phase-1 srflx-tracking (Codex 2026-05-30):
@@ -566,11 +592,7 @@ func (w *WorkerICE) injectPortForwardedCandidate(srflxCandidate ice.Candidate) {
 	w.log.Debugf("injecting port-forwarded candidate: %s (mapping: %d -> %d via %s, priority: %d)",
 		forwardedCandidate.String(), mapping.InternalPort, mapping.ExternalPort, mapping.NATType, forwardedCandidate.Priority())
 
-	go func() {
-		if err := w.signaler.SignalICECandidate(forwardedCandidate, w.config.Key); err != nil {
-			w.log.Errorf("signal port-forwarded candidate: %v", err)
-		}
-	}()
+	w.signalAndRemember(forwardedCandidate)
 }
 
 // createForwardedCandidate creates a new server reflexive candidate with the forwarded port.
@@ -797,5 +819,118 @@ func selectedPriority(pair *ice.CandidatePair) conntype.ConnPriority {
 		return conntype.ICETurn
 	} else {
 		return conntype.ICEP2P
+	}
+}
+
+// signalAndRemember sends an ICE candidate to the remote peer via the
+// Signaler AND appends it to sentCandidates so a later
+// MaybeReplayCandidates call (for legacy peers running NetBird
+// v0.51.2 with the OnRemoteCandidate "agent==nil → drop" race) can
+// re-send it.
+//
+// Track C 2026-05-31 (Codex Plan v3+v4 review). All paths that
+// previously called w.signaler.SignalICECandidate directly
+// (onICECandidate and injectPortForwardedCandidate) must go through
+// this helper so the replay buffer is complete — otherwise
+// port-forwarded candidates would be missing from the replay set.
+//
+// Append happens BEFORE the async send: if the send fails, the
+// replay is our second chance to deliver this candidate. Gating
+// the append on send-success would lose us replays in the
+// fast-answer race.
+func (w *WorkerICE) signalAndRemember(candidate ice.Candidate) {
+	w.sentCandidatesMu.Lock()
+	w.sentCandidates = append(w.sentCandidates, candidate)
+	w.sentCandidatesMu.Unlock()
+
+	go func() {
+		if err := w.signaler.SignalICECandidate(candidate, w.config.Key); err != nil {
+			w.log.Errorf("failed signaling candidate to the remote peer %s %s", w.config.Key, err)
+		}
+	}()
+}
+
+// MaybeReplayCandidates re-sends previously gathered ICE candidates
+// to the remote peer if the peer runs a NetBird version known to
+// drop early-arriving candidates (the v0.51.2 ICE-Init-Race in
+// worker_ice.go OnRemoteCandidate, see
+// docs/test-reports/2026-05-31-elmira-ice-init-race-android-vs-
+// legacy/ for the full investigation).
+//
+// CRITICAL ORDERING (Codex Plan v3+v4 review):
+//
+//  1. Sleep FIRST. Both the snapshot AND the replayedThisSession
+//     gate must be read AFTER the delay, because the
+//     OnRemoteOffer-receiver-role path triggers a parallel
+//     Handshaker.Listen → WorkerICE.OnNewOffer → reCreateAgent
+//     that runs during the sleep. reCreateAgent clears BOTH
+//     sentCandidates AND replayedThisSession. If we read either
+//     pre-sleep, we'd see the previous session's state and either
+//     get an empty replay (snapshot) or a false "already replayed"
+//     (gate) and bail incorrectly.
+//
+//  2. Gate-AFTER-snapshot-validity. We only consume the
+//     "replayedThisSession=true" gate WHEN we actually have
+//     candidates to send. If the snapshot is empty (gather still
+//     slow, race on first OnRemoteOffer), we return with the gate
+//     untouched, so a later trigger in the same session can try
+//     again (Codex Plan v4: no-consume-on-empty).
+//
+//  3. The send goroutines fire AFTER we release the mutex so the
+//     caller's path is not blocked.
+//
+// The replay itself is idempotent on the receiver side (pion's
+// agent.AddRemoteCandidate dropping duplicates), so it is safe
+// even if a modern peer somehow ends up gated as legacy.
+func (w *WorkerICE) MaybeReplayCandidates(remoteVersion string) {
+	if !legacyCandidateReplayEnabled() {
+		return
+	}
+	if !isLegacyICECandidateRecv(remoteVersion) {
+		return
+	}
+
+	// Step 1: sleep FIRST, give reCreateAgent + gather() time to run
+	// if this trigger came via the OnRemoteOffer-receiver-role path.
+	time.Sleep(legacyCandidateReplayDelay())
+
+	// Step 2: gate-check AND snapshot under same lock, AFTER the sleep.
+	w.sentCandidatesMu.Lock()
+
+	if w.replayedThisSession {
+		w.replaySkippedAttempts++
+		skipped := w.replaySkippedAttempts
+		w.sentCandidatesMu.Unlock()
+		w.log.Debugf("[Track-C] replay skipped (already replayed this session, total skipped=%d) for peer %s",
+			skipped, w.config.Key)
+		return
+	}
+
+	snapshot := append([]ice.Candidate(nil), w.sentCandidates...)
+	if len(snapshot) == 0 {
+		// Empty snapshot — gather() has not produced candidates yet
+		// even after the sleep. Do NOT consume the
+		// replayedThisSession gate, so a later trigger in this same
+		// session still has a chance to replay.
+		w.sentCandidatesMu.Unlock()
+		w.log.Debugf("[Track-C] no candidates to replay for peer %s (remote version %s) — gather race?",
+			w.config.Key, remoteVersion)
+		return
+	}
+
+	// Only set the gate when we actually have something to send.
+	w.replayedThisSession = true
+	w.sentCandidatesMu.Unlock()
+
+	w.log.Debugf("[Track-C] replaying %d gathered candidates to legacy peer %s (remote version %s)",
+		len(snapshot), w.config.Key, remoteVersion)
+
+	for _, c := range snapshot {
+		c := c
+		go func() {
+			if err := w.signaler.SignalICECandidate(c, w.config.Key); err != nil {
+				w.log.Debugf("[Track-C] failed replaying candidate to %s: %s", w.config.Key, err)
+			}
+		}()
 	}
 }

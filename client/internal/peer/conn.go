@@ -447,6 +447,15 @@ func (conn *Conn) OnRemoteAnswer(answer OfferAnswer) {
 	conn.dumpState.RemoteAnswer()
 	conn.Log.Infof("OnRemoteAnswer, priority: %s, status ICE: %s, status relay: %s", conn.currentConnPriority, conn.statusICE, conn.statusRelay)
 	conn.handshaker.OnRemoteAnswer(answer)
+
+	// Track C 2026-05-31: legacy peer candidate replay (Codex Plan v4).
+	// Goroutine because MaybeReplayCandidates sleeps internally before
+	// taking the snapshot. We hook BOTH OnRemoteAnswer and
+	// OnRemoteOffer so the replay fires regardless of whether we are
+	// the offer-initiator or offer-receiver role.
+	if conn.workerICE != nil {
+		go conn.workerICE.MaybeReplayCandidates(answer.Version)
+	}
 }
 
 // OnRemoteCandidate Handles ICE connection Candidate provided by the remote peer.
@@ -486,6 +495,16 @@ func (conn *Conn) OnRemoteOffer(offer OfferAnswer) {
 	conn.dumpState.RemoteOffer()
 	conn.Log.Infof("OnRemoteOffer, on status ICE: %s, status Relay: %s", conn.statusICE, conn.statusRelay)
 	conn.handshaker.OnRemoteOffer(offer)
+
+	// Track C 2026-05-31: legacy peer candidate replay also fires when
+	// WE are the offer-receiver role. Codex Plan v3+v4 review pointed
+	// out that an OnRemoteAnswer-only hook would miss this path.
+	// The goroutine + internal sleep gives Handshaker.Listen time to
+	// process the offer (→ reCreateAgent → gather()) before the
+	// replay snapshot is taken.
+	if conn.workerICE != nil {
+		go conn.workerICE.MaybeReplayCandidates(offer.Version)
+	}
 }
 
 // WgConfig returns the WireGuard config

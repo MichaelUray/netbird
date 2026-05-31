@@ -20,7 +20,49 @@ const (
 
 	envEnableLazyConn      = "NB_ENABLE_EXPERIMENTAL_LAZY_CONN"
 	envInactivityThreshold = "NB_LAZY_CONN_INACTIVITY_THRESHOLD"
+
+	// Track C 2026-05-31: legacy candidate replay knobs.
+	envLegacyCandidateReplayEnabled = "NB_LEGACY_CANDIDATE_REPLAY"
+	envLegacyCandidateReplayDelayMs = "NB_LEGACY_CANDIDATE_REPLAY_DELAY_MS"
 )
+
+// legacyCandidateReplayEnabled reports whether the Track-C
+// legacy-scoped ICE-candidate-replay path is active. Default
+// ENABLED. Set NB_LEGACY_CANDIDATE_REPLAY=false (or "0") to disable.
+//
+// Codex Plan v3 review: On Android, env vars are sourced via the
+// EnvVarPackager which currently does not propagate user-set shell
+// env. So this knob is effectively only usable on Linux/Windows
+// builds OR if we later extend EnvVarPackager. The Android rollback
+// path is APK-revert to the previous build without Track-C.
+func legacyCandidateReplayEnabled() bool {
+	v := os.Getenv(envLegacyCandidateReplayEnabled)
+	if v == "" {
+		return true
+	}
+	return strings.EqualFold(v, "true") || v == "1"
+}
+
+// legacyCandidateReplayDelay returns the duration MaybeReplayCandidates
+// sleeps before reading the gate + snapshot. Default 300ms; clamped
+// to [0, 5000ms]. Override via NB_LEGACY_CANDIDATE_REPLAY_DELAY_MS.
+//
+// The delay needs to be long enough that, on the OnRemoteOffer-
+// receiver-role path, Handshaker.Listen has time to process the
+// offer (→ WorkerICE.OnNewOffer → reCreateAgent → gather()) so the
+// replay snapshot captures the freshly-gathered candidates. 300ms
+// is empirical-safe vs an observed Elmira race window of 100-200ms.
+func legacyCandidateReplayDelay() time.Duration {
+	v := os.Getenv(envLegacyCandidateReplayDelayMs)
+	if v == "" {
+		return 300 * time.Millisecond
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > 5000 {
+		return 300 * time.Millisecond
+	}
+	return time.Duration(n) * time.Millisecond
+}
 
 var deprecationOnce sync.Map // env-var name -> *sync.Once
 
