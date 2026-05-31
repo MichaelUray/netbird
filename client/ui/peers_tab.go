@@ -16,6 +16,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/proto"
 )
 
@@ -133,8 +134,16 @@ func (s *serviceClient) buildPeersTabContent(ctx context.Context) peersTabBundle
 // simultaneously (each row owns its own state). Phase 3.7i of #5989.
 func newPeerRow(p *proto.PeerState, showFull bool, mu *sync.Mutex, expanded map[string]bool) *fyne.Container {
 	pubkey := p.GetPubKey()
-	titleCollapsed := fmt.Sprintf("▶  %s   %s   %s", peerGlyph(p), peerHostnameShort(p), peerModeTag(p))
-	titleExpanded := fmt.Sprintf("▼  %s   %s   %s", peerGlyph(p), peerHostnameShort(p), peerModeTag(p))
+	// Row 1 (header button): glyph + hostname + optional Legacy-tag.
+	// Track-C follow-up (2026-05-31): mode-info moves to row 2 so the
+	// header stays uncluttered and the user can see the actual
+	// connection-type at a glance.
+	headerParts := []string{peerGlyph(p), peerHostnameShort(p)}
+	if tag := peerLegacyTag(p); tag != "" {
+		headerParts = append(headerParts, tag)
+	}
+	titleCollapsed := "▶  " + strings.Join(headerParts, "   ")
+	titleExpanded := "▼  " + strings.Join(headerParts, "   ")
 
 	mu.Lock()
 	startExpanded := expanded[pubkey]
@@ -150,6 +159,15 @@ func newPeerRow(p *proto.PeerState, showFull bool, mu *sync.Mutex, expanded map[
 
 	row := container.NewBorder(nil, nil, swatch, nil, header)
 	box := container.NewVBox(row)
+
+	// Row 2 (under the header, slightly indented): explicit
+	// "Connection: ... · Mode: ..." subtitle. Empty for Idle/Offline
+	// peers with no mode info, to avoid wasting vertical space.
+	if sub := peerConnectionLine(p); sub != "" {
+		subLabel := widget.NewLabel("       " + sub) // small indent to align under hostname
+		subLabel.TextStyle = fyne.TextStyle{Italic: true}
+		box.Add(subLabel)
+	}
 	var detail *widget.Label
 
 	addDetail := func() {
@@ -262,15 +280,69 @@ func peerHostnameShort(p *proto.PeerState) string {
 	return fqdn
 }
 
+// peerModeTag renders the effective connection-mode plus a short
+// human-readable reason when the effective and configured modes
+// differ. Track-C follow-up (2026-05-31): replaces the older raw
+// "! eff (cfg: ...)" form with a structured reason from the daemon
+// (proto.ModeReasonCode) so users see *why* a downgrade happened.
 func peerModeTag(p *proto.PeerState) string {
-	eff, cfg := p.GetEffectiveConnectionMode(), p.GetConfiguredConnectionMode()
+	eff := p.GetEffectiveConnectionMode()
 	if eff == "" {
 		return ""
 	}
-	if cfg != "" && cfg != eff {
-		return "! " + eff + " (cfg: " + cfg + ")"
+	switch p.GetModeReasonCode() {
+	case proto.ModeReasonCode_MODE_REASON_LEGACY_PEER:
+		return eff + " · downgraded (legacy peer)"
+	case proto.ModeReasonCode_MODE_REASON_SERVER_OVERRIDE:
+		return eff + " · downgraded (server policy)"
+	case proto.ModeReasonCode_MODE_REASON_UNKNOWN:
+		return eff + " · downgraded (reason unknown)"
 	}
 	return eff
+}
+
+// peerLegacyTag returns a short "[Legacy vX.Y.Z]" tag for peers
+// running an older NetBird version that pre-dates ICE-init-race +
+// mode-negotiation fixes. Returns "" for modern / dev / unknown
+// versions so callers can simply skip rendering.
+//
+// The tag exists because in v3 the older UI showed only a mysterious
+// "! p2p-lazy (cfg: p2p-dynamic)" indicator that users could not
+// distinguish from a connection error.
+func peerLegacyTag(p *proto.PeerState) string {
+	v := p.GetAgentVersion()
+	if v == "" || !peer.IsLegacyPeer(v) {
+		return ""
+	}
+	return "[Legacy v" + v + "]"
+}
+
+// peerConnectionLine returns the per-row second-line summary text the
+// new two-row peer layout displays underneath the hostname:
+//
+//	"Connection: P2P direct  ·  Mode: p2p-lazy · downgraded (legacy peer)"
+//
+// Empty connection or mode fields are simply omitted so the line stays
+// compact for Idle / Offline peers.
+func peerConnectionLine(p *proto.PeerState) string {
+	connType := p.GetConnectionTypeExtended()
+	if connType == "" && strings.EqualFold(p.GetConnStatus(), "connected") {
+		// Fallback for old daemons (no daemon-derived label)
+		if p.GetRelayed() {
+			connType = "Relayed"
+		} else {
+			connType = "P2P"
+		}
+	}
+	mode := peerModeTag(p)
+	parts := make([]string, 0, 2)
+	if connType != "" {
+		parts = append(parts, "Connection: "+connType)
+	}
+	if mode != "" {
+		parts = append(parts, "Mode: "+mode)
+	}
+	return strings.Join(parts, "  ·  ")
 }
 
 // buildPeerDetailText builds the per-peer detail text. Standard fields
@@ -290,9 +362,27 @@ func buildPeerDetailText(p *proto.PeerState, full bool) string {
 		connType += " (relayed)"
 	}
 	fmt.Fprintf(&sb, "Connection type:   %s\n", connType)
+	// Track-C follow-up (2026-05-31): explicit Agent-version + Legacy
+	// marker so users see WHY a downgrade happened. Empty when unknown.
+	if av := p.GetAgentVersion(); av != "" {
+		if peer.IsLegacyPeer(av) {
+			fmt.Fprintf(&sb, "Agent version:     %s  [Legacy]\n", av)
+		} else {
+			fmt.Fprintf(&sb, "Agent version:     %s\n", av)
+		}
+	}
 	fmt.Fprintf(&sb, "Effective mode:    %s\n", orDashStr(p.GetEffectiveConnectionMode()))
 	if p.GetEffectiveConnectionMode() != p.GetConfiguredConnectionMode() && p.GetConfiguredConnectionMode() != "" {
 		fmt.Fprintf(&sb, "Configured mode:   %s\n", orDashStr(p.GetConfiguredConnectionMode()))
+		// Track-C follow-up (2026-05-31): explain the mismatch.
+		switch p.GetModeReasonCode() {
+		case proto.ModeReasonCode_MODE_REASON_LEGACY_PEER:
+			sb.WriteString("Mode mismatch:     server downgraded — legacy peer\n")
+		case proto.ModeReasonCode_MODE_REASON_SERVER_OVERRIDE:
+			sb.WriteString("Mode mismatch:     server policy override\n")
+		case proto.ModeReasonCode_MODE_REASON_UNKNOWN:
+			sb.WriteString("Mode mismatch:     reason unknown\n")
+		}
 	}
 	if hs := p.GetLastWireguardHandshake(); hs != nil && hs.IsValid() {
 		fmt.Fprintf(&sb, "Last handshake:    %s\n", hs.AsTime().Format(time.RFC3339))
