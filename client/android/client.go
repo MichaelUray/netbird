@@ -353,8 +353,15 @@ func (c *Client) PeersList() *PeerInfoArray {
 			pi.IceBackoffNextRetry = p.IceBackoffNextRetry.Format(time.RFC3339)
 		}
 		pi.IceBackoffSuspended = p.IceBackoffSuspended
-		// AgentVersion / OsVersion: peer.State does not expose these fields;
-		// left empty until daemon surfaces them (future phase).
+		// Track-C follow-up (2026-05-31): AgentVersion is now surfaced
+		// via the RemoteMeta pipeline (mgmt-server -> RemoteMeta ->
+		// peer.State). ModeReasonCode is a daemon-derived enum value
+		// so Java doesn't re-implement the legacy-version parser.
+		pi.AgentVersion = p.AgentVersion
+		pi.IsLegacyPeer = peer.IsLegacyPeer(p.AgentVersion)
+		pi.ModeReasonCode = int32(peer.DeriveModeReasonCode(p))
+		// OsVersion: peer.State still does not expose this field; left
+		// empty until daemon surfaces it.
 
 		peerInfos[n] = pi
 	}

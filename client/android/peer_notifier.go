@@ -48,6 +48,21 @@ type PeerInfo struct {
 	IceBackoffFailures  int32
 	IceBackoffNextRetry string // RFC3339; "" if zero
 	IceBackoffSuspended bool
+
+	// Track-C follow-up (2026-05-31): UI Connection-Type / Legacy-tag
+	// metadata. IsLegacyPeer is computed daemon-side via the same
+	// ceiling Track-C uses for candidate-replay, so Java does NOT
+	// re-implement the version parser.
+	//
+	// ModeReasonCode mirrors the proto enum values verbatim:
+	//   0 = MODE_REASON_NONE           — kein Mismatch
+	//   1 = MODE_REASON_LEGACY_PEER    — server downgrade weil v<0.52
+	//   2 = MODE_REASON_SERVER_OVERRIDE — server policy override
+	//   3 = MODE_REASON_UNKNOWN        — Mismatch existiert, Grund unklar
+	// Java reads this as int and renders its own localized string per
+	// surface (no shared English label baked into the bridge).
+	IsLegacyPeer   bool
+	ModeReasonCode int32
 }
 
 func (p *PeerInfo) GetPeerRoutes() *PeerRoutes {
