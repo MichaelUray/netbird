@@ -143,6 +143,12 @@ type Conn struct {
 	// would incorrectly skip the initial offer because no ICE
 	// listener is attached YET.
 	everConnected atomic.Bool
+	// createdAt is the wall-clock time at NewConn() — used by
+	// shouldSkipBootstrapOffer's grace-period gate. After ~30s of
+	// guard-firing without OFFER from remote, we MUST send one even
+	// when both sides are lazy (otherwise: never-connected lazy peer
+	// pairs cold-boot deadlock — observed 2026-05-31).
+	createdAt time.Time
 
 	workerICE   *WorkerICE
 	workerRelay *WorkerRelay
@@ -263,6 +269,7 @@ func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
 		endpointUpdater:    NewEndpointUpdater(connLog, config.WgConfig, isController(config)),
 		wgWatcher:          NewWGWatcher(connLog, config.WgConfig.WgInterface, config.Key, dumpState),
 		metricsRecorder:    services.MetricsRecorder,
+		createdAt:          time.Now(),
 	}
 
 	return conn, nil
@@ -937,6 +944,18 @@ func (conn *Conn) shouldSkipBootstrapOffer() bool {
 	if conn.everConnected.Load() {
 		return false
 	}
+	// Bug-fix 2026-05-31: cold-boot-deadlock-guard. Both endpoints
+	// lazy + neither ever connected + neither has user-traffic →
+	// nobody sends OFFER ever. After 30s grace, force-send one
+	// Bootstrap-Offer anyway. The remote will receive it (lazy mgr
+	// wakes on incoming OFFER), respond, and the normal flow resumes.
+	//
+	// Without this guard, dk20 + Elmira-peer never connected over
+	// 6+ hours despite mgmt+signal+relay all healthy. The original
+	// Phase-37k commit f433f1b42 missed this case.
+	if !conn.createdAt.IsZero() && time.Since(conn.createdAt) > 30*time.Second {
+		return false
+	}
 	switch conn.remoteEffectiveMode() {
 	case connectionmode.ModeP2PLazy, connectionmode.ModeP2PDynamic:
 		return true
@@ -987,9 +1006,21 @@ func (conn *Conn) onGuardEvent() {
 	if conn.config.Mode == connectionmode.ModeP2PDynamic {
 		if state, err := conn.statusRecorder.GetPeer(conn.config.Key); err == nil {
 			if state.RemoteServerLivenessKnown && !state.RemoteLiveOnline {
-				conn.Log.Tracef("guard: skip offer (remote peer offline, p2p-dynamic)")
-				conn.logDiagSnapshot("guard-skip-remote-offline")
-				return
+				// Bug-fix 2026-05-31: cold-boot-deadlock. If never-
+				// connected + mgmt-server marked remote as offline at
+				// boot, after 30s grace we MUST try Bootstrap-Offer
+				// anyway. The mgmt-online-flag can be stale (Elmira
+				// observed: WAN-port reachable but mgmt-tunnel
+				// briefly down). Without this fallback, peer pair
+				// stays cold forever.
+				neverConnected := !conn.everConnected.Load()
+				graceExpired := !conn.createdAt.IsZero() && time.Since(conn.createdAt) > 30*time.Second
+				if !(neverConnected && graceExpired) {
+					conn.Log.Tracef("guard: skip offer (remote peer offline, p2p-dynamic)")
+					conn.logDiagSnapshot("guard-skip-remote-offline")
+					return
+				}
+				conn.Log.Tracef("guard: remote-offline grace expired, sending bootstrap-offer anyway")
 			}
 		}
 		// Codex hardening audit: also skip when the guard is firing
