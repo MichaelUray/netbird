@@ -105,6 +105,16 @@ type State struct {
 	// LastSeenAtServer-zero heuristic; new servers set it true so the
 	// counter trusts RemoteLiveOnline directly.
 	RemoteServerLivenessKnown bool
+	// AgentVersion is the remote peer's NetBird agent version as
+	// reported by the management server via RemotePeerConfig.AgentVersion,
+	// mirrored here through UpdatePeerRemoteMeta. Empty until the first
+	// mgmt-server peer-config sync arrives. UIs combine this with
+	// IsLegacyPeer() to render a [Legacy] tag for peers <0.52 that
+	// pre-date the ICE-init-race fix and other compatibility hardening.
+	//
+	// Monotone: an empty value from a later mgmt-sync never overwrites
+	// a known version (see UpdatePeerRemoteMeta — partial-sync guard).
+	AgentVersion string
 }
 
 // AddRoute add a single route to routes map
@@ -503,6 +513,14 @@ type RemoteMeta struct {
 	LastSeenAtServer           time.Time
 	LiveOnline                 bool
 	ServerLivenessKnown        bool
+	// AgentVersion: peer's reported NetBird agent version
+	// (e.g. "0.51.2", "0.68.0-dev-trackc-abc"). Used by UIs for the
+	// [Legacy] tag and by daemon-side DeriveModeReasonCode().
+	//
+	// Special handling in UpdatePeerRemoteMeta: an empty value is
+	// treated as "no information this round" and does NOT overwrite a
+	// previously-known version (partial-sync guard).
+	AgentVersion string
 }
 
 // UpdatePeerRemoteMeta sets the RemotePeerConfig-derived fields on the
@@ -536,6 +554,13 @@ func (d *Status) UpdatePeerRemoteMeta(pubKey string, meta RemoteMeta) error {
 		st.RemoteLastSeenAtServer = meta.LastSeenAtServer
 		st.RemoteLiveOnline = meta.LiveOnline
 		st.RemoteServerLivenessKnown = meta.ServerLivenessKnown
+		// AgentVersion is monotone: empty meta value never erases a
+		// previously-known version (partial-sync guard). Notify on
+		// actual change so UIs refresh the [Legacy] tag promptly.
+		if meta.AgentVersion != "" && st.AgentVersion != meta.AgentVersion {
+			st.AgentVersion = meta.AgentVersion
+			notify = true
+		}
 		d.peers[pubKey] = st
 		if notify {
 			d.notifyPeerListChanged()
@@ -560,6 +585,11 @@ func (d *Status) UpdatePeerRemoteMeta(pubKey string, meta RemoteMeta) error {
 			d.offlinePeers[i].RemoteLastSeenAtServer = meta.LastSeenAtServer
 			d.offlinePeers[i].RemoteLiveOnline = meta.LiveOnline
 			d.offlinePeers[i].RemoteServerLivenessKnown = meta.ServerLivenessKnown
+			// AgentVersion is monotone: see online-path comment above.
+			if meta.AgentVersion != "" && d.offlinePeers[i].AgentVersion != meta.AgentVersion {
+				d.offlinePeers[i].AgentVersion = meta.AgentVersion
+				notify = true
+			}
 			if notify {
 				d.notifyPeerListChanged()
 			}
