@@ -1790,6 +1790,10 @@ func (fs FullStatus) ToProto() *proto.FullStatus {
 			ConfiguredP2PTimeoutSecs:   peerState.RemoteConfiguredP2PTimeoutSecs,
 			ConfiguredP2PRetryMaxSecs:  peerState.RemoteConfiguredP2PRetryMaxSecs,
 			ConnectionTypeExtended:     DeriveConnectionTypeExtended(peerState),
+			// Track-C follow-up (2026-05-31): legacy-peer + mode-mismatch
+			// metadata for the UI [Legacy] tag and downgrade reason.
+			AgentVersion:   peerState.AgentVersion,
+			ModeReasonCode: DeriveModeReasonCode(peerState),
 		}
 		if !peerState.RemoteLastSeenAtServer.IsZero() {
 			pbPeerState.LastSeenAtServer = timestamppb.New(peerState.RemoteLastSeenAtServer)

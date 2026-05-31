@@ -77,6 +77,18 @@ type PeerStateDetailOutput struct {
 	IceBackoffFailures  int       `json:"iceBackoffFailures" yaml:"iceBackoffFailures"`
 	IceBackoffNextRetry time.Time `json:"iceBackoffNextRetry" yaml:"iceBackoffNextRetry"`
 	IceBackoffSuspended bool      `json:"iceBackoffSuspended" yaml:"iceBackoffSuspended"`
+	// Track-C follow-up (2026-05-31): UI Connection-Type + Legacy-tag
+	// fields. ConnType above is also populated from
+	// ConnectionTypeExtended when available, so old consumers keep
+	// working while new consumers get the richer signal here.
+	ConnectionTypeExtended   string `json:"connectionTypeExtended,omitempty" yaml:"connectionTypeExtended,omitempty"`
+	AgentVersion             string `json:"agentVersion,omitempty" yaml:"agentVersion,omitempty"`
+	IsLegacyPeer             bool   `json:"isLegacyPeer,omitempty" yaml:"isLegacyPeer,omitempty"`
+	EffectiveConnectionMode  string `json:"effectiveConnectionMode,omitempty" yaml:"effectiveConnectionMode,omitempty"`
+	ConfiguredConnectionMode string `json:"configuredConnectionMode,omitempty" yaml:"configuredConnectionMode,omitempty"`
+	// ModeReason is the stable string form of the proto enum:
+	// "" (omitted) | "legacy_peer" | "server_override" | "unknown"
+	ModeReason string `json:"modeReason,omitempty" yaml:"modeReason,omitempty"`
 }
 
 type PeersStateOutput struct {
@@ -295,7 +307,14 @@ func mapPeers(
 
 		isPeerConnected := pbPeerState.ConnStatus == peer.StatusConnected.String()
 
-		if isPeerConnected {
+		// Track-C follow-up (2026-05-31, Codex v3.1 P2): prefer the
+		// daemon-derived extended label so transient
+		// "Relayed (negotiating P2P)" windows are visible in CLI too.
+		// Fall back to the (relayed bool)-based heuristic for old
+		// daemons that don't populate ConnectionTypeExtended.
+		if ext := pbPeerState.GetConnectionTypeExtended(); ext != "" {
+			connType = ext
+		} else if isPeerConnected {
 			connType = "P2P"
 			if pbPeerState.Relayed {
 				connType = "Relayed"
@@ -344,6 +363,16 @@ func mapPeers(
 			IceBackoffFailures:     int(pbPeerState.GetIceBackoffFailures()),
 			IceBackoffNextRetry:    iceBackoffNextRetry(pbPeerState),
 			IceBackoffSuspended:    pbPeerState.GetIceBackoffSuspended(),
+			// Track-C follow-up (2026-05-31): UI Connection-Type +
+			// Legacy-tag fields surfaced from proto. ConnType above
+			// already prefers ConnectionTypeExtended; we additionally
+			// expose the raw value here for richer JSON consumers.
+			ConnectionTypeExtended:   pbPeerState.GetConnectionTypeExtended(),
+			AgentVersion:             pbPeerState.GetAgentVersion(),
+			IsLegacyPeer:             peer.IsLegacyPeer(pbPeerState.GetAgentVersion()),
+			EffectiveConnectionMode:  pbPeerState.GetEffectiveConnectionMode(),
+			ConfiguredConnectionMode: pbPeerState.GetConfiguredConnectionMode(),
+			ModeReason:               peer.ModeReasonCodeString(pbPeerState.GetModeReasonCode()),
 		}
 
 		peersStateDetail = append(peersStateDetail, peerState)
