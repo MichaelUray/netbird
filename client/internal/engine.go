@@ -1561,20 +1561,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 				prevLiveOnline = prev.RemoteLiveOnline
 				prevLivenessKnown = prev.RemoteServerLivenessKnown
 			}
-			if err := e.statusRecorder.UpdatePeerRemoteMeta(pubKey, peer.RemoteMeta{
-				EffectiveConnectionMode:    rp.GetEffectiveConnectionMode(),
-				EffectiveRelayTimeoutSecs:  rp.GetEffectiveRelayTimeoutSecs(),
-				EffectiveP2PTimeoutSecs:    rp.GetEffectiveP2PTimeoutSecs(),
-				EffectiveP2PRetryMaxSecs:   rp.GetEffectiveP2PRetryMaxSecs(),
-				ConfiguredConnectionMode:   rp.GetConfiguredConnectionMode(),
-				ConfiguredRelayTimeoutSecs: rp.GetConfiguredRelayTimeoutSecs(),
-				ConfiguredP2PTimeoutSecs:   rp.GetConfiguredP2PTimeoutSecs(),
-				ConfiguredP2PRetryMaxSecs:  rp.GetConfiguredP2PRetryMaxSecs(),
-				Groups:                     rp.GetGroups(),
-				LastSeenAtServer:           peer.TimestampOrZero(rp.GetLastSeenAtServer()),
-				LiveOnline:                 liveOnline,
-				ServerLivenessKnown:        livenessKnown,
-			}); err != nil {
+			if err := e.statusRecorder.UpdatePeerRemoteMeta(pubKey, buildRemoteMeta(rp)); err != nil {
 				log.Debugf("UpdatePeerRemoteMeta(%s): %v", pubKey, err)
 			}
 			// Transition true->false (under a phase-3.7i+ mgmt that
