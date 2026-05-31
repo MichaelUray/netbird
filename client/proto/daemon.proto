@@ -394,6 +394,31 @@ message PeerState {
   // (relayed, ice_*) themselves -- keeps the transition window
   // visualization consistent across all clients.
   string connection_type_extended                       = 41;
+
+  // Track-C follow-up (2026-05-31): NetBird agent version reported by
+  // the management server for this peer (RemotePeerConfig.AgentVersion,
+  // mirrored via RemoteMeta). Empty if not yet synced or unknown. UIs
+  // combine this with a legacy-detection helper to render a [Legacy]
+  // tag for peers <0.52 that pre-date the ICE-init-race fix and other
+  // compatibility hardening.
+  string agent_version                                  = 42;
+
+  // Track-C follow-up (2026-05-31): Daemon-derived reason for the
+  // EffectiveConnectionMode / ConfiguredConnectionMode mismatch. UIs
+  // render their own localized string per code; NONE means modes match
+  // (no need to display anything).
+  ModeReasonCode mode_reason_code                       = 43;
+}
+
+// Track-C follow-up (2026-05-31): Reason codes for a per-peer
+// effective-vs-configured connection-mode mismatch. UIs translate the
+// enum to a human-readable string per surface (no shared English
+// labels — keeps localization possible).
+enum ModeReasonCode {
+  MODE_REASON_NONE = 0;            // kein Mismatch / kein effektiver Modus bekannt
+  MODE_REASON_LEGACY_PEER = 1;     // server downgrade weil remote v<0.52
+  MODE_REASON_SERVER_OVERRIDE = 2; // server policy override (peer ist modern)
+  MODE_REASON_UNKNOWN = 3;         // Mismatch existiert, Grund unklar (z.B. AgentVersion fehlt)
 }
 
 // LocalPeerState contains the latest state of the local peer
