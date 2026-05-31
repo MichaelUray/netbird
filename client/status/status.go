@@ -833,6 +833,36 @@ func parsePeers(peers PeersStateOutput, rosenpassEnabled, rosenpassPermissive bo
 			)
 		}
 
+		// Track-C follow-up (2026-05-31): agent version + [Legacy] tag.
+		// Only printed when the daemon knows the remote version
+		// (i.e. mgmt-server populates AgentVersion in RemotePeerConfig).
+		if peerState.AgentVersion != "" {
+			tag := ""
+			if peerState.IsLegacyPeer {
+				tag = "  [Legacy]"
+			}
+			peerString += fmt.Sprintf("  Agent version: %s%s\n", peerState.AgentVersion, tag)
+		}
+		// Track-C follow-up (2026-05-31): explicit mode + downgrade reason.
+		// Skip entirely when there is no effective mode information.
+		if peerState.EffectiveConnectionMode != "" {
+			peerString += fmt.Sprintf("  Effective mode: %s\n", peerState.EffectiveConnectionMode)
+			if peerState.ConfiguredConnectionMode != "" &&
+				peerState.ConfiguredConnectionMode != peerState.EffectiveConnectionMode {
+				reason := ""
+				switch peerState.ModeReason {
+				case "legacy_peer":
+					reason = " — downgraded because remote peer is on a legacy version"
+				case "server_override":
+					reason = " — downgraded by server policy"
+				case "unknown":
+					reason = " — downgrade reason unknown"
+				}
+				peerString += fmt.Sprintf("  Configured mode: %s%s\n",
+					peerState.ConfiguredConnectionMode, reason)
+			}
+		}
+
 		peersString += peerString
 	}
 	return peersString
