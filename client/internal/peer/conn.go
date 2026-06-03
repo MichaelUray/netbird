@@ -2154,6 +2154,32 @@ func (conn *Conn) IceBackoffSnapshot() BackoffSnapshot {
 // Called from Guard's goroutine; acquires conn.mu, so it must not be
 // invoked from a path that already holds conn.mu.
 func (conn *Conn) onNetworkChange() {
+	// V14.1 (2026-06-03): gate the SR-watcher / network-change re-attach for
+	// peers that the lazy manager just put to sleep. onNetworkChange fires
+	// on EVERY srReconnect — including spurious Signal-gRPC-stream timeouts
+	// (TCP keepalive, server-side stream rotation), which are not real
+	// network events. The default behaviour re-attaches ICE for every peer
+	// in batch, which after a 3-min p2p-dynamic teardown reads the user as
+	// "P2P is back up" without the user ever sending traffic — defeating
+	// lazy mode. Observed on S21 with 11 peers: a 30-s grpc stream blip
+	// re-armed all 11 ICE listeners simultaneously, every 3 min, in a
+	// stable cycle.
+	//
+	// We skip ONLY when the conn is currently intentionally-detached AND
+	// has ever-connected. That combination means the lazy manager
+	// deliberately left ICE down because no real WG traffic crossed the
+	// peer for p2pTimeoutSecs. A real network event (LTE replug, WiFi
+	// roam) on a peer with active traffic would have cleared the marker
+	// earlier (AttachICEFrom on previous activity), so this gate fires
+	// only on the legacy-spam-recovery path, not on legitimate roam
+	// recovery for actively-used peers.
+	//
+	// User-outbound traffic still wakes the peer via lazyconn/manager
+	// .onPeerActivity (separate path, not affected by this gate).
+	if conn.IsIntentionallyDetached() && conn.everConnected.Load() {
+		conn.Log.Tracef("V14.1 gate: skipping onNetworkChange re-attach (intentionally-detached + everConnected, lazy-mode preserved)")
+		return
+	}
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #5,
 	// SR-watcher reconnect). A network event (LTE replug, WiFi roam)
 	// invalidates any previous "intentionally idle" reasoning -- the
