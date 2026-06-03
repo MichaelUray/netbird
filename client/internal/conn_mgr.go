@@ -520,23 +520,32 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		return
 	}
 
-	// V13 lazy-mode anti-spam gate: ignore inbound Body_OFFER when the
-	// peer was previously connected and is currently intentionally-
-	// detached (= runDynamicInactivityLoop just tore down ICE because
-	// no real WG traffic in the last p2pTimeoutSecs). Legacy remotes
-	// without f433f1b42 keep sending eager bootstrap-OFFERs every ~30 s;
-	// without this gate, every such OFFER cleared the marker, AttachICE
-	// re-ran, the 180 s timer restarted, and the peer effectively stayed
-	// P2P-up forever. User-spec: no P2P link to legacy peers without
-	// real data transfer. Local outbound traffic still wakes the peer
-	// via the lazy manager's WG-activity detector (different code path).
+	// V14 lazy-mode anti-spam gate (supersedes V13): ignore ALL inbound
+	// signal messages (OFFER / ANSWER / CANDIDATE / MODE — anything that
+	// reaches engine.go:1872 with msgType != GO_IDLE) when the peer was
+	// previously connected and is currently intentionally-detached
+	// (= runDynamicInactivityLoop just tore down ICE because no real
+	// WG traffic in the last p2pTimeoutSecs). Legacy remotes without
+	// f433f1b42 keep emitting bootstrap-OFFERs AND follow-up CANDIDATE /
+	// ANSWER messages every ~30 s; V13 only gated OFFER, so the
+	// CANDIDATE/ANSWER flow through AttachICEFrom(SourceSignal) cleared
+	// the intentional-detach marker and the very next OFFER then
+	// re-armed ICE (V13 saw marker=false and fell through).
 	//
-	// Initial connect (everConnected=false) is NOT gated — the very
-	// first OFFER from a legitimate remote must still trigger a wake-up.
-	if msgType == sProto.Body_OFFER &&
-		conn.EverConnected() &&
-		conn.IsIntentionallyDetached() {
-		conn.Log.Tracef("V13 gate: ignoring inbound OFFER (intentionally-detached + everConnected, lazy-mode anti-spam)")
+	// Result with V13.0 alone on S21: 24 detach events but 34 re-attach
+	// events — the cycle was unbroken.
+	//
+	// V14 closes that gap by gating every signal-driven activation in
+	// detached-state, not just OFFER. User-outbound traffic still wakes
+	// the peer through lazy-mgr's onPeerActivity path
+	// (lazyconn/manager/manager.go:675), which is independent of
+	// ActivatePeerForMessage.
+	//
+	// Initial connect (everConnected=false) is NOT gated — a peer that
+	// has never been P2P-up must still react to legitimate remote-
+	// initiated negotiation.
+	if conn.EverConnected() && conn.IsIntentionallyDetached() {
+		conn.Log.Tracef("V14 gate: ignoring inbound signal %s (intentionally-detached + everConnected, lazy-mode anti-spam)", msgType)
 		return
 	}
 
