@@ -1523,6 +1523,29 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 //
 // Phase 3.7i (#5989), Codex review 2026-05-05.
 func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
+	// V13.1 (2026-06-03): block relay-activity ICE-recovery when we just
+	// lazy-detached. Legacy peers without f433f1b42 keep emitting both
+	// eager bootstrap-OFFERs (signal channel — V13 gates those in
+	// ActivatePeerForMessage) AND >32-byte type-4 WG transport packets
+	// over the relay (e.g. routing keep-alives), and the latter would
+	// otherwise reach here and re-arm ICE within seconds of every
+	// runDynamicInactivityLoop teardown. Net result: ICE bounces
+	// detach -> attach every ~3 min, peer effectively stays P2P-up
+	// forever, no real user data crosses the link. User spec: no P2P
+	// link to legacy peers without real data transfer.
+	//
+	// Local outbound user-traffic still wakes the peer via the lazy
+	// manager's onPeerActivity path (lazyconn/manager/manager.go:675),
+	// which is independent of this fast-path.
+	//
+	// Initial connect (everConnected=false) is NOT gated. A peer that
+	// has never been P2P-up has no AttachICEOnRelayActivity reason
+	// because everConnected=false short-circuits below anyway, so this
+	// branch only adds latency to the legacy-spam case.
+	if conn.IsIntentionallyDetached() && conn.everConnected.Load() {
+		conn.logDiagSnapshot("V13.1-relay-activity-blocked-intentionally-detached")
+		return false
+	}
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #3).
 	// Relay activity is an unambiguous signal that the local stack is
 	// re-engaging ICE — any preceding intentional-detach is no longer
