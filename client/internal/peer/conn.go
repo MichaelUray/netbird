@@ -238,6 +238,19 @@ func (conn *Conn) ClearIntentionallyDetached() {
 	conn.intentionallyDetached.Store(false)
 }
 
+// EverConnected returns true if this Conn has ever completed at least
+// one full configureConnection (P2P or relay). Used by the lazy-mode
+// inbound-OFFER anti-spam gate (V13) to differentiate a brand-new
+// peer-pair (where an inbound OFFER is the legitimate initial-connect
+// trigger) from a previously-connected peer that was idle-detached by
+// runDynamicInactivityLoop and is now being re-poked by a legacy
+// remote (no f433f1b42).
+//
+// Safe to call concurrently.
+func (conn *Conn) EverConnected() bool {
+	return conn.everConnected.Load()
+}
+
 // NewConn creates a new not opened Conn to the remote peer.
 // To establish a connection run Conn.Open
 func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {

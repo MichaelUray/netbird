@@ -520,6 +520,26 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		return
 	}
 
+	// V13 lazy-mode anti-spam gate: ignore inbound Body_OFFER when the
+	// peer was previously connected and is currently intentionally-
+	// detached (= runDynamicInactivityLoop just tore down ICE because
+	// no real WG traffic in the last p2pTimeoutSecs). Legacy remotes
+	// without f433f1b42 keep sending eager bootstrap-OFFERs every ~30 s;
+	// without this gate, every such OFFER cleared the marker, AttachICE
+	// re-ran, the 180 s timer restarted, and the peer effectively stayed
+	// P2P-up forever. User-spec: no P2P link to legacy peers without
+	// real data transfer. Local outbound traffic still wakes the peer
+	// via the lazy manager's WG-activity detector (different code path).
+	//
+	// Initial connect (everConnected=false) is NOT gated — the very
+	// first OFFER from a legitimate remote must still trigger a wake-up.
+	if msgType == sProto.Body_OFFER &&
+		conn.EverConnected() &&
+		conn.IsIntentionallyDetached() {
+		conn.Log.Tracef("V13 gate: ignoring inbound OFFER (intentionally-detached + everConnected, lazy-mode anti-spam)")
+		return
+	}
+
 	if found := e.lazyConnMgr.ActivatePeer(conn.GetKey()); found {
 		// Phase 3.7j: clear the intentional-detach marker (clear-point #4).
 		// Signal-driven wake-up after a remote OFFER means a peer that
