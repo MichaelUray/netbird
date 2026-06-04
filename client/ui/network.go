@@ -35,8 +35,19 @@ const (
 type filter string
 
 func (s *serviceClient) showNetworksUI() {
+	// V17 (2026-06-04): Singleton-Pattern — wenn das Fenster bereits
+	// existiert, nur erneut zeigen statt neu erzeugen. Das verhindert
+	// das Crash-Szenario das w11-test1 beobachtete: bei jedem Re-Open
+	// wurde s.wNetworks überschrieben, alte startAutoRefresh-Goroutinen
+	// liefen weiter mit veralteten Closure-Captures, und der nächste
+	// Tick traf gelegentlich ein bereits geschlossenes Window-Objekt
+	// (nil-Content / nil-Refresh) → Fyne-segfault.
+	if s.wNetworks != nil {
+		s.wNetworks.Show()
+		s.wNetworks.RequestFocus()
+		return
+	}
 	s.wNetworks = s.app.NewWindow("Peers and Networks")
-	s.wNetworks.SetOnClosed(s.cancel)
 
 	allGrid := container.New(layout.NewGridLayout(3))
 	go s.updateNetworks(allGrid, allNetworks)
@@ -373,20 +384,42 @@ func (s *serviceClient) showError(err error) {
 }
 
 func (s *serviceClient) startAutoRefresh(interval time.Duration, tabs *container.AppTabs, allGrid, overlappingGrid, exitNodesGrid *fyne.Container) {
+	// V17 (2026-06-04): Goroutine via Context kontrollieren statt
+	// ausschließlich über ticker.Stop(). ticker.Stop() unterbricht nur
+	// neue Ticks, aber bereits im Channel wartende Ticks werden noch
+	// gelesen — die Goroutine kann dann auf ein Window zugreifen das
+	// schon geschlossen ist (Window-1's content nil-deref auf w11-test1).
+	// Plus: lokale Window-Referenz erfassen statt s.wNetworks (das Field
+	// kann inzwischen auf ein neueres Window zeigen, wenn die UI mehrfach
+	// reaktiviert wurde).
+	w := s.wNetworks
+	ctx, cancel := context.WithCancel(s.ctx)
 	ticker := time.NewTicker(interval)
 	go func() {
-		for range ticker.C {
-			// Silent mode: auto-refresh never pops up modal "not
-			// connected" dialogs. The Refresh button still does, since
-			// the user expects feedback when they trigger it.
-			grid, f := getGridAndFilterFromTab(tabs, allGrid, overlappingGrid, exitNodesGrid)
-			s.wNetworks.Content().Refresh()
-			s.updateNetworksSilent(grid, f)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Silent mode: auto-refresh never pops up modal "not
+				// connected" dialogs. The Refresh button still does, since
+				// the user expects feedback when they trigger it.
+				if w == nil || w.Content() == nil {
+					return
+				}
+				grid, f := getGridAndFilterFromTab(tabs, allGrid, overlappingGrid, exitNodesGrid)
+				w.Content().Refresh()
+				s.updateNetworksSilent(grid, f)
+			}
 		}
 	}()
 
-	s.wNetworks.SetOnClosed(func() {
-		ticker.Stop()
+	w.SetOnClosed(func() {
+		cancel()
+		// V17: das Singleton-Field räumen, damit das nächste showNetworksUI()
+		// wieder ein frisches Window erzeugt.
+		s.wNetworks = nil
 		s.cancel()
 	})
 }
