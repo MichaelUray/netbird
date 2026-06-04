@@ -549,6 +549,35 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		return
 	}
 
+	// V15 strict-lazy cold-boot gate (2026-06-04): in p2p-dynamic mode,
+	// ALSO drop inbound Body_OFFER for peers that have NEVER connected
+	// yet. User spec: 'no P2P link to legacy peers without real data
+	// transfer, not even on cold-boot'. V14 alone only kicks in AFTER
+	// the first ever-connected → intentionally-detached cycle, so the
+	// initial flood (legacy remotes blast bootstrap-OFFERs the moment
+	// they see our peer come online) was unblocked: 14 peers woke
+	// immediately after S26 reconnect, contradicting lazy semantics.
+	//
+	// Restricted to Body_OFFER (the wake-up trigger) and
+	// !EverConnected (initial-connect only): once we ever connected,
+	// V14 owns the gating; continuing CANDIDATE/ANSWER for a
+	// genuinely-active mid-session ICE negotiation still flow through.
+	//
+	// Trade-off: a legacy peer that first-movers (user pings FROM the
+	// legacy peer TO our device) will not establish P2P until our side
+	// sends outbound traffic. Acceptable per user spec — this is the
+	// explicit definition of "lazy" on the local side.
+	//
+	// Local outbound traffic continues to wake the peer through
+	// lazyconn/manager/manager.go:675 onPeerActivity (separate code
+	// path, not affected by this gate).
+	if e.mode == connectionmode.ModeP2PDynamic &&
+		msgType == sProto.Body_OFFER &&
+		!conn.EverConnected() {
+		conn.Log.Tracef("V15 gate: ignoring inbound OFFER (cold-boot, never-connected; strict-lazy: wait for local outbound traffic)")
+		return
+	}
+
 	if found := e.lazyConnMgr.ActivatePeer(conn.GetKey()); found {
 		// Phase 3.7j: clear the intentional-detach marker (clear-point #4).
 		// Signal-driven wake-up after a remote OFFER means a peer that
