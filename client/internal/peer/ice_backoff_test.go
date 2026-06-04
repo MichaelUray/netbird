@@ -377,3 +377,96 @@ func TestResolveP2pRetryCap_SentinelMakesBackoffDisabled(t *testing.T) {
 		t.Fatalf("disabled backoff returned non-zero delay: %v", delay)
 	}
 }
+
+// TestIceBackoff_PostSuccessDropRamp verifies the V16.1 ramped schedule:
+// 2s, 5s, 10s, then 30s cap. This is the schedule pinned for transient
+// Halifax-CGNAT NAT-stale failures so they don't poison the exponential
+// schedule for genuine first-attempt-cannot-pair failures.
+func TestIceBackoff_PostSuccessDropRamp(t *testing.T) {
+	expected := []time.Duration{
+		2 * time.Second,
+		5 * time.Second,
+		10 * time.Second,
+		30 * time.Second,
+		30 * time.Second, // cap
+		30 * time.Second, // cap
+	}
+	s := newIceBackoff(15 * time.Minute)
+	// Skip the network-change grace by clearing lastResetAt to a far past.
+	s.lastResetAt = time.Now().Add(-2 * time.Hour)
+
+	for i, want := range expected {
+		got := s.markFailurePostSuccessDrop()
+		if got != want {
+			t.Errorf("post-success-drop #%d: got %v, want %v", i+1, got, want)
+		}
+	}
+}
+
+// TestIceBackoff_PostSuccessDropDoesNotPoisonExponential verifies the
+// core V16.1 fix: many post-success-drops must NOT advance the long-term
+// exponential schedule (bo.NextBackOff). The next genuine first-attempt
+// failure must therefore still return the InitialInterval, not the
+// post-N-th-exponential interval. This is the bug that V16 (before .1)
+// left open: s.bo.NextBackOff() was called inside the post-success path,
+// poisoning the schedule.
+func TestIceBackoff_PostSuccessDropDoesNotPoisonExponential(t *testing.T) {
+	s := newIceBackoff(15 * time.Minute)
+	s.lastResetAt = time.Now().Add(-2 * time.Hour) // skip grace
+
+	// Flutter 6× via post-success-drop. Pre-V16.1 these would each call
+	// bo.NextBackOff() and advance currentInterval up to MaxInterval.
+	for i := 0; i < 6; i++ {
+		s.markFailurePostSuccessDrop()
+	}
+
+	// Now a genuine first-attempt failure should still get the
+	// InitialInterval (~iceBackoffInitialInterval) with randomization,
+	// NOT something close to maxBackoff.
+	delay := s.markFailure()
+	// InitialInterval is 1min, randomization 0.1 → ~54-66s.
+	if delay > 70*time.Second {
+		t.Errorf("post-success-drops poisoned exponential schedule: "+
+			"first-attempt got %v, expected ~1m initial-interval", delay)
+	}
+}
+
+// TestIceBackoff_MarkSuccessResetsPostSuccessCounter verifies that a
+// successful ICE-Connected event clears the post-success-drop counter,
+// so a future flutter starts the ramp from 2s again, not from the cap.
+func TestIceBackoff_MarkSuccessResetsPostSuccessCounter(t *testing.T) {
+	s := newIceBackoff(15 * time.Minute)
+	s.lastResetAt = time.Now().Add(-2 * time.Hour)
+
+	for i := 0; i < 4; i++ {
+		s.markFailurePostSuccessDrop()
+	}
+	s.markSuccess()
+
+	first := s.markFailurePostSuccessDrop()
+	if first != 2*time.Second {
+		t.Errorf("markSuccess did not reset post-success counter: "+
+			"first delay after reset was %v, expected 2s", first)
+	}
+}
+
+// TestIceBackoff_PostSuccessDropDelayForSchedule pins the static ramp.
+func TestIceBackoff_PostSuccessDropDelayForSchedule(t *testing.T) {
+	cases := []struct {
+		n    int
+		want time.Duration
+	}{
+		{0, 2 * time.Second},
+		{1, 2 * time.Second},
+		{2, 5 * time.Second},
+		{3, 10 * time.Second},
+		{4, 30 * time.Second},
+		{100, 30 * time.Second},
+	}
+	for _, tc := range cases {
+		got := postSuccessDropDelayFor(tc.n)
+		if got != tc.want {
+			t.Errorf("postSuccessDropDelayFor(%d) = %v, want %v", tc.n, got, tc.want)
+		}
+	}
+}

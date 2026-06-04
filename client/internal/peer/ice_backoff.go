@@ -75,6 +75,12 @@ type iceBackoffState struct {
 	suspended   bool
 	maxBackoff  time.Duration
 	lastResetAt time.Time
+
+	// V16.1 (2026-06-04): post-success-drop has its own counter, kept
+	// separate from `failures` so the milder schedule below does not
+	// feed the long-term exponential `bo` state. Reset by markSuccess
+	// and Reset, like `failures`.
+	postSuccessFailures int
 }
 
 // BackoffSnapshot is a read-only view used by the status output.
@@ -139,17 +145,62 @@ func (s *iceBackoffState) markFailure() time.Duration {
 // in 2 min+ suspends after only 3-4 cycles and looks "permanently broken"
 // to the user (S26 case 2026-06-04).
 //
-// We cap the post-success-drop suspend at postSuccessDropMaxSuspend
-// (currently 30 s) and we do NOT advance the long-term exponential
-// schedule. The first-attempt / re-attach paths keep the original
+// V16.1 schedule (ramped, independent of `bo`):
+//
+//	post-fail #1: 2 s
+//	post-fail #2: 5 s
+//	post-fail #3: 10 s
+//	post-fail #4+: 30 s (postSuccessDropMaxSuspend)
+//
+// The first-attempt / re-attach paths keep the original exponential
 // behaviour because they signal a real "cannot establish" condition.
+// `s.bo` is NOT touched here — so a peer that flutters via
+// post-success-drops never poisons the schedule for a later genuine
+// first-attempt failure (V16 bug found by code-review 2026-06-04).
 func (s *iceBackoffState) markFailurePostSuccessDrop() time.Duration {
-	return s.markFailureWithSeverity(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxBackoff == 0 {
+		return 0
+	}
+	s.failures++
+	s.postSuccessFailures++
+
+	// Network-change grace still wins (same logic as markFailure).
+	var delay time.Duration
+	if !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod {
+		delay = networkChangeRetryDelay
+	} else {
+		delay = postSuccessDropDelayFor(s.postSuccessFailures)
+	}
+
+	s.nextRetry = time.Now().Add(delay)
+	s.suspended = true
+	return delay
 }
 
 const postSuccessDropMaxSuspend = 30 * time.Second
 
+// postSuccessDropDelayFor returns the ramped post-success-drop delay for
+// the n-th consecutive post-success failure (1-based). Public package-local
+// so unit tests can pin the schedule.
+func postSuccessDropDelayFor(n int) time.Duration {
+	switch n {
+	case 0, 1:
+		return 2 * time.Second
+	case 2:
+		return 5 * time.Second
+	case 3:
+		return 10 * time.Second
+	default:
+		return postSuccessDropMaxSuspend
+	}
+}
+
 func (s *iceBackoffState) markFailureWithSeverity(postSuccessDrop bool) time.Duration {
+	if postSuccessDrop {
+		return s.markFailurePostSuccessDrop()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.maxBackoff == 0 {
@@ -158,19 +209,9 @@ func (s *iceBackoffState) markFailureWithSeverity(postSuccessDrop bool) time.Dur
 	s.failures++
 
 	var delay time.Duration
-	switch {
-	case !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod:
+	if !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod {
 		delay = networkChangeRetryDelay
-	case postSuccessDrop:
-		// V16 (2026-06-04): cap post-success-drop suspends so transient
-		// Halifax-CGNAT NAT-stale doesn't escalate the schedule.
-		exp := s.bo.NextBackOff()
-		if exp > postSuccessDropMaxSuspend {
-			delay = postSuccessDropMaxSuspend
-		} else {
-			delay = exp
-		}
-	default:
+	} else {
 		delay = s.bo.NextBackOff()
 	}
 
@@ -204,6 +245,7 @@ func (s *iceBackoffState) markSuccess() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures = 0
+	s.postSuccessFailures = 0
 	s.suspended = false
 	s.bo.Reset()
 	s.lastResetAt = time.Now()
@@ -217,6 +259,7 @@ func (s *iceBackoffState) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures = 0
+	s.postSuccessFailures = 0
 	s.suspended = false
 	s.bo.Reset()
 	s.lastResetAt = time.Now()
