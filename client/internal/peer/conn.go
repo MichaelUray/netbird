@@ -251,6 +251,26 @@ func (conn *Conn) EverConnected() bool {
 	return conn.everConnected.Load()
 }
 
+// IsLazyDetached reports whether this connection is currently in the
+// "lazy idle after success" state — i.e. the inactivity manager fired
+// DetachICEForPeer (which sets the intentional-detach marker) AND the
+// connection had reached at least one successful configureConnection
+// before. This composite check is the gating predicate for V13/V14/
+// V14.1/V13.1 anti-spam gates: when both are true, an inbound signal /
+// network-change / relay-activity must NOT silently re-arm ICE,
+// otherwise legacy peers' eager-bootstrap traffic drives a
+// detach/re-attach cycle that defeats lazy mode (see report
+// docs/test-reports/2026-06-04-netbird-v16-elmira-p2p-resolved).
+//
+// Helper introduced 2026-06-04 by the code-review-recommended dedup of
+// the three identical inline checks (V13.1 conn.go:1562, V14
+// conn_mgr.go:547, V14.1 conn.go:2206).
+//
+// Safe to call concurrently.
+func (conn *Conn) IsLazyDetached() bool {
+	return conn.IsIntentionallyDetached() && conn.everConnected.Load()
+}
+
 // NewConn creates a new not opened Conn to the remote peer.
 // To establish a connection run Conn.Open
 func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
@@ -1559,7 +1579,7 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	// has never been P2P-up has no AttachICEOnRelayActivity reason
 	// because everConnected=false short-circuits below anyway, so this
 	// branch only adds latency to the legacy-spam case.
-	if conn.IsIntentionallyDetached() && conn.everConnected.Load() {
+	if conn.IsLazyDetached() {
 		conn.logDiagSnapshot("V13.1-relay-activity-blocked-intentionally-detached")
 		return false
 	}
@@ -2203,7 +2223,7 @@ func (conn *Conn) onNetworkChange() {
 	//
 	// User-outbound traffic still wakes the peer via lazyconn/manager
 	// .onPeerActivity (separate path, not affected by this gate).
-	if conn.IsIntentionallyDetached() && conn.everConnected.Load() {
+	if conn.IsLazyDetached() {
 		conn.Log.Tracef("V14.1 gate: skipping onNetworkChange re-attach (intentionally-detached + everConnected, lazy-mode preserved)")
 		return
 	}

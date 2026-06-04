@@ -544,7 +544,7 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 	// Initial connect (everConnected=false) is NOT gated — a peer that
 	// has never been P2P-up must still react to legitimate remote-
 	// initiated negotiation.
-	if conn.EverConnected() && conn.IsIntentionallyDetached() {
+	if conn.IsLazyDetached() {
 		conn.Log.Tracef("V14 gate: ignoring inbound signal %s (intentionally-detached + everConnected, lazy-mode anti-spam)", msgType)
 		return
 	}

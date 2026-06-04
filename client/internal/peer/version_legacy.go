@@ -1,9 +1,9 @@
 package peer
 
 import (
-	"strings"
-
 	"github.com/hashicorp/go-version"
+
+	"github.com/netbirdio/netbird/client/internal/lazyconn"
 )
 
 // legacyCandidateRecvCeiling is the NetBird version ceiling below
@@ -35,28 +35,12 @@ var legacyCandidateRecvCeiling = version.Must(version.NewVersion("0.52.0"))
 // "-ci-") are treated as modern (they share our source tree).
 // "development" and unparseable short-hash forms are also modern.
 //
-// The version-string is run through the same prefix-trim as
-// lazyconn/support.go to be tolerant of upstream tagging conventions
-// (e.g. "v0.51.2", "a0.51.2").
+// Uses lazyconn.ParseAgentVersion for the prefix-trim + dev/ci predicate
+// so the legacy-detection and the lazy-support-check stay in sync
+// (code-review dedup 2026-06-04).
 func isLegacyICECandidateRecv(remoteVersion string) bool {
-	if remoteVersion == "" || remoteVersion == "development" {
-		return false
-	}
-	if strings.HasPrefix(remoteVersion, "dev-") ||
-		strings.HasPrefix(remoteVersion, "ci-") ||
-		strings.Contains(remoteVersion, "-dev-") ||
-		strings.Contains(remoteVersion, "-ci-") {
-		return false
-	}
-	if !strings.Contains(remoteVersion, ".") {
-		return false
-	}
-	normalized := remoteVersion
-	if len(normalized) > 0 && (normalized[0] == 'v' || normalized[0] == 'a') {
-		normalized = normalized[1:]
-	}
-	parsed, err := version.NewVersion(normalized)
-	if err != nil {
+	parsed, ok := lazyconn.ParseAgentVersion(remoteVersion)
+	if !ok {
 		return false
 	}
 	return parsed.LessThan(legacyCandidateRecvCeiling)
