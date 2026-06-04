@@ -126,6 +126,30 @@ func (s *iceBackoffState) IsSuspended() bool {
 // pair-check run while a fresh LTE/Wi-Fi NAT mapping is still warm,
 // without flooding signaling for chronically broken peers.
 func (s *iceBackoffState) markFailure() time.Duration {
+	return s.markFailureWithSeverity(false)
+}
+
+// markFailurePostSuccessDrop is the milder variant for failures that occur
+// AFTER an ICE session was already established. Halifax-CGNAT and similar
+// stateful NAT setups routinely trip post-success-drops via NAT-stale
+// without the underlying P2P path being structurally broken — w11-test1
+// 2026-06-04 had failure #1 → 2 s suspend → next OFFER → success in 0.4 s.
+// Without this milder path, those transient drops feed the same exponential
+// curve as first-attempt-cannot-pair, so a peer that fluctuates ends up
+// in 2 min+ suspends after only 3-4 cycles and looks "permanently broken"
+// to the user (S26 case 2026-06-04).
+//
+// We cap the post-success-drop suspend at postSuccessDropMaxSuspend
+// (currently 30 s) and we do NOT advance the long-term exponential
+// schedule. The first-attempt / re-attach paths keep the original
+// behaviour because they signal a real "cannot establish" condition.
+func (s *iceBackoffState) markFailurePostSuccessDrop() time.Duration {
+	return s.markFailureWithSeverity(true)
+}
+
+const postSuccessDropMaxSuspend = 30 * time.Second
+
+func (s *iceBackoffState) markFailureWithSeverity(postSuccessDrop bool) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.maxBackoff == 0 {
@@ -134,9 +158,19 @@ func (s *iceBackoffState) markFailure() time.Duration {
 	s.failures++
 
 	var delay time.Duration
-	if !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod {
+	switch {
+	case !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod:
 		delay = networkChangeRetryDelay
-	} else {
+	case postSuccessDrop:
+		// V16 (2026-06-04): cap post-success-drop suspends so transient
+		// Halifax-CGNAT NAT-stale doesn't escalate the schedule.
+		exp := s.bo.NextBackOff()
+		if exp > postSuccessDropMaxSuspend {
+			delay = postSuccessDropMaxSuspend
+		} else {
+			delay = exp
+		}
+	default:
 		delay = s.bo.NextBackOff()
 	}
 

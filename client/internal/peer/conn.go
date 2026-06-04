@@ -2043,14 +2043,24 @@ func (conn *Conn) onICEFailed() {
 	// classification is best-effort -- pion only tells us "Failed";
 	// we infer from local state.
 	failType := "first-attempt"
+	isPostSuccessDrop := false
 	switch {
 	case conn.everConnected.Load():
 		failType = "post-success-drop"
+		isPostSuccessDrop = true
 	case conn.handshaker != nil && conn.handshaker.readICEListener() != nil:
 		failType = "re-attach"
 	}
 
-	delay := conn.iceBackoff.markFailure()
+	// V16 (2026-06-04): post-success-drops on stateful NAT (Halifax-CGNAT)
+	// must not feed the exponential curve — see ice_backoff.go for the
+	// rationale. first-attempt and re-attach keep the original schedule.
+	var delay time.Duration
+	if isPostSuccessDrop {
+		delay = conn.iceBackoff.markFailurePostSuccessDrop()
+	} else {
+		delay = conn.iceBackoff.markFailure()
+	}
 	snap := conn.iceBackoff.Snapshot()
 	if delay > 0 {
 		conn.Log.Infof("ICE failure #%d (%s), suspending for %s, next retry at %s",
