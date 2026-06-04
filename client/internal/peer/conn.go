@@ -457,6 +457,12 @@ func (conn *Conn) Close(signalToRemote bool, keepWgPeer bool) {
 // OnRemoteAnswer handles an offer from the remote peer and returns true if the message was accepted, false otherwise
 // doesn't block, discards the message if connection wasn't ready
 func (conn *Conn) OnRemoteAnswer(answer OfferAnswer) {
+	// V15.1 nil-safe: same as OnRemoteOffer — handshaker may be nil
+	// when V15 cold-boot-gate suppressed the activation pipeline.
+	if conn.handshaker == nil {
+		conn.Log.Tracef("OnRemoteAnswer dropped: handshaker not initialized (peer in lazy-idle pre-Open)")
+		return
+	}
 	conn.dumpState.RemoteAnswer()
 	conn.Log.Infof("OnRemoteAnswer, priority: %s, status ICE: %s, status relay: %s", conn.currentConnPriority, conn.statusICE, conn.statusRelay)
 	conn.handshaker.OnRemoteAnswer(answer)
@@ -505,6 +511,17 @@ func (conn *Conn) SetRosenpassInitializedPresharedKeyValidator(handler func(peer
 }
 
 func (conn *Conn) OnRemoteOffer(offer OfferAnswer) {
+	// V15.1 nil-safe (2026-06-04): when V15 cold-boot-gate in
+	// ConnMgr.ActivatePeerForMessage drops the upstream activation,
+	// conn.Open() is never called, so conn.handshaker stays nil. The
+	// engine still dispatches OnRemoteOffer downstream of
+	// ActivatePeerForMessage, which then NPE'd here. The fix is
+	// defensive: if no handshaker, the peer has no listening offer
+	// pipeline anyway — just drop the offer.
+	if conn.handshaker == nil {
+		conn.Log.Tracef("OnRemoteOffer dropped: handshaker not initialized (peer in lazy-idle pre-Open)")
+		return
+	}
 	conn.dumpState.RemoteOffer()
 	conn.Log.Infof("OnRemoteOffer, on status ICE: %s, status Relay: %s", conn.statusICE, conn.statusRelay)
 	conn.handshaker.OnRemoteOffer(offer)
