@@ -255,12 +255,24 @@ func (conn *Conn) EverConnected() bool {
 // "lazy idle after success" state — i.e. the inactivity manager fired
 // DetachICEForPeer (which sets the intentional-detach marker) AND the
 // connection had reached at least one successful configureConnection
-// before. This composite check is the gating predicate for V13/V14/
-// V14.1/V13.1 anti-spam gates: when both are true, an inbound signal /
-// network-change / relay-activity must NOT silently re-arm ICE,
-// otherwise legacy peers' eager-bootstrap traffic drives a
-// detach/re-attach cycle that defeats lazy mode (see report
-// docs/test-reports/2026-06-04-netbird-v16-elmira-p2p-resolved).
+// before AND the conn is still open (in active lazy-pause).
+//
+// This composite check is the gating predicate for V13/V14/V14.1/V13.1
+// anti-spam gates: when true, an inbound signal / network-change /
+// relay-activity must NOT silently re-arm ICE, otherwise legacy peers'
+// eager-bootstrap traffic drives a detach/re-attach cycle that defeats
+// lazy mode (see report docs/test-reports/2026-06-04-netbird-v16-
+// elmira-p2p-resolved).
+//
+// Fix V17.2 (2026-06-06): added !opened short-circuit. When conn is
+// fully-closed (opened=false, e.g. after relayTimeout PeerConnClose),
+// the peer is in long-idle state and a remote-initiated OFFER from a
+// legacy peer is a legitimate reconnect attempt, NOT bootstrap-spam.
+// Without this short-circuit S26 stuck with Marl Creek (legacy v0.60.4)
+// because the WG-peer endpoint state had drifted to public-IP, the
+// activity-listener couldn't trigger, and V14 blocked every recovery
+// path from the remote side — leaving the peer permanently unreachable
+// (see report docs/test-reports/2026-06-06-netbird-v17.2-stuck-peer-recovery).
 //
 // Helper introduced 2026-06-04 by the code-review-recommended dedup of
 // the three identical inline checks (V13.1 conn.go:1562, V14
@@ -268,6 +280,9 @@ func (conn *Conn) EverConnected() bool {
 //
 // Safe to call concurrently.
 func (conn *Conn) IsLazyDetached() bool {
+	if !conn.opened {
+		return false
+	}
 	return conn.IsIntentionallyDetached() && conn.everConnected.Load()
 }
 
