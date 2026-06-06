@@ -881,7 +881,24 @@ func (e *ConnMgr) DetachICEForPeer(peerKey string) error {
 	// onNetworkChange and onICEFailed (see Conn.intentionallyDetached
 	// for the full list of clear-points).
 	conn.MarkIntentionallyDetached()
-	return conn.DetachICE()
+	if err := conn.DetachICE(); err != nil {
+		return err
+	}
+
+	// V18 state-sync (2026-06-06): notify the lazy-mgr so it transitions
+	// watcherInactivity → watcherActivity and arms the activity listener.
+	// Without this, the conn is intentionallyDetached but the lazy-mgr
+	// still thinks the peer is active → V14 anti-spam predicate sees
+	// !listener-armed → IsLazyDetached returns false → legacy peer
+	// (pre-0.68) OFFERs fall through V14 into V17.4 stuck-recovery, which
+	// closes the conn and resets the cycle every ~4 min. Production W11
+	// + Marl Creek v0.60.4 reproduced this loop. The state-sync runs in
+	// the lazy-mgr without touching the conn (Relay tunnel stays up,
+	// opened stays true), so V14 evaluates correctly on the next OFFER.
+	if e.lazyConnMgr != nil {
+		e.lazyConnMgr.HandleICEInactivityTransition(peerKey)
+	}
+	return nil
 }
 
 func (e *ConnMgr) Close() {

@@ -757,6 +757,49 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 	}
 }
 
+// HandleICEInactivityTransition is the V18 (2026-06-06) state-sync hook
+// called by ConnMgr.DetachICEForPeer after the inactivity-timer driven
+// ICE teardown. Without this, the lazy-mgr stays in watcherInactivity
+// while the conn is intentionally-detached → the activity listener is
+// never armed → user outbound traffic cannot wake the peer AND remote
+// OFFERs from legacy (pre-0.68) peers fall through V14 (no listener →
+// IsLazyDetached returns false), trigger V17.4 stuck-recovery (which
+// calls lazyConnMgr.DeactivatePeer → peerStore.PeerConnClose →
+// conn.opened=false), and the very next OFFER bypasses V14 again (the
+// V17.2 !opened short-circuit). Result on production (W11 + Marl Creek
+// v0.60.4): a 4-min P2P up/down loop. V18 closes the loop at the
+// source by syncing the lazy-mgr state on the inactivity-detach edge,
+// without touching the conn (no Close, no relay teardown).
+//
+// Safe to call when:
+//   - lazyConnMgr is nil (caller guards)
+//   - peer is unknown (silent no-op, may have been removed)
+//   - peer is already in watcherActivity (no double-arm; listener is
+//     idempotent via activity.Manager but the state-transition log
+//     would be misleading)
+//
+// Idempotent. Holds managedPeersMu for the full transition+arm so a
+// concurrent ActivatePeer / DeactivatePeer can't race the state.
+func (m *Manager) HandleICEInactivityTransition(peerID string) {
+	m.managedPeersMu.Lock()
+	defer m.managedPeersMu.Unlock()
+
+	cfg, ok := m.managedPeers[peerID]
+	if !ok {
+		return
+	}
+	mp, ok := m.managedPeersByConnID[cfg.PeerConnID]
+	if !ok {
+		return
+	}
+	if mp.expectedWatcher == watcherActivity {
+		return
+	}
+
+	m.transitionToActivityWatcherStateOnly(mp)
+	m.armActivityListener(mp)
+}
+
 // transitionToActivityWatcherStateOnly performs the non-blocking
 // state-machine part of the watcherInactivity → watcherActivity
 // transition (expectedWatcher flip + RemovePeer from inactivity manager).
