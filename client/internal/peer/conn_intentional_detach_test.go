@@ -264,3 +264,61 @@ func TestConn_IsLazyDetached_FreshConnNotDetached(t *testing.T) {
 		t.Fatal("IsLazyDetached must return false on a fresh conn (no everConnected, no marker)")
 	}
 }
+
+// TestConn_IsLazyDetached_NoListenerArmed_SubState verifies the V17.4
+// sub-state branch: when the conn is in active-lazy state (opened=true,
+// intentionallyDetached=true, everConnected=true) but the activity
+// listener is NOT armed, IsLazyDetached must return false so V14 lets
+// remote-OFFER recovery through. Without this, the peer is permanently
+// stuck (no listener → no outbound-traffic wakeup; V14 → no remote-OFFER
+// wakeup either).
+func TestConn_IsLazyDetached_NoListenerArmed_SubState(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	conn.everConnected.Store(true)
+	conn.MarkIntentionallyDetached()
+	conn.opened = true
+
+	// Wire predicate that reports "not armed" — simulates the
+	// iceTimeout-but-not-yet-relayTimeout sub-state, or any path that
+	// detached ICE without driving the lazy-mgr transition.
+	conn.SetIsActivityListenerArmedFn(func() bool { return false })
+
+	if conn.IsLazyDetached() {
+		t.Fatal("V17.4: when listener is NOT armed, IsLazyDetached must return false so remote-OFFER recovery is allowed")
+	}
+}
+
+// TestConn_IsLazyDetached_ListenerArmedRestoresGate verifies that the
+// V17.4 sub-state branch does NOT regress V14 anti-spam: when the
+// listener IS armed (= normal active-lazy steady state), IsLazyDetached
+// must remain true so legacy bootstrap-OFFER spam is blocked.
+func TestConn_IsLazyDetached_ListenerArmedRestoresGate(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	conn.everConnected.Store(true)
+	conn.MarkIntentionallyDetached()
+	conn.opened = true
+
+	conn.SetIsActivityListenerArmedFn(func() bool { return true })
+
+	if !conn.IsLazyDetached() {
+		t.Fatal("V17.4: when listener IS armed, IsLazyDetached must remain true (V14 anti-spam preserved)")
+	}
+}
+
+// TestConn_IsLazyDetached_NilPredicateConservative verifies the
+// conservative default: when no predicate is wired (eager modes, tests),
+// IsLazyDetached behaves as if the listener IS armed = strict V14.
+func TestConn_IsLazyDetached_NilPredicateConservative(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	conn.everConnected.Store(true)
+	conn.MarkIntentionallyDetached()
+	conn.opened = true
+	// No SetIsActivityListenerArmedFn call.
+
+	if !conn.IsLazyDetached() {
+		t.Fatal("V17.4: nil predicate must default to strict V14 (= true), not loose recovery")
+	}
+}

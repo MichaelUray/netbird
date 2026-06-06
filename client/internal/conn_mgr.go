@@ -428,6 +428,21 @@ func (e *ConnMgr) AddPeerConn(ctx context.Context, peerKey string, conn *peer.Co
 	// Closes over peerKey so the callback is independent of conn state.
 	conn.SetOnWGTimeoutRecover(func() { e.RecoverPeerToIdle(peerKey) })
 
+	// V17.4 (2026-06-06): wire the listener-armed predicate so
+	// Conn.IsLazyDetached() can detect the sub-state where the lazy-mgr
+	// has not (yet) set up an activity listener (e.g. iceTimeout before
+	// relayTimeout). Without this hook the V14 anti-spam gate would
+	// keep blocking the only remaining recovery path (remote OFFER).
+	// nil-safe: if lazyConnMgr is not set (eager modes), the callback
+	// returns true (= conservative, preserves V14 strict behaviour).
+	connIDForPred := conn.ConnID()
+	conn.SetIsActivityListenerArmedFn(func() bool {
+		if e.lazyConnMgr == nil {
+			return true
+		}
+		return e.lazyConnMgr.IsListenerArmed(connIDForPred)
+	})
+
 	if !e.isStartedWithLazyMgr() {
 		if err := conn.Open(ctx); err != nil {
 			conn.Log.Errorf("failed to open connection: %v", err)
@@ -575,6 +590,34 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		msgType == sProto.Body_OFFER &&
 		!conn.EverConnected() {
 		conn.Log.Tracef("V15 gate: ignoring inbound OFFER (cold-boot, never-connected; strict-lazy: wait for local outbound traffic)")
+		return
+	}
+
+	// V17.4 stuck-recovery (2026-06-06): a remote OFFER arriving while
+	// (a) the peer is in intentionally-detached state (lazy-pause), but
+	// (b) the lazy-mgr has NO activity listener armed for this peer, means
+	// local outbound traffic CANNOT wake the peer (the fake-IP edge
+	// listener is not installed). Without an explicit re-arm path the
+	// peer is permanently stuck: V14 blocks the OFFER, ActivatePeer
+	// returns false because watcherInactivity ignores it, and
+	// OnRemoteOffer eventually drops the message with "receiver not
+	// ready" (handshaker dead since Close).
+	//
+	// Drive the lazy-mgr DeactivatePeer pathway to re-arm the activity
+	// listener + restore the fake-IP endpoint, then return; the next
+	// OFFER (within ~30s) or local outbound traffic will trigger normal
+	// activation. This is the targeted reverse of the GAP that V17.3
+	// closed at engine.go:2801 — but for the (rarer) case where the
+	// state-drift was created by a different code path or an older
+	// build before V17.3.
+	if e.mode == connectionmode.ModeP2PDynamic &&
+		msgType == sProto.Body_OFFER &&
+		conn.IsIntentionallyDetached() &&
+		conn.EverConnected() &&
+		e.lazyConnMgr != nil &&
+		!e.lazyConnMgr.IsListenerArmed(conn.ConnID()) {
+		conn.Log.Infof("V17.4 stuck-recovery: remote OFFER on intentionally-detached peer w/o activity-listener — re-arm lazy idle")
+		e.lazyConnMgr.DeactivatePeer(conn.ConnID())
 		return
 	}
 

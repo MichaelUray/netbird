@@ -185,6 +185,26 @@ func (m *Manager) InactivityManager() *inactivity.Manager {
 	return m.inactivityManager
 }
 
+// IsListenerArmed reports whether the lazy-mgr currently has an activity
+// listener installed for the given peerConnID — i.e. outbound user-
+// traffic edges through this peer's fake-IP endpoint would generate a
+// wakeup event. The V17.4 sub-state coverage in Conn.IsLazyDetached
+// consults this so the V14 anti-spam gate does not block the only
+// remaining recovery path when no listener is armed (iceTimeout sub-
+// state, or post engine.go:2801 remote-offline-close that bypassed
+// the lazy-mgr).
+//
+// Returns false when the manager is nil (defensive) or when the
+// activityManager is nil (kernel-bind mode). In both cases the
+// IsLazyDetached predicate falls through to the strict V14 check —
+// safe default for production paths that do not exercise this hook.
+func (m *Manager) IsListenerArmed(peerConnID peerid.ConnID) bool {
+	if m == nil || m.activityManager == nil {
+		return false
+	}
+	return m.activityManager.HasPeer(peerConnID)
+}
+
 // UpdateRouteHAMap updates the HA group mappings for routes
 // This should be called when route configuration changes
 func (m *Manager) UpdateRouteHAMap(haMap route.HAMap) {

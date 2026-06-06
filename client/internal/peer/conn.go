@@ -130,6 +130,13 @@ type Conn struct {
 	// to the 6-host hardware test on c9a47ed90.
 	onWGTimeoutRecover func()
 
+	// isActivityListenerArmedFn is the V17.4 predicate consulted by
+	// IsLazyDetached(): when the lazy-mgr does NOT have an activity
+	// listener armed for this peer, the conn cannot wake via outbound
+	// user-traffic, so V14 must let remote OFFERs through. nil means
+	// "assume armed" (conservative default = preserve V14 anti-spam).
+	isActivityListenerArmedFn func() bool
+
 	statusRelay         *worker.AtomicWorkerStatus
 	statusICE           *worker.AtomicWorkerStatus
 	currentConnPriority conntype.ConnPriority
@@ -281,6 +288,21 @@ func (conn *Conn) EverConnected() bool {
 // Safe to call concurrently.
 func (conn *Conn) IsLazyDetached() bool {
 	if !conn.opened {
+		return false
+	}
+	// V17.4 (2026-06-06): sub-state coverage. If conn is in active-lazy
+	// state (opened=true) but the activity listener is NOT armed —
+	// e.g. iceTimeout fired but relayTimeout has not yet, or
+	// engine.go:2801 remote-offline-close ran without driving the
+	// lazy-mgr transition (V17.3 fixed the call site, but pre-V17.3
+	// state may still linger) — then outbound user-traffic cannot
+	// wake the peer via the fake-IP edge. Remote-OFFER is the only
+	// recovery path; V14 must let it through.
+	//
+	// Conservative default: if the predicate is unset (nil), assume
+	// armed (= keep V14 anti-spam strict). Production wiring sets it
+	// to lazyConnMgr.IsListenerArmed.
+	if conn.isActivityListenerArmedFn != nil && !conn.isActivityListenerArmedFn() {
 		return false
 	}
 	return conn.IsIntentionallyDetached() && conn.everConnected.Load()
@@ -536,6 +558,19 @@ func (conn *Conn) SetOnDisconnected(handler func(remotePeer string)) {
 // on the Conn struct for the full rationale.
 func (conn *Conn) SetOnWGTimeoutRecover(handler func()) {
 	conn.onWGTimeoutRecover = handler
+}
+
+// SetIsActivityListenerArmedFn wires a predicate used by the V17.4
+// stuck-recovery branch of IsLazyDetached(). When the conn is in the
+// active lazy-pause state (opened=true + intentionallyDetached=true)
+// but the lazy-mgr has NOT armed an activity listener for this peer
+// (e.g. iceTimeout sub-state before relayTimeout, or after
+// engine.go:2801 remote-offline-close without lazy-mgr transition),
+// no outbound traffic edge can wake the peer — the remote OFFER is
+// the only recovery path, so V14 must let it through. The predicate
+// returns true if the listener is currently armed.
+func (conn *Conn) SetIsActivityListenerArmedFn(fn func() bool) {
+	conn.isActivityListenerArmedFn = fn
 }
 
 // SetRosenpassInitializedPresharedKeyValidator sets a function to check if Rosenpass has taken over
