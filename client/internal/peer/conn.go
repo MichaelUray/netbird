@@ -1610,29 +1610,29 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 //
 // Phase 3.7i (#5989), Codex review 2026-05-05.
 func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
-	// V13.1 (2026-06-03): block relay-activity ICE-recovery when we just
-	// lazy-detached. Legacy peers without f433f1b42 keep emitting both
-	// eager bootstrap-OFFERs (signal channel — V13 gates those in
-	// ActivatePeerForMessage) AND >32-byte type-4 WG transport packets
-	// over the relay (e.g. routing keep-alives), and the latter would
-	// otherwise reach here and re-arm ICE within seconds of every
-	// runDynamicInactivityLoop teardown. Net result: ICE bounces
-	// detach -> attach every ~3 min, peer effectively stays P2P-up
-	// forever, no real user data crosses the link. User spec: no P2P
-	// link to legacy peers without real data transfer.
+	// V13.1 RETIRED by V18.1 (2026-06-06): the original V13.1 gate
+	// (block relay-activity ICE-recovery when IsLazyDetached()) was a
+	// no-op from 2026-06-03 to V18 because the listener-armed predicate
+	// was never wired to a real source — IsLazyDetached returned false
+	// in the inactivity-timeout sub-state, so V13.1 never fired. V18
+	// (HandleICEInactivityTransition state-sync) closed that gap → V13.1
+	// suddenly became active → blocked every legitimate user-traffic-
+	// driven Relay-to-P2P upgrade (production W11 → Marl Creek: after
+	// 4-min idle, Relay-only, but user traffic over Relay would no
+	// longer re-attach ICE).
 	//
-	// Local outbound user-traffic still wakes the peer via the lazy
-	// manager's onPeerActivity path (lazyconn/manager/manager.go:675),
-	// which is independent of this fast-path.
-	//
-	// Initial connect (everConnected=false) is NOT gated. A peer that
-	// has never been P2P-up has no AttachICEOnRelayActivity reason
-	// because everConnected=false short-circuits below anyway, so this
-	// branch only adds latency to the legacy-spam case.
-	if conn.IsLazyDetached() {
-		conn.logDiagSnapshot("V13.1-relay-activity-blocked-intentionally-detached")
-		return false
-	}
+	// Decision: drop V13.1 entirely. V14 (conn_mgr.go ActivatePeer-
+	// ForMessage) and V15 (cold-boot OFFER) gate signal-channel spam
+	// from legacy peers; that is the primary defence. Transport-level
+	// relay-data is rarer than signal-OFFER spam, and conflating it
+	// with "intentional spam" forbids the legitimate "user is
+	// transferring data" path that the user spec explicitly requires
+	// ("wenn Datentransfer stattfindet, soll P2P wiederhergestellt
+	// werden"). If legacy keep-alives later prove to wake P2P too
+	// aggressively, the right gate is a LastActivities-based check
+	// for local outbound traffic within a window (Phase-3.7j Fix-C
+	// pattern, see conn_mgr.go DeactivatePeer), NOT a coarse
+	// IsLazyDetached return.
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #3).
 	// Relay activity is an unambiguous signal that the local stack is
 	// re-engaging ICE — any preceding intentional-detach is no longer
