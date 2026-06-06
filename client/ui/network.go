@@ -35,26 +35,29 @@ const (
 type filter string
 
 func (s *serviceClient) showNetworksUI() {
-	// V17 (2026-06-04): Singleton-Pattern — wenn das Fenster bereits
-	// existiert, nur erneut zeigen statt neu erzeugen. Das verhindert
-	// das Crash-Szenario das w11-test1 beobachtete: bei jedem Re-Open
-	// wurde s.wNetworks überschrieben, alte startAutoRefresh-Goroutinen
-	// liefen weiter mit veralteten Closure-Captures, und der nächste
-	// Tick traf gelegentlich ein bereits geschlossenes Window-Objekt
-	// (nil-Content / nil-Refresh) → Fyne-segfault.
-	if s.wNetworks != nil {
-		s.wNetworks.Show()
-		s.wNetworks.RequestFocus()
-		return
-	}
+	// V17.3 (2026-06-06): Singleton-Pattern entfernt. netbird-ui spawnt
+	// für `-networks=true` einen eigenen Subprozess (event_handler.go:244),
+	// pro Subprozess existiert immer genau EIN Window — der Singleton-
+	// Check ist also wirkungslos und würde im Main-Process-Modell sogar
+	// einen Fyne-#3280-Reuse-after-teardown-Trigger erzeugen.
 	s.wNetworks = s.app.NewWindow("Peers and Networks")
 
+	// V17.3 R1+R7: lokaler Window-Lifecycle-Context. Wird beim Schließen
+	// gecancelt, OHNE den Root-s.ctx (= grpc-Dial, eventManager) zu
+	// töten. V17.0 hatte s.cancel() in SetOnClosed — das killte den
+	// Subprozess-Root-Context und ließ in-flight render+grpc panic'en
+	// auf eine fyne.Do gegen das gerade tot-gestellte Window. Resultat:
+	// spontanes Window-disappear (User-Bericht 2026-06-06).
+	winCtx, winCancel := context.WithCancel(s.ctx)
+
 	allGrid := container.New(layout.NewGridLayout(3))
-	go s.updateNetworks(allGrid, allNetworks)
+	// V17.3 R2: initial refresh läuft jetzt durch updateNetworksGuarded,
+	// das winCtx-Cancel und nil-Content-Race berücksichtigt.
+	go s.updateNetworksGuarded(winCtx, allGrid, allNetworks, true)
 	overlappingGrid := container.New(layout.NewGridLayout(3))
 	exitNodeGrid := container.New(layout.NewGridLayout(3))
 	routeCheckContainer := container.NewVBox()
-	peersBundle := s.buildPeersTabContent(s.ctx)
+	peersBundle := s.buildPeersTabContent(winCtx) // R1: window-scoped, nicht s.ctx
 	// Wrap the Peers tab content in a Stack so it fills the full tab
 	// area (NewBorder alone collapses when child MinSizes are small).
 	tabs := container.NewAppTabs(
@@ -102,15 +105,28 @@ func (s *serviceClient) showNetworksUI() {
 	tabs.OnSelected = func(item *container.TabItem) {
 		updateFooter()
 		if item != nil && item.Text != peersText {
-			s.updateNetworksBasedOnDisplayTab(tabs, allGrid, overlappingGrid, exitNodeGrid)
+			// V17.3 R3: tab-switch via guarded async; bestehender
+			// synchroner s.wNetworks.Content().Refresh()-Pfad konnte
+			// auf nil deref'en wenn winCtx schon canceled war.
+			grid, f := getGridAndFilterFromTab(tabs, allGrid, overlappingGrid, exitNodeGrid)
+			go s.updateNetworksGuarded(winCtx, grid, f, false)
 		}
 	}
 	tabs.OnUnselected = func(item *container.TabItem) {
 		// Only reset network grids when leaving a network tab; the
 		// peers VBox manages its own state.
 		if item != nil && item.Text != peersText {
+			// V17.3 R3: skip nach window-cancel; mutate im UI-thread
+			// um slice-race mit gleichzeitigem grid.Add aus auto-
+			// refresh-tick zu vermeiden.
+			if winCtx.Err() != nil {
+				return
+			}
 			grid, _ := getGridAndFilterFromTab(tabs, allGrid, overlappingGrid, exitNodeGrid)
-			grid.Objects = nil
+			fyne.Do(func() {
+				grid.Objects = nil
+				grid.Refresh()
+			})
 		}
 	}
 
@@ -133,7 +149,7 @@ func (s *serviceClient) showNetworksUI() {
 	s.wNetworks.SetContent(content)
 	s.wNetworks.Show()
 
-	s.startAutoRefresh(10*time.Second, tabs, allGrid, overlappingGrid, exitNodeGrid)
+	s.startAutoRefresh(winCtx, winCancel, 10*time.Second, tabs, allGrid, overlappingGrid, exitNodeGrid)
 }
 
 func (s *serviceClient) updateNetworks(grid *fyne.Container, f filter) {
@@ -383,23 +399,17 @@ func (s *serviceClient) showError(err error) {
 	dialog.ShowError(fmt.Errorf("%s", wrappedMessage), s.wNetworks)
 }
 
-func (s *serviceClient) startAutoRefresh(interval time.Duration, tabs *container.AppTabs, allGrid, overlappingGrid, exitNodesGrid *fyne.Container) {
-	// V17 (2026-06-04): Goroutine via Context kontrollieren statt
-	// ausschließlich über ticker.Stop(). ticker.Stop() unterbricht nur
-	// neue Ticks, aber bereits im Channel wartende Ticks werden noch
-	// gelesen — die Goroutine kann dann auf ein Window zugreifen das
-	// schon geschlossen ist (Window-1's content nil-deref auf w11-test1).
-	// Plus: lokale Window-Referenz erfassen statt s.wNetworks (das Field
-	// kann inzwischen auf ein neueres Window zeigen, wenn die UI mehrfach
-	// reaktiviert wurde).
+func (s *serviceClient) startAutoRefresh(winCtx context.Context, winCancel context.CancelFunc, interval time.Duration, tabs *container.AppTabs, allGrid, overlappingGrid, exitNodesGrid *fyne.Container) {
+	// V17.3: Window-scoped ctx wird vom showNetworksUI() vorgegeben.
+	// Auto-Refresh-Goroutine läuft mit demselben winCtx und stoppt sauber
+	// wenn das Window schließt — ohne den Root s.ctx anzugreifen.
 	w := s.wNetworks
-	ctx, cancel := context.WithCancel(s.ctx)
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-winCtx.Done():
 				return
 			case <-ticker.C:
 				// Silent mode: auto-refresh never pops up modal "not
@@ -409,18 +419,53 @@ func (s *serviceClient) startAutoRefresh(interval time.Duration, tabs *container
 					return
 				}
 				grid, f := getGridAndFilterFromTab(tabs, allGrid, overlappingGrid, exitNodesGrid)
-				w.Content().Refresh()
-				s.updateNetworksSilent(grid, f)
+				// V17.3 R4: updateNetworksGuarded snapshot-t w und prüft
+				// winCtx vor jedem fyne.Do — kein nil-deref auf
+				// s.wNetworks.Content() mehr nach window-close.
+				s.updateNetworksGuarded(winCtx, grid, f, true)
 			}
 		}
 	}()
 
 	w.SetOnClosed(func() {
-		cancel()
-		// V17: das Singleton-Field räumen, damit das nächste showNetworksUI()
-		// wieder ein frisches Window erzeugt.
-		s.wNetworks = nil
-		s.cancel()
+		// V17.3 R1+R6+R7: NUR window-scope cancel, NICHT s.cancel().
+		// V17 hatte hier zusätzlich:
+		//   s.wNetworks = nil  (Singleton-Reset)
+		//   s.cancel()         (Root-Context-Kill — Hauptursache des
+		//                       Window-disappear-Bugs)
+		// Beide wurden entfernt: Singleton ist im Subprozess-Modell
+		// wirkungslos, und Root-Cancel killt grpc + in-flight render-
+		// goroutines die dann auf das gerade tot-gestellte Window
+		// fyne.Do(...) feuern → "Fenster schließt sich von selbst".
+		winCancel()
+	})
+}
+
+// updateNetworksGuarded ist die V17.3-sichere Variante: prüft den
+// window-scope context, snapshot-t die window-reference lokal, und führt
+// alle Container-Mutationen über fyne.Do auf dem UI-Thread aus.
+// Skip silently wenn winCtx schon canceled oder window weg.
+func (s *serviceClient) updateNetworksGuarded(winCtx context.Context, grid *fyne.Container, f filter, silent bool) {
+	if winCtx == nil || winCtx.Err() != nil {
+		return
+	}
+	w := s.wNetworks // snapshot — falls extern reassigned wird
+	if w == nil {
+		return
+	}
+	s.updateNetworksWithMode(grid, f, silent)
+	// V17.3: post-refresh content-Refresh nur wenn ctx noch lebt + window
+	// noch existiert. Im UI-thread durch fyne.Do serialisiert.
+	if winCtx.Err() != nil {
+		return
+	}
+	fyne.Do(func() {
+		if winCtx.Err() != nil {
+			return
+		}
+		if c := w.Content(); c != nil {
+			c.Refresh()
+		}
 	})
 }
 

@@ -2794,11 +2794,25 @@ func (e *Engine) scheduleRemoteOfflineClose(pubKey string) {
 			return
 		}
 		log.Infof("[peer: %s] remote went offline (debounced %s), closing local conn (p2p-dynamic)", pubKey, remoteOfflineGracePeriod)
-		// Remote-offline close: keep the WG peer entry so that if the
-		// remote comes back online and traffic flows, the route-mgr-
-		// applied AllowedIPs are still in place. The lazy-mgr will
-		// reactivate the peer through the activity listener.
-		conn.Close(false, true)
+		// V17.3 Fix B (2026-06-06): zuerst Lazy-Manager über remote-driven
+		// idle informieren. Ohne diesen Aufruf bleibt der WG-Peer-Endpoint
+		// auf stale public-IP/relay-proxy stehen — die nächste
+		// outbound-User-Traffic-Aktion landet direkt am stale public-Port
+		// statt am fake-IP-listener, der lazy-Listener kommt nie wieder
+		// hoch, und V14 blockt den remote-Recovery-Pfad. Resultat (vor
+		// Fix): Peer permanent unreachable bis NetBird-App-Restart
+		// (S26 ↔ Marl Creek 2026-06-06 beobachtet).
+		//
+		// DeactivatePeer routet je nach deactivatePeerActionFor entweder
+		// in den lazy-mgr (= rüstet Activity-Listener neu + setzt
+		// fake-IP-Endpoint via setupLazyConn) oder in den ICE-Detach-
+		// Fallback. Beide sind sicherer als der nackte conn.Close, der
+		// keinerlei Lazy-State-Transition mitmacht.
+		if e.connMgr != nil {
+			e.connMgr.DeactivatePeer(conn)
+		} else {
+			conn.Close(false, true)
+		}
 	})
 	e.peerOfflineDebounce[pubKey] = t
 }
