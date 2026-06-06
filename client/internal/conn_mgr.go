@@ -880,25 +880,26 @@ func (e *ConnMgr) DetachICEForPeer(peerKey string) error {
 	// cleared by every Attach-family method, ConnMgr.ActivatePeer,
 	// onNetworkChange and onICEFailed (see Conn.intentionallyDetached
 	// for the full list of clear-points).
+	//
+	// V18 reverted (2026-06-06): a prior commit added
+	// lazyConnMgr.HandleICEInactivityTransition here to force the
+	// lazy-mgr from watcherInactivity → watcherActivity (arm listener).
+	// In production the listener's setupLazyConn (UpdatePeer with
+	// fakeIP 127.2.x.y) raced conn.go:771 "ICE disconnected, set Relay
+	// to active connection" (UpdatePeer with relay-proxy 127.1.x.y);
+	// whichever wrote last won, leaving either a stranded fake-IP
+	// listener (relay traffic broken) or a stranded relay endpoint
+	// (lazy wake broken). W11 → Marl Creek: pings failed in BOTH
+	// Relay and P2P states. The two states are semantically distinct:
+	// watcherActivity = "fully idle, only listener" (p2p-lazy mode);
+	// ICE-detached-relay-only = "relay carries traffic, no ICE worker"
+	// (p2p-dynamic inactivity-timeout). Folding the second into the
+	// first is incorrect. V18.1 (V13.1-gate drop) alone is sufficient
+	// to allow relay-activity → P2P upgrade; the cosmetic 4-min
+	// legacy-peer re-establish cycle returns but Relay carries traffic
+	// continuously so user pings always work.
 	conn.MarkIntentionallyDetached()
-	if err := conn.DetachICE(); err != nil {
-		return err
-	}
-
-	// V18 state-sync (2026-06-06): notify the lazy-mgr so it transitions
-	// watcherInactivity → watcherActivity and arms the activity listener.
-	// Without this, the conn is intentionallyDetached but the lazy-mgr
-	// still thinks the peer is active → V14 anti-spam predicate sees
-	// !listener-armed → IsLazyDetached returns false → legacy peer
-	// (pre-0.68) OFFERs fall through V14 into V17.4 stuck-recovery, which
-	// closes the conn and resets the cycle every ~4 min. Production W11
-	// + Marl Creek v0.60.4 reproduced this loop. The state-sync runs in
-	// the lazy-mgr without touching the conn (Relay tunnel stays up,
-	// opened stays true), so V14 evaluates correctly on the next OFFER.
-	if e.lazyConnMgr != nil {
-		e.lazyConnMgr.HandleICEInactivityTransition(peerKey)
-	}
-	return nil
+	return conn.DetachICE()
 }
 
 func (e *ConnMgr) Close() {
