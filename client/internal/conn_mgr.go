@@ -593,33 +593,17 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		return
 	}
 
-	// V17.4 stuck-recovery (2026-06-06): a remote OFFER arriving while
-	// (a) the peer is in intentionally-detached state (lazy-pause), but
-	// (b) the lazy-mgr has NO activity listener armed for this peer, means
-	// local outbound traffic CANNOT wake the peer (the fake-IP edge
-	// listener is not installed). Without an explicit re-arm path the
-	// peer is permanently stuck: V14 blocks the OFFER, ActivatePeer
-	// returns false because watcherInactivity ignores it, and
-	// OnRemoteOffer eventually drops the message with "receiver not
-	// ready" (handshaker dead since Close).
-	//
-	// Drive the lazy-mgr DeactivatePeer pathway to re-arm the activity
-	// listener + restore the fake-IP endpoint, then return; the next
-	// OFFER (within ~30s) or local outbound traffic will trigger normal
-	// activation. This is the targeted reverse of the GAP that V17.3
-	// closed at engine.go:2801 — but for the (rarer) case where the
-	// state-drift was created by a different code path or an older
-	// build before V17.3.
-	if e.mode == connectionmode.ModeP2PDynamic &&
-		msgType == sProto.Body_OFFER &&
-		conn.IsIntentionallyDetached() &&
-		conn.EverConnected() &&
-		e.lazyConnMgr != nil &&
-		!e.lazyConnMgr.IsListenerArmed(conn.ConnID()) {
-		conn.Log.Infof("V17.4 stuck-recovery: remote OFFER on intentionally-detached peer w/o activity-listener — re-arm lazy idle")
-		e.lazyConnMgr.DeactivatePeer(conn.ConnID())
-		return
-	}
+	// V17.4 stuck-recovery removed by V18.3 (2026-06-09): with V14
+	// (IsLazyDetached) now gating the inbound OFFER unconditionally
+	// when intentionallyDetached + everConnected + opened, the
+	// "stuck" precondition (legacy OFFER falls through V14, lazy-mgr
+	// can't activate) no longer occurs in this path. The relay-active
+	// wake-up path (AttachICEOnRelayActivity, V13.1 gate dropped by
+	// V18.1) handles user-traffic-driven recovery; the conn close that
+	// V17.4 triggered via lazyConnMgr.DeactivatePeer was itself the
+	// loop driver (close → !opened → next OFFER bypasses V14 → ICE
+	// re-attach → 4-min idle → close). The simpler predicate eliminates
+	// the loop without removing any legitimate wake path.
 
 	if found := e.lazyConnMgr.ActivatePeer(conn.GetKey()); found {
 		// Phase 3.7j: clear the intentional-detach marker (clear-point #4).

@@ -285,24 +285,26 @@ func (conn *Conn) EverConnected() bool {
 // the three identical inline checks (V13.1 conn.go:1562, V14
 // conn_mgr.go:547, V14.1 conn.go:2206).
 //
+// V17.4 listener-armed short-circuit removed by V18.3 (2026-06-09):
+// after V18.2 reverted the DetachICEForPeer state-sync, the listener
+// is never armed in the p2p-dynamic inactivity-timeout sub-state, so
+// the V17.4 check always returned false → V14 anti-spam never fired
+// on the ICE-detached-Relay-only path. Production S26 observed every
+// 4 min legacy-peer-OFFER re-attach cycles for both Lethbridge and a
+// 178.183 endpoint despite zero user traffic — exactly the
+// lazy-bootstrap-spam pattern V14 was designed to block.
+//
+// Wake-up paths remain intact:
+//   - User outbound traffic over Relay → AttachICEOnRelayActivity
+//     (V13.1 gate dropped by V18.1) → SendOffer (we initiate, remote
+//     responds with Answer; V14 only gates inbound OFFER) → P2P up.
+//   - Remote-initiated wake from a non-legacy peer that respects lazy
+//     semantics never sends bootstrap-OFFERs while we are
+//     intentionally-detached, so V14 doesn't impact them.
+//
 // Safe to call concurrently.
 func (conn *Conn) IsLazyDetached() bool {
 	if !conn.opened {
-		return false
-	}
-	// V17.4 (2026-06-06): sub-state coverage. If conn is in active-lazy
-	// state (opened=true) but the activity listener is NOT armed —
-	// e.g. iceTimeout fired but relayTimeout has not yet, or
-	// engine.go:2801 remote-offline-close ran without driving the
-	// lazy-mgr transition (V17.3 fixed the call site, but pre-V17.3
-	// state may still linger) — then outbound user-traffic cannot
-	// wake the peer via the fake-IP edge. Remote-OFFER is the only
-	// recovery path; V14 must let it through.
-	//
-	// Conservative default: if the predicate is unset (nil), assume
-	// armed (= keep V14 anti-spam strict). Production wiring sets it
-	// to lazyConnMgr.IsListenerArmed.
-	if conn.isActivityListenerArmedFn != nil && !conn.isActivityListenerArmedFn() {
 		return false
 	}
 	return conn.IsIntentionallyDetached() && conn.everConnected.Load()
