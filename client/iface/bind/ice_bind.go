@@ -184,7 +184,18 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	// per-burst spam.
 	if stdEp, isStd := ep.(*Endpoint); isStd {
 		for _, buf := range bufs {
-			if isTransportPkg([][]byte{buf}, len(buf)) {
+			// V18.6 (2026-06-09): also filter WG keep-alive transport
+			// packets (exactly 32 bytes = 16-byte WG header + 16-byte
+			// empty-payload Poly1305 auth tag). User traffic of any
+			// kind carries at least an IP header inside the encrypted
+			// payload, so real packets are >32 bytes wire-size. Without
+			// this size filter our own WG persistent-keepalive (default
+			// 25 s) drove the AttachICEOnRelayActivity wake path every
+			// idle cycle, producing the 4-min P2P re-attach loop after
+			// V18.4 split send/recv. The receive-side filter in
+			// receiveRelayed already drops legacy peer keep-alives;
+			// pairing both directions here gives clean lazy semantics.
+			if isTransportPkg([][]byte{buf}, len(buf)) && len(buf) > 32 {
 				// V18.4 (2026-06-09): outbound path uses the
 				// callback-firing variant so AttachICEOnRelayActivity
 				// triggers only on locally-initiated traffic; legacy
