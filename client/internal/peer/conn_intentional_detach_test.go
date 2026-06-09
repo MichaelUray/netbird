@@ -136,22 +136,30 @@ func TestConn_AttachICEClearsMarker(t *testing.T) {
 	})
 }
 
-// TestConn_AttachICEOnRelayActivityClearsMarker verifies clear-point #3.
-// The method returns false immediately when the Conn is not in
-// ModeP2PDynamic, but the clear sits above that gate so it must still
-// fire. Without this clear, a relay-activity-driven wake-up after an
-// intentional detach would leave the marker latched and Commit 2's
-// guard predicate would silently skip the next legitimate fail.
-func TestConn_AttachICEOnRelayActivityClearsMarker(t *testing.T) {
+// TestConn_AttachICEOnRelayActivityPreservesMarkerOnEarlyReturn verifies
+// V18.9 (2026-06-09): when AttachICEOnRelayActivity bails on a pre-
+// check (mode != p2p-dynamic, !opened, currentConnPriority != Relay),
+// the intentionallyDetached marker must NOT be cleared. The earlier
+// behaviour cleared the marker unconditionally at function entry,
+// which silently undid V18.8's onICEStateDisconnected marker-set
+// during the relay-fallback transition window (currentConnPriority
+// briefly None while pion notifies + relay-fallback runs). Without
+// V18.9, the legacy peer's next OFFER bypassed V14 and re-attached.
+//
+// On success-path (priority == Relay, mode == p2p-dynamic, opened),
+// the marker still gets cleared — via AttachICEFrom's clear-point #1
+// (conn.go:1833) which is called inside this function.
+func TestConn_AttachICEOnRelayActivityPreservesMarkerOnEarlyReturn(t *testing.T) {
 	conn := newMarkerTestConn(t)
 	conn.MarkIntentionallyDetached()
 	// Default ConnConfig is not ModeP2PDynamic, so the method early-
-	// returns false. The clear should still have run.
+	// returns false. The marker must remain set so V14/V18.5 stay
+	// strict for the next signal-OFFER.
 	if attempted := conn.AttachICEOnRelayActivity(); attempted {
 		t.Fatal("AttachICEOnRelayActivity unexpectedly attempted attach on non-dynamic mode")
 	}
-	if conn.IsIntentionallyDetached() {
-		t.Fatal("AttachICEOnRelayActivity did not clear the marker (clear-point #3)")
+	if !conn.IsIntentionallyDetached() {
+		t.Fatal("V18.9: AttachICEOnRelayActivity must NOT clear marker on pre-check bail")
 	}
 }
 

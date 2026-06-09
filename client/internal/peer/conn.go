@@ -1679,11 +1679,22 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	// for local outbound traffic within a window (Phase-3.7j Fix-C
 	// pattern, see conn_mgr.go DeactivatePeer), NOT a coarse
 	// IsLazyDetached return.
-	// Phase 3.7j: clear the intentional-detach marker here (clear-point #3).
-	// Relay activity is an unambiguous signal that the local stack is
-	// re-engaging ICE — any preceding intentional-detach is no longer
-	// the current truth.
-	conn.ClearIntentionallyDetached()
+	// V18.9 (2026-06-09): moved ClearIntentionallyDetached from before
+	// the priority/mode checks to AFTER. The earlier unconditional clear
+	// at function entry created a race window where every relay-activity
+	// edge — including the bursts that fire during the ICE-disconnect →
+	// relay-fallback transition (when currentConnPriority is still ICE
+	// or None), or from spurious outbound traffic that the V18.4 filter
+	// can't classify as user-initiated (e.g. OS-generated responses to
+	// inbound packets) — cleared the marker WITHOUT actually re-engaging
+	// ICE. Combined with V18.8 (mark on every pion-disconnect), this
+	// silently undid V18.8's gate within seconds and left the cycle
+	// intact (W11 production V18.8 test: cycle reduced but not gone,
+	// 8-14 s detach→re-attach intervals interleaved with longer ones).
+	//
+	// Phase 3.7j: clear the intentional-detach marker — Relay activity
+	// is an unambiguous signal that the local stack is re-engaging ICE.
+	// Cleared only after we confirm the call will proceed to re-engage.
 	conn.mu.Lock()
 	if conn.config.Mode != connectionmode.ModeP2PDynamic {
 		conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-mode-not-p2p-dynamic")
