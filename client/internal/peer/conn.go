@@ -768,6 +768,29 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 		}
 	}
 
+	// V18.8 (2026-06-09): in p2p-dynamic mode, treat every ICE-state-
+	// disconnect as intentional. The pion-side disconnect (NAT binding
+	// expiry, consent freshness failure, idle-peer keep-alive miss)
+	// happens silently without runDynamicInactivityLoop's MarkIntention-
+	// allyDetached firing — so V14/V18.5 saw marker=false and the guard
+	// fired SendOffer ~800 ms after the disconnect, driving the 4-min
+	// re-attach cycle even with zero user traffic. Diagnostic build
+	// V18.7-diag confirmed every SendOffer originated from onGuardEvent
+	// (conn.go:1161) and AttachICEFrom (conn.go:1861) with src=signal,
+	// marker=false — neither would have fired with the marker set.
+	//
+	// In p2p-dynamic mode the design contract is "lazy ICE": when the
+	// pair drops we go relay-only until user traffic re-engages us
+	// (ICEBind.Send → recordOutbound → AttachICEOnRelayActivity → which
+	// clears the marker as clear-point #3). Stamping the marker here
+	// makes the lazy semantics work regardless of which side initiated
+	// the disconnect. Real pion failures (ConnectionStateFailed) still
+	// clear the marker via onICEFailed → clear-point #6, so failure
+	// recovery is untouched.
+	if conn.config.Mode == connectionmode.ModeP2PDynamic {
+		conn.MarkIntentionallyDetached()
+	}
+
 	// switch back to relay connection
 	if conn.isReadyToUpgrade() {
 		conn.Log.Infof("ICE disconnected, set Relay to active connection")
@@ -1071,7 +1094,7 @@ func (conn *Conn) onGuardEvent() {
 	// clear the marker via AttachICE / AttachICEUserInitiated /
 	// AttachICEOnRelayActivity (see clear-point list at conn.go:230).
 	if conn.config.Mode == connectionmode.ModeP2PDynamic && conn.IsIntentionallyDetached() {
-		conn.Log.Infof("V18.5 guard-skip: intentionally detached, p2p-dynamic lazy mode")
+		conn.Log.Tracef("guard: skip offer (intentionally detached, p2p-dynamic lazy mode)")
 		conn.logDiagSnapshot("guard-skip-intentionally-detached")
 		return
 	}
