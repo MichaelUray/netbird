@@ -1055,6 +1055,27 @@ func (conn *Conn) shouldSkipBootstrapOffer() bool {
 }
 
 func (conn *Conn) onGuardEvent() {
+	// V18.5 (2026-06-09): hard skip when the local conn is intentionally
+	// detached (= inactivity-timer drove DetachICEForPeer). The guard's
+	// purpose is recovery from network/relay/signal disruption; an
+	// intentional lazy detach is none of those. Without this skip the
+	// guard fires SendOffer within ~800 ms of the ICE-state-disconnect
+	// callback (production W11/S26: every 4-min idle → guard wakes peer
+	// → re-attach loop). The lazy-mode "wait for user traffic" path
+	// re-engages via ICEBind.Send → recordOutbound → AttachICEOnRelay-
+	// Activity (V18.4); the guard does not need to fire.
+	//
+	// Eager modes (p2p, relay-forced) and p2p-dynamic peers that lost
+	// connectivity (intentionallyDetached=false) keep the always-on
+	// recovery behaviour. Wake paths from user-side outbound traffic
+	// clear the marker via AttachICE / AttachICEUserInitiated /
+	// AttachICEOnRelayActivity (see clear-point list at conn.go:230).
+	if conn.config.Mode == connectionmode.ModeP2PDynamic && conn.IsIntentionallyDetached() {
+		conn.Log.Tracef("guard: skip offer (intentionally detached, p2p-dynamic lazy mode)")
+		conn.logDiagSnapshot("guard-skip-intentionally-detached")
+		return
+	}
+
 	// Respect remote peer's resolved connection mode: when the management
 	// server has placed the REMOTE peer in p2p-lazy (typical for legacy
 	// clients covered by LegacyLazyFallback even though the account-wide
