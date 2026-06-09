@@ -816,6 +816,26 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 	// recovery is untouched.
 	if conn.config.Mode == connectionmode.ModeP2PDynamic {
 		conn.MarkIntentionallyDetached()
+		// V18.12 (2026-06-09): also remove the handshaker's ICE listener
+		// so subsequent remote OFFERs cannot directly re-create the pion
+		// agent and pair-check without going through the gated AttachICE-
+		// family paths. Without this, handshaker.Listen sees a remote
+		// OFFER → iceListener (workerICE.OnNewOffer) → ICE re-attaches
+		// silently (no SendOffer log line, no AttachICEFrom diag, just
+		// 'set ICE to active connection' 10-14 s after disconnect).
+		// V18.10/V18.11 gates never fired because this path bypasses
+		// them entirely. Mirrors the listener-removal in DetachICE
+		// (conn.go:2218) but here for the pion-side disconnect case
+		// where DetachICE never runs.
+		//
+		// Listener is re-attached automatically by AttachICEFrom →
+		// attachICEListenerLocked when user activity (RelayActivity)
+		// fires a legitimate wake. Legacy peer signal-OFFER spam still
+		// gets dropped at handshaker.Listen with the "remote OFFER
+		// without local ICE listener" log line.
+		if conn.handshaker != nil {
+			conn.handshaker.RemoveICEListener()
+		}
 	}
 
 	// switch back to relay connection
