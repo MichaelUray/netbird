@@ -1860,6 +1860,24 @@ func (conn *Conn) AttachICE() error {
 // is recorded in the blocked-backoff DIAG marker for offline analysis
 // (Fix-D D1.1, Codex 2026-05-29).
 func (conn *Conn) AttachICEFrom(src AttachICESource) error {
+	// V18.10 (2026-06-09): signal-driven re-attach must NOT proceed when
+	// the conn is intentionally detached in p2p-dynamic mode. V14 gate
+	// in ActivatePeerForMessage upstream is supposed to prevent this,
+	// but production traces (W11 V18.8-V18.9) show signal-driven
+	// AttachICEFrom (src=Signal) still firing during the relay-fallback
+	// transition — the marker that V18.8 stamped on onICEStateDisconnected
+	// gets cleared by an earlier clear-point before V14 sees it. By
+	// bailing here for src=Signal we keep the lazy gate strict even if
+	// V14's check raced the marker. User-driven wakes (RelayActivity,
+	// LazyActivity) are NOT gated — they are the legitimate path to
+	// re-engage P2P on real outbound traffic.
+	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
+		src == AttachICESourceSignal &&
+		conn.IsIntentionallyDetached() {
+		conn.Log.Tracef("V18.10 gate: skipping signal-driven AttachICE while intentionally detached (p2p-dynamic lazy)")
+		conn.logDiagSnapshot("AttachICEFrom-blocked-signal-intentionally-detached")
+		return nil
+	}
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #1).
 	// Signal-driven ICE re-attach is the explicit counterpart to an
 	// intentional detach; once we re-attach the marker must not linger
@@ -1996,6 +2014,18 @@ func (conn *Conn) AttachICEUserInitiated(minCooldown time.Duration) error {
 //
 // Codex D3b recommendation (2026-05-29).
 func (conn *Conn) AttachICEOnRemoteOffer(minCooldown time.Duration) error {
+	// V18.10 (2026-06-09): symmetric with AttachICEFrom gate. Remote
+	// OFFER is a signal-channel trigger — in p2p-dynamic lazy mode the
+	// remote should not be able to wake us by re-OFFERing while we are
+	// intentionally detached. User-driven wakes (RelayActivity / Lazy-
+	// Activity) clear the marker through the standard clear-points and
+	// then a subsequent legitimate signal cycle resumes naturally.
+	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
+		conn.IsIntentionallyDetached() {
+		conn.Log.Tracef("V18.10 gate: skipping AttachICEOnRemoteOffer while intentionally detached (p2p-dynamic lazy)")
+		conn.logDiagSnapshot("AttachICEOnRemoteOffer-blocked-intentionally-detached")
+		return nil
+	}
 	// Symmetric with the other Attach-paths: clear the intentional-detach
 	// marker since a remote OFFER is an explicit re-engage signal.
 	conn.ClearIntentionallyDetached()
