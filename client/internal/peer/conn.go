@@ -1071,7 +1071,7 @@ func (conn *Conn) onGuardEvent() {
 	// clear the marker via AttachICE / AttachICEUserInitiated /
 	// AttachICEOnRelayActivity (see clear-point list at conn.go:230).
 	if conn.config.Mode == connectionmode.ModeP2PDynamic && conn.IsIntentionallyDetached() {
-		conn.Log.Tracef("guard: skip offer (intentionally detached, p2p-dynamic lazy mode)")
+		conn.Log.Infof("V18.5 guard-skip: intentionally detached, p2p-dynamic lazy mode")
 		conn.logDiagSnapshot("guard-skip-intentionally-detached")
 		return
 	}

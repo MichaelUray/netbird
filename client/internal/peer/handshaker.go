@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -222,7 +223,10 @@ func (h *Handshaker) sendOffer() error {
 	}
 
 	offer := h.buildOfferAnswer()
-	h.log.Infof("sending offer with serial: %s", offer.SessionIDString())
+	// V18.7-diag: stamp the immediate caller so we can identify which
+	// path drives the SendOffer cycle on production W11/S26.
+	_, file, line, _ := runtime.Caller(2)
+	h.log.Infof("sending offer with serial: %s (called from %s:%d)", offer.SessionIDString(), file, line)
 
 	return h.signaler.SignalOffer(offer, h.config.Key)
 }
