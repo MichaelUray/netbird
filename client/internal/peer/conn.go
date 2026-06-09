@@ -25,10 +25,20 @@ import (
 	"github.com/netbirdio/netbird/client/internal/peer/worker"
 	"github.com/netbirdio/netbird/client/internal/portforward"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
+	"github.com/netbirdio/netbird/monotime"
 	"github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/connectionmode"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
 )
+
+// V18.11: cooldown window after MarkIntentionallyDetached during which
+// AttachICEOnRelayActivity bails. Tuned to outlast typical OS-response
+// bursts (TCP RST after relay-fallback drops the open connection,
+// mDNS broadcast retries, DNS retry storms) without rejecting genuine
+// sustained user traffic. 30 s = comfortably longer than the legacy
+// peer signal-OFFER interval (~2-3 min) yet short enough that user
+// activity after a fresh detach still wakes on the next packet burst.
+const v18_11RelayActivityCooldown = 30 * time.Second
 
 // MetricsRecorder is an interface for recording peer connection metrics
 type MetricsRecorder interface {
@@ -206,6 +216,20 @@ type Conn struct {
 	// ConnMgr.ActivatePeer pre-Open / onNetworkChange / onICEFailed).
 	intentionallyDetached atomic.Bool
 
+	// V18.11 (2026-06-09): monotonic timestamp of the most recent
+	// MarkIntentionallyDetached call. Used by AttachICEOnRelayActivity
+	// to enforce a post-detach cooldown window during which transient
+	// outbound activity (Android system traffic, mDNS, DNS retries,
+	// OS responses to inbound packets) cannot wake P2P. After the
+	// cooldown elapses, real user-initiated outbound traffic can wake
+	// the peer normally. Production S26 V18.10 trace: 13 re-attach
+	// cycles in 30 min with V18.10 gate firing only 3 times, the other
+	// 10 cycles came through AttachICEOnRelayActivity → AttachICEFrom
+	// (RelayActivity) from spurious outbound packets that bypassed
+	// the V18.4 isTransportPkg filter (real type-4 transport with
+	// payload > 32 bytes from internal sources).
+	intentionallyDetachedAt atomic.Int64
+
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
 	// from onICEFailed / onICEConnected; snapshot-read from
@@ -223,6 +247,9 @@ type Conn struct {
 // Safe to call concurrently. Idempotent.
 func (conn *Conn) MarkIntentionallyDetached() {
 	conn.intentionallyDetached.Store(true)
+	// V18.11: stamp the detach time so AttachICEOnRelayActivity can
+	// enforce a post-detach cooldown window.
+	conn.intentionallyDetachedAt.Store(int64(monotime.Now()))
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
@@ -1656,6 +1683,31 @@ func boolToConnStatus(connected bool) guard.ConnStatus {
 //
 // Phase 3.7i (#5989), Codex review 2026-05-05.
 func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
+	// V18.11 (2026-06-09): post-detach cooldown. Bail when the most
+	// recent MarkIntentionallyDetached call was within the cooldown
+	// window. Spurious outbound traffic that fires in the first ~30 s
+	// after a pion-side disconnect (Android system mDNS, DNS retry
+	// bursts, OS-generated TCP RSTs to inbound legacy keep-alives,
+	// internal NetBird route-manager pings, etc.) cannot wake P2P in
+	// this window. Sustained user activity outlasting 30 s — or any
+	// activity after the cooldown elapses — still wakes the peer
+	// normally. Production S26 V18.10 trace: 13 re-attach cycles in
+	// 30 min with V18.10 gate (signal-channel) firing only 3 times;
+	// the other 10 came through this path from non-user outbound.
+	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
+		conn.IsIntentionallyDetached() {
+		detachedAtNs := conn.intentionallyDetachedAt.Load()
+		if detachedAtNs > 0 {
+			since := monotime.Since(monotime.Time(detachedAtNs))
+			if since < v18_11RelayActivityCooldown {
+				conn.Log.Tracef("V18.11 cooldown: skipping AttachICEOnRelayActivity (detached %v ago, cooldown %v)",
+					since, v18_11RelayActivityCooldown)
+				conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-cooldown")
+				return false
+			}
+		}
+	}
+
 	// V13.1 RETIRED by V18.1 (2026-06-06): the original V13.1 gate
 	// (block relay-activity ICE-recovery when IsLazyDetached()) was a
 	// no-op from 2026-06-03 to V18 because the listener-armed predicate
