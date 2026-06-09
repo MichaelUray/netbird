@@ -94,8 +94,40 @@ func (r *ActivityRecorder) Remove(publicKey string) {
 	}
 }
 
-// record updates LastActivity for the given address using atomic store
+// record updates LastActivity for the given address using atomic store.
+//
+// V18.4 (2026-06-09): no longer fires the onActivity callback. Receive-
+// path packets (which were the original trigger source) include legacy
+// peer keep-alives that should NOT wake intentionally-detached peers.
+// Callers that want the wake-up edge must use recordOutbound instead;
+// the bidir Last-Activity timestamp is still maintained here so
+// LastActivities()-based heuristics (Phase-3.7j Fix-C local activity
+// gate, etc.) keep working unchanged.
 func (r *ActivityRecorder) record(address netip.AddrPort) {
+	r.mu.RLock()
+	record, ok := r.addrToPeer[address]
+	r.mu.RUnlock()
+	if !ok {
+		log.Warnf("could not find record for address %s", address)
+		return
+	}
+
+	now := int64(monotime.Now())
+	last := record.LastActivity.Load()
+	if now-last < saveFrequency {
+		return
+	}
+	record.LastActivity.CompareAndSwap(last, now)
+}
+
+// recordOutbound updates LastActivity AND fires the onActivity callback.
+// Called from the WG send path so the relay-activity → P2P upgrade only
+// triggers on locally-initiated outbound traffic. Without this split,
+// legacy (pre-0.68) peers' keep-alives arriving via relay would
+// repeatedly wake an intentionally-detached peer (production W11 + S26
+// 2026-06-09: 4-min detach / re-attach cycle for every paired legacy
+// peer, even with zero user traffic).
+func (r *ActivityRecorder) recordOutbound(address netip.AddrPort) {
 	r.mu.RLock()
 	record, ok := r.addrToPeer[address]
 	cb := r.onActivity
@@ -114,9 +146,8 @@ func (r *ActivityRecorder) record(address netip.AddrPort) {
 	if record.LastActivity.CompareAndSwap(last, now) && cb != nil {
 		// Fire only on the actual save edge (CAS success). Prevents
 		// duplicate events when many goroutines race on the same packet
-		// burst. Callback runs synchronously on the WG read/write
-		// goroutine -- handler MUST be cheap or self-defer to its own
-		// goroutine.
+		// burst. Callback runs synchronously on the WG send goroutine —
+		// handler MUST be cheap or self-defer to its own goroutine.
 		cb(record.PublicKey)
 	}
 }

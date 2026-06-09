@@ -185,7 +185,12 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	if stdEp, isStd := ep.(*Endpoint); isStd {
 		for _, buf := range bufs {
 			if isTransportPkg([][]byte{buf}, len(buf)) {
-				b.activityRecorder.record(stdEp.AddrPort)
+				// V18.4 (2026-06-09): outbound path uses the
+				// callback-firing variant so AttachICEOnRelayActivity
+				// triggers only on locally-initiated traffic; legacy
+				// peer keep-alives arriving via recv are intentionally
+				// excluded (see activity.go for full rationale).
+				b.activityRecorder.recordOutbound(stdEp.AddrPort)
 				break
 			}
 		}
