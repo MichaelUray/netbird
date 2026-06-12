@@ -40,6 +40,21 @@ import (
 // activity after a fresh detach still wakes on the next packet burst.
 const v18_11RelayActivityCooldown = 30 * time.Second
 
+// V18.13: burst-detection thresholds for AttachICEOnRelayActivity.
+// recordOutbound's saveFrequency in ActivityRecorder is 5 s — one
+// callback per peer at most every 5 s regardless of how many packets
+// flowed. So a sustained user TCP stream produces 1 callback every 5 s
+// while sparse Android background traffic (every ~2 min) produces 1
+// isolated callback. To distinguish: require >=3 callbacks within a
+// 30 s window. 3 callbacks ⇒ user transferred packets across at least
+// 10 s (= obvious data stream, not a stray system probe).
+// The 30 s window is a sliding bucket — the first callback after the
+// window expires starts a fresh window with count=1.
+const (
+	v18_13BurstWindow = 30 * time.Second
+	v18_13MinBurst    = int32(3)
+)
+
 // MetricsRecorder is an interface for recording peer connection metrics
 type MetricsRecorder interface {
 	RecordConnectionStages(
@@ -229,6 +244,19 @@ type Conn struct {
 	// the V18.4 isTransportPkg filter (real type-4 transport with
 	// payload > 32 bytes from internal sources).
 	intentionallyDetachedAt atomic.Int64
+
+	// V18.13 (2026-06-12): burst-detection counters for AttachICEOnRelayActivity.
+	// Track the number of relay-activity callbacks within a sliding window so
+	// only SUSTAINED outbound traffic (=user data stream) wakes P2P; single
+	// or sparse callbacks (Android system mDNS, periodic background sync,
+	// DNS retry, OS responses to inbound) cannot. Production S26 V18.12-real
+	// trace: cycle every ~2 min driven by Android background traffic to peer
+	// subnets (e.g. 10.1.41.0/24 for Marl Creek). recordOutbound's
+	// saveFrequency throttle (5 s) means a sustained user flow generates 1
+	// callback every 5 s; a 30 s window requires >=3 callbacks to attest
+	// real user activity.
+	relayActivityCount      atomic.Int32
+	relayActivityWindowStart atomic.Int64 // monotime ns of first count in current window
 
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
@@ -1714,8 +1742,21 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	// normally. Production S26 V18.10 trace: 13 re-attach cycles in
 	// 30 min with V18.10 gate (signal-channel) firing only 3 times;
 	// the other 10 came through this path from non-user outbound.
+	//
+	// V18.13 (2026-06-12): after the cooldown expires, require a
+	// SUSTAINED burst of relay-activity callbacks before waking P2P.
+	// recordOutbound's saveFrequency (5 s) caps the callback rate to
+	// 1/peer/5s. A user data stream produces a callback every 5 s;
+	// Android background traffic produces 1 isolated callback every
+	// ~2 min. Requiring >=3 callbacks in a 30 s window (= activity
+	// spanning at least 10 s of wall-clock time) lets user pings,
+	// SSH sessions, etc. wake the peer while filtering single
+	// android-system probes. Production S26 V18.12-real trace: cycle
+	// every ~2 min driven by single Android system packets to peer
+	// subnets (10.1.41.0/24 Marl Creek, 10.1.238.0/24 Lethbridge).
 	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
 		conn.IsIntentionallyDetached() {
+		now := monotime.Now()
 		detachedAtNs := conn.intentionallyDetachedAt.Load()
 		if detachedAtNs > 0 {
 			since := monotime.Since(monotime.Time(detachedAtNs))
@@ -1726,6 +1767,31 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 				return false
 			}
 		}
+
+		// Burst-detection: roll a 30 s sliding window of callback counts.
+		windowStart := conn.relayActivityWindowStart.Load()
+		if windowStart == 0 || monotime.Since(monotime.Time(windowStart)) > v18_13BurstWindow {
+			// Window expired (or never started) — start a fresh one.
+			conn.relayActivityWindowStart.Store(int64(now))
+			conn.relayActivityCount.Store(1)
+			conn.Log.Tracef("V18.13 burst: starting fresh 30s window, count=1/3")
+			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-burst-window-fresh")
+			return false
+		}
+		// Within an active window. Increment and check threshold.
+		count := conn.relayActivityCount.Add(1)
+		if count < v18_13MinBurst {
+			conn.Log.Tracef("V18.13 burst: %d/%d callbacks in window — need sustained traffic",
+				count, v18_13MinBurst)
+			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-burst-insufficient")
+			return false
+		}
+		// Threshold reached — sustained user traffic detected.
+		// Reset counters so the next detach cycle starts fresh.
+		conn.relayActivityCount.Store(0)
+		conn.relayActivityWindowStart.Store(0)
+		conn.Log.Infof("V18.13 burst: sustained user traffic confirmed (>=%d outbound callbacks in 30s) — proceeding with ICE re-attach",
+			v18_13MinBurst)
 	}
 
 	// V13.1 RETIRED by V18.1 (2026-06-06): the original V13.1 gate
