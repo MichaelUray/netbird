@@ -357,11 +357,29 @@ func (conn *Conn) EverConnected() bool {
 //     semantics never sends bootstrap-OFFERs while we are
 //     intentionally-detached, so V14 doesn't impact them.
 //
+// V18.14 (2026-06-12): dropped V17.2 !opened short-circuit. Production
+// S26 V18.13 trace showed lazy-mgr's relay-inactivity timer (default
+// 5 min) calls conn.Close (keepWgPeer=true) after sustained relay-only
+// idle. The Close sets opened=false but does NOT clear
+// intentionallyDetached. The V17.2 short-circuit then made IsLazyDetached
+// return false → V14 stopped gating → the very next legacy peer OFFER
+// drove lazyConnMgr.ActivatePeer at conn_mgr.go:624 → cycle.
+//
+// Removing the !opened gate makes the predicate report the lazy state
+// regardless of whether conn is opened or closed. User wake remains
+// intact because the fake-IP activity listener (armed by lazy-mgr at
+// the same transitionToActivityWatcherStateOnly that closes the conn)
+// fires lazyconn/manager.onPeerActivity → AttachICEFrom(LazyActivity),
+// which is NOT gated by V14 and clears the marker via its standard
+// clear-point at conn.go:1858.
+//
+// V17.2's original concern (S26 Marl Creek "stuck permanently") was a
+// different scenario: WG-peer endpoint had drifted to public-IP so the
+// fake-IP listener never armed. Post-V18 the listener is always armed
+// in watcherActivity state and the user wake path works through it.
+//
 // Safe to call concurrently.
 func (conn *Conn) IsLazyDetached() bool {
-	if !conn.opened {
-		return false
-	}
 	return conn.IsIntentionallyDetached() && conn.everConnected.Load()
 }
 

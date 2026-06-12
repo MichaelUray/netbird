@@ -221,28 +221,32 @@ func TestConn_OnNetworkChangeClearsMarker(t *testing.T) {
 	}
 }
 
-// TestConn_IsLazyDetached_OpenedFalseShortCircuit verifies the V17.2 fix:
-// when conn.opened is false (peer fully closed by relayTimeout / engine
-// shutdown / explicit close), IsLazyDetached must return false even if
-// the intentionally-detached marker is set and everConnected is true.
+// TestConn_IsLazyDetached_V18_14_OpenedFalseStillGated verifies the V18.14
+// drop of the V17.2 !opened short-circuit: when conn.opened is false
+// (peer fully closed by lazy-mgr's relayTimeout PeerConnClose), V14 must
+// STILL gate signal-OFFERs as long as intentionallyDetached + everConnected.
 //
-// Rationale: a fully-closed peer is in long-idle state. A remote-
-// initiated OFFER from a legacy peer is a legitimate reconnect attempt,
-// not bootstrap-spam — the anti-spam gate must let it through so the
-// peer can come back online. Without this short-circuit S26 stuck with
-// Marl Creek (2026-06-06): WG endpoint had drifted to public IP, the
-// activity-listener never triggered, and V14 blocked every recovery
-// path — leaving the peer permanently unreachable.
-func TestConn_IsLazyDetached_OpenedFalseShortCircuit(t *testing.T) {
+// Rationale: production S26 V18.13 trace showed the V17.2 short-circuit
+// re-opened the legacy-peer-OFFER spam path after a lazy-mgr relayTimeout
+// closed the conn (lazy-mgr's transitionToActivityWatcherStateOnly armed
+// the fake-IP listener but also closed the relay conn). With !opened →
+// IsLazyDetached returns false → V14 stops gating → next legacy OFFER
+// drives lazyConnMgr.ActivatePeer → re-engage cycle.
+//
+// User wake remains intact via the fake-IP listener path
+// (lazyconn/manager.onPeerActivity → AttachICEFrom(LazyActivity)), which
+// does NOT go through V14 and clears the marker via its own clear-point.
+func TestConn_IsLazyDetached_V18_14_OpenedFalseStillGated(t *testing.T) {
 	conn := newMarkerTestConn(t)
 
-	// Simulate the "post-success, lazy-detached, then fully closed" state.
+	// Simulate the "post-success, lazy-detached, then fully closed by
+	// lazy-mgr's relayTimeout" state.
 	conn.everConnected.Store(true)
 	conn.MarkIntentionallyDetached()
-	conn.opened = false // simulates Close() result
+	conn.opened = false // simulates lazy-mgr.DeactivatePeer Close result
 
-	if conn.IsLazyDetached() {
-		t.Fatal("IsLazyDetached must return false when opened=false (V17.2 short-circuit), even with everConnected+intentionallyDetached set")
+	if !conn.IsLazyDetached() {
+		t.Fatal("V18.14: IsLazyDetached must remain true when opened=false (post-lazy-mgr-Close) so V14 keeps gating legacy OFFER spam")
 	}
 }
 
