@@ -44,6 +44,9 @@ func (r *Route) RemoveRoute() error {
 }
 
 func (r *Route) AddAllowedIPs(peerKey string) error {
+	if ref, ok := r.allowedIPsRefcounter.Get(r.route.Network); ok && ref.Out == peerKey {
+		return nil
+	}
 	if ref, err := r.allowedIPsRefcounter.Increment(r.route.Network, peerKey); err != nil {
 		return fmt.Errorf("add allowed IP %s: %w", r.route.Network, err)
 	} else if ref.Count > 1 && ref.Out != peerKey {

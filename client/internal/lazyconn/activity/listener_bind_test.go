@@ -60,9 +60,14 @@ func (m *mockEndpointManager) ActivityRecorder() *bind.ActivityRecorder {
 // MockWGIfaceBind mocks WgInterface with bind support
 type MockWGIfaceBind struct {
 	endpointMgr *mockEndpointManager
+	mu          sync.Mutex
+	removed     []string
 }
 
-func (m *MockWGIfaceBind) RemovePeer(string) error {
+func (m *MockWGIfaceBind) RemovePeer(peerKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removed = append(m.removed, peerKey)
 	return nil
 }
 
@@ -83,6 +88,12 @@ func (m *MockWGIfaceBind) Address() wgaddr.Address {
 
 func (m *MockWGIfaceBind) GetBind() device.EndpointManager {
 	return m.endpointMgr
+}
+
+func (m *MockWGIfaceBind) RemovedPeers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.removed...)
 }
 
 func TestBindListener_Creation(t *testing.T) {
@@ -156,7 +167,45 @@ func TestBindListener_ActivityDetection(t *testing.T) {
 		t.Fatal("timeout waiting for activity detection")
 	}
 
-	assert.Nil(t, mockEndpointMgr.GetEndpoint(fakeIP), "Endpoint should be removed after activity detection")
+	assert.NotNil(t, mockEndpointMgr.GetEndpoint(fakeIP), "Drop-and-wait endpoint should remain until reattach overwrites it")
+}
+
+func TestBindListener_ActivityFire_PreservesWgPeerEntry(t *testing.T) {
+	mockEndpointMgr := newMockEndpointManager()
+	mockIface := &MockWGIfaceBind{endpointMgr: mockEndpointMgr}
+
+	peer := &MocPeer{PeerID: "testPeer1"}
+	cfg := lazyconn.PeerConfig{
+		PublicKey:  peer.PeerID,
+		PeerConnID: peer.ConnID(),
+		AllowedIPs: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.2/32"),
+			netip.MustParsePrefix("10.1.233.0/24"),
+		},
+		Log: log.WithField("peer", "testPeer1"),
+	}
+
+	listener, err := NewBindListener(mockIface, mockEndpointMgr, cfg)
+	require.NoError(t, err)
+
+	activityDetected := make(chan struct{})
+	go func() {
+		listener.ReadPackets()
+		close(activityDetected)
+	}()
+
+	conn := mockEndpointMgr.GetEndpoint(listener.fakeIP)
+	require.NotNil(t, conn, "Endpoint should be registered")
+	_, err = conn.Write([]byte{0x01})
+	require.NoError(t, err)
+
+	select {
+	case <-activityDetected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for activity detection")
+	}
+
+	assert.Empty(t, mockIface.RemovedPeers(), "activity wake must preserve WG peer entry and routed-subnet AllowedIPs")
 }
 
 func TestBindListener_Close(t *testing.T) {
@@ -230,7 +279,7 @@ func TestManager_BindMode(t *testing.T) {
 		t.Fatal("timeout waiting for activity notification")
 	}
 
-	assert.Nil(t, mockEndpointMgr.GetEndpoint(fakeIP), "Endpoint should be removed after activity")
+	assert.NotNil(t, mockEndpointMgr.GetEndpoint(fakeIP), "Drop-and-wait endpoint should remain until reattach overwrites it")
 }
 
 func TestManager_BindMode_MultiplePeers(t *testing.T) {

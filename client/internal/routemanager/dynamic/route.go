@@ -331,6 +331,9 @@ func (r *Route) removeRoutes(prefixes []netip.Prefix) ([]netip.Prefix, error) {
 }
 
 func (r *Route) incrementAllowedIP(domain domain.Domain, prefix netip.Prefix, peerKey string) error {
+	if ref, ok := r.allowedIPsRefcounter.Get(prefix); ok && ref.Out == peerKey {
+		return nil
+	}
 	if ref, err := r.allowedIPsRefcounter.Increment(prefix, peerKey); err != nil {
 		return fmt.Errorf(addAllowedIP, prefix, err)
 	} else if ref.Count > 1 && ref.Out != peerKey {

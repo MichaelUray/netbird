@@ -25,6 +25,12 @@ import (
 type mockWGIface struct {
 	mu             sync.Mutex
 	lastActivities map[string]monotime.Time
+	updateCalls    []updatePeerCall
+}
+
+type updatePeerCall struct {
+	peerKey    string
+	allowedIPs []netip.Prefix
 }
 
 func newMockWGIface() *mockWGIface {
@@ -32,7 +38,13 @@ func newMockWGIface() *mockWGIface {
 }
 
 func (m *mockWGIface) RemovePeer(string) error { return nil }
-func (m *mockWGIface) UpdatePeer(string, []netip.Prefix, time.Duration, *net.UDPAddr, *wgtypes.Key) error {
+func (m *mockWGIface) UpdatePeer(peerKey string, allowedIPs []netip.Prefix, _ time.Duration, _ *net.UDPAddr, _ *wgtypes.Key) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updateCalls = append(m.updateCalls, updatePeerCall{
+		peerKey:    peerKey,
+		allowedIPs: append([]netip.Prefix(nil), allowedIPs...),
+	})
 	return nil
 }
 
@@ -60,6 +72,12 @@ func (m *mockWGIface) LastActivities() map[string]monotime.Time {
 		out[k] = v
 	}
 	return out
+}
+
+func (m *mockWGIface) UpdateCalls() []updatePeerCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]updatePeerCall(nil), m.updateCalls...)
 }
 
 // testHarness wires a *Manager with manually-injected two-timer

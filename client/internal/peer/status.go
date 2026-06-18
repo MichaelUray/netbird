@@ -445,8 +445,12 @@ func (d *Status) updatePeerStateLocked(receivedState State) (func(), error) {
 	}
 
 	oldState := peerState.ConnStatus
+	statusChanged := receivedState.ConnStatus != peerState.ConnStatus
+	initialIdleDispatch := receivedState.ConnStatus == StatusIdle &&
+		oldState == StatusIdle &&
+		peerState.ConnStatusUpdate.IsZero()
 
-	if receivedState.ConnStatus != peerState.ConnStatus {
+	if statusChanged || initialIdleDispatch {
 		peerState.ConnStatus = receivedState.ConnStatus
 		peerState.ConnStatusUpdate = receivedState.ConnStatusUpdate
 		peerState.Relayed = receivedState.Relayed
@@ -462,7 +466,7 @@ func (d *Status) updatePeerStateLocked(receivedState State) (func(), error) {
 
 	notifyList := hasConnStatusChanged(oldState, receivedState.ConnStatus)
 	// when we close the connection we will not notify the router manager
-	notifyRouter := receivedState.ConnStatus == StatusIdle
+	notifyRouter := receivedState.ConnStatus == StatusIdle && (statusChanged || initialIdleDispatch)
 	routerSnapshot := d.snapshotRouterPeersLocked(receivedState.PubKey, notifyRouter)
 	numPeers := d.numOfPeers()
 
@@ -475,7 +479,7 @@ func (d *Status) updatePeerStateLocked(receivedState State) (func(), error) {
 		d.dispatchRouterPeers(receivedState.PubKey, routerSnapshot)
 	}
 
-	if hasConnStatusChanged(oldState, receivedState.ConnStatus) {
+	if statusChanged {
 		return d.notifyConnStateChange(receivedState.PubKey, peerState), nil
 	}
 	return func() {}, nil

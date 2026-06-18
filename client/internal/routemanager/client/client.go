@@ -254,8 +254,7 @@ func (w *Watcher) getBestRouteFromStatuses(routePeerStatuses map[route.ID]router
 	return chosen, chosenStatus
 }
 
-func (w *Watcher) watchPeerStatusChanges(ctx context.Context, peerKey string, peerStateUpdate chan map[string]peer.RouterState, closer chan struct{}) {
-	subscription := w.statusRecorder.SubscribeToPeerStateChanges(ctx, peerKey)
+func (w *Watcher) watchPeerStatusChanges(ctx context.Context, peerKey string, subscription *peer.StatusChangeSubscription, peerStateUpdate chan map[string]peer.RouterState, closer chan struct{}) {
 	defer w.statusRecorder.UnsubscribePeerStateChanges(subscription)
 
 	for {
@@ -285,7 +284,8 @@ func (w *Watcher) startNewPeerStatusWatchers() {
 
 		closerChan := make(chan struct{})
 		w.routePeersNotifiers[r.Peer] = closerChan
-		go w.watchPeerStatusChanges(w.ctx, r.Peer, w.peerStateUpdate, closerChan)
+		subscription := w.statusRecorder.SubscribeToPeerStateChanges(w.ctx, r.Peer)
+		go w.watchPeerStatusChanges(w.ctx, r.Peer, subscription, w.peerStateUpdate, closerChan)
 	}
 }
 

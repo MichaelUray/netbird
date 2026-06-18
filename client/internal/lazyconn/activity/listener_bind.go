@@ -130,11 +130,16 @@ func (d *BindListener) ReadPackets() readResult {
 		d.peerCfg.Log.Infof("exit from activity listener")
 	}
 
+	if result == readActivity {
+		d.peerCfg.Log.Debugf("preserving lazy WG peer entry for peer %s after activity", d.peerCfg.PublicKey)
+		d.done.Done()
+		return result
+	}
+
 	d.peerCfg.Log.Debugf("removing lazy endpoint for peer %s", d.peerCfg.PublicKey)
 	if err := d.wgIface.RemovePeer(d.peerCfg.PublicKey); err != nil {
 		d.peerCfg.Log.Errorf("failed to remove endpoint: %s", err)
 	}
-
 	_ = d.lazyConn.Close()
 	d.bind.RemoveEndpoint(d.fakeIP)
 	d.done.Done()

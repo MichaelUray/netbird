@@ -2,6 +2,8 @@ package manager
 
 import (
 	"context"
+	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -136,9 +138,10 @@ type Manager struct {
 
 	// Route HA group management
 	// If any peer in the same HA group is active, all peers in that group should prevent going idle
-	peerToHAGroups map[string][]route.HAUniqueID // peer ID -> HA groups they belong to
-	haGroupToPeers map[route.HAUniqueID][]string // HA group -> peer IDs in the group
-	routesMu       sync.RWMutex
+	peerToHAGroups      map[string][]route.HAUniqueID // peer ID -> HA groups they belong to
+	haGroupToPeers      map[route.HAUniqueID][]string // HA group -> peer IDs in the group
+	peerToRoutePrefixes map[string][]netip.Prefix     // peer ID -> routed prefixes from management sync
+	routesMu            sync.RWMutex
 }
 
 // NewManager creates a new lazy connection manager
@@ -156,6 +159,7 @@ func NewManager(config Config, engineCtx context.Context, peerStore *peerstore.S
 		activityManager:      activity.NewManager(wgIface),
 		peerToHAGroups:       make(map[string][]route.HAUniqueID),
 		haGroupToPeers:       make(map[route.HAUniqueID][]string),
+		peerToRoutePrefixes:  make(map[string][]netip.Prefix),
 	}
 
 	if wgIface.IsUserspaceBind() {
@@ -209,16 +213,27 @@ func (m *Manager) IsListenerArmed(peerConnID peerid.ConnID) bool {
 // This should be called when route configuration changes
 func (m *Manager) UpdateRouteHAMap(haMap route.HAMap) {
 	m.routesMu.Lock()
-	defer m.routesMu.Unlock()
 
 	clear(m.peerToHAGroups)
 	clear(m.haGroupToPeers)
+	clear(m.peerToRoutePrefixes)
+
+	routePrefixSet := make(map[string]map[netip.Prefix]struct{})
 
 	for haUniqueID, routes := range haMap {
 		var peers []string
 
 		peerSet := make(map[string]bool)
 		for _, r := range routes {
+			if r == nil {
+				continue
+			}
+			if prefix, ok := routePrefixForLazyPeer(r); ok {
+				if routePrefixSet[r.Peer] == nil {
+					routePrefixSet[r.Peer] = make(map[netip.Prefix]struct{})
+				}
+				routePrefixSet[r.Peer][prefix] = struct{}{}
+			}
 			if !peerSet[r.Peer] {
 				peerSet[r.Peer] = true
 				peers = append(peers, r.Peer)
@@ -236,7 +251,54 @@ func (m *Manager) UpdateRouteHAMap(haMap route.HAMap) {
 		}
 	}
 
+	for peerID, prefixes := range routePrefixSet {
+		m.peerToRoutePrefixes[peerID] = sortedPrefixes(prefixes)
+	}
+
 	log.Debugf("updated route HA mappings: %d HA groups, %d peers with routes", len(m.haGroupToPeers), len(m.peerToHAGroups))
+	m.routesMu.Unlock()
+
+	m.managedPeersMu.Lock()
+	for _, cfg := range m.managedPeers {
+		cfg.AllowedIPs = m.allowedIPsForPeer(cfg.PublicKey, cfg.AllowedIPs)
+	}
+	m.managedPeersMu.Unlock()
+	return
+}
+
+func routePrefixForLazyPeer(r *route.Route) (netip.Prefix, bool) {
+	if r.IsDynamic() || !r.Network.IsValid() {
+		return netip.Prefix{}, false
+	}
+	return r.Network.Masked(), true
+}
+
+func sortedPrefixes(prefixes map[netip.Prefix]struct{}) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(prefixes))
+	for prefix := range prefixes {
+		out = append(out, prefix)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if cmp := out[i].Addr().Compare(out[j].Addr()); cmp != 0 {
+			return cmp < 0
+		}
+		return out[i].Bits() < out[j].Bits()
+	})
+	return out
+}
+
+func (m *Manager) allowedIPsForPeer(peerID string, base []netip.Prefix) []netip.Prefix {
+	m.routesMu.RLock()
+	defer m.routesMu.RUnlock()
+
+	set := make(map[netip.Prefix]struct{}, len(base)+len(m.peerToRoutePrefixes[peerID]))
+	for _, prefix := range base {
+		set[prefix.Masked()] = struct{}{}
+	}
+	for _, prefix := range m.peerToRoutePrefixes[peerID] {
+		set[prefix.Masked()] = struct{}{}
+	}
+	return sortedPrefixes(set)
 }
 
 // Start starts the manager and listens for peer activity and inactivity events.
@@ -366,6 +428,7 @@ func (m *Manager) AddPeer(peerCfg lazyconn.PeerConfig) (bool, error) {
 		return false, nil
 	}
 
+	peerCfg.AllowedIPs = m.allowedIPsForPeer(peerCfg.PublicKey, peerCfg.AllowedIPs)
 	if err := m.activityManager.MonitorPeerActivity(peerCfg); err != nil {
 		return false, err
 	}
@@ -601,6 +664,7 @@ func (m *Manager) addActivePeer(peerCfg *lazyconn.PeerConfig) error {
 		return nil
 	}
 
+	peerCfg.AllowedIPs = m.allowedIPsForPeer(peerCfg.PublicKey, peerCfg.AllowedIPs)
 	m.managedPeers[peerCfg.PublicKey] = peerCfg
 	m.managedPeersByConnID[peerCfg.PeerConnID] = &managedPeer{
 		peerCfg:         peerCfg,

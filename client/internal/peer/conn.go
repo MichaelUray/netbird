@@ -255,7 +255,7 @@ type Conn struct {
 	// saveFrequency throttle (5 s) means a sustained user flow generates 1
 	// callback every 5 s; a 30 s window requires >=3 callbacks to attest
 	// real user activity.
-	relayActivityCount      atomic.Int32
+	relayActivityCount       atomic.Int32
 	relayActivityWindowStart atomic.Int64 // monotime ns of first count in current window
 
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
@@ -1619,6 +1619,23 @@ func (conn *Conn) AllowedIP() netip.Addr {
 
 func (conn *Conn) AgentVersionString() string {
 	return conn.config.AgentVersion
+}
+
+// NotifyIdleStateForRouteBootstrap emits the initial lazy-idle router-state
+// snapshot after a peer is registered with the lazy manager. Status.AddPeer
+// creates peers in Idle state without notifying route watchers; this method
+// drives the regular UpdatePeerState path so routed-subnet AllowedIPs can be
+// attached before the first successful connection.
+func (conn *Conn) NotifyIdleStateForRouteBootstrap() {
+	peerState := State{
+		PubKey:           conn.config.Key,
+		ConnStatusUpdate: time.Now(),
+		ConnStatus:       StatusIdle,
+		Mux:              new(sync.RWMutex),
+	}
+	if err := conn.statusRecorder.UpdatePeerState(peerState); err != nil {
+		conn.Log.Warnf("error while publishing lazy idle route bootstrap state: %v", err)
+	}
 }
 
 func (conn *Conn) presharedKey(remoteRosenpassKey []byte) *wgtypes.Key {

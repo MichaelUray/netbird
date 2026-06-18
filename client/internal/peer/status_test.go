@@ -63,6 +63,43 @@ func TestUpdatePeerState(t *testing.T) {
 	assert.Equal(t, ip, state.IP, "ip should be equal")
 }
 
+func TestStatus_UpdatePeerState_InitialIdleDispatchesOnce(t *testing.T) {
+	key := "router-peer"
+	status := NewRecorder("https://mgm")
+	if err := status.AddPeer(key, "router.netbird", "100.87.22.246"); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	sub := status.SubscribeToPeerStateChanges(context.Background(), key)
+	defer status.UnsubscribePeerStateChanges(sub)
+
+	idleState := State{
+		PubKey:           key,
+		ConnStatus:       StatusIdle,
+		ConnStatusUpdate: time.Now(),
+	}
+	if err := status.UpdatePeerState(idleState); err != nil {
+		t.Fatalf("first idle UpdatePeerState: %v", err)
+	}
+	select {
+	case snapshot := <-sub.Events():
+		if snapshot[key].Status != StatusIdle {
+			t.Fatalf("router snapshot status = %s, want Idle", snapshot[key].Status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial idle router-state dispatch")
+	}
+
+	idleState.ConnStatusUpdate = time.Now()
+	if err := status.UpdatePeerState(idleState); err != nil {
+		t.Fatalf("second idle UpdatePeerState: %v", err)
+	}
+	select {
+	case snapshot := <-sub.Events():
+		t.Fatalf("unexpected duplicate idle router-state dispatch: %+v", snapshot)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestStatus_UpdatePeerFQDN(t *testing.T) {
 	key := "abc"
 	fqdn := "peer-a.netbird.local"

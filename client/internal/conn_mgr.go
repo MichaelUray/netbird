@@ -481,6 +481,7 @@ func (e *ConnMgr) AddPeerConn(ctx context.Context, peerKey string, conn *peer.Co
 		return
 	}
 
+	conn.NotifyIdleStateForRouteBootstrap()
 	conn.Log.Infof("peer added to lazy conn manager")
 	return
 }

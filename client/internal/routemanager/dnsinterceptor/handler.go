@@ -133,6 +133,9 @@ func (d *DnsInterceptor) transformRealToFakePrefix(realPrefix netip.Prefix) neti
 // addAllowedIPForPrefix handles the AllowedIPs logic for a single prefix (uses real IPs)
 func (d *DnsInterceptor) addAllowedIPForPrefix(realPrefix netip.Prefix, peerKey string, domain domain.Domain) error {
 	// AllowedIPs always use real IPs
+	if ref, ok := d.allowedIPsRefcounter.Get(realPrefix); ok && ref.Out == peerKey {
+		return nil
+	}
 	ref, err := d.allowedIPsRefcounter.Increment(realPrefix, peerKey)
 	if err != nil {
 		return fmt.Errorf("add allowed IP %s: %v", realPrefix, err)

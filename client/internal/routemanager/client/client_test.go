@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"testing"
@@ -11,6 +12,21 @@ import (
 	"github.com/netbirdio/netbird/client/internal/routemanager/static"
 	"github.com/netbirdio/netbird/route"
 )
+
+type recordingRouteHandler struct {
+	addCh chan string
+}
+
+func (h *recordingRouteHandler) String() string { return "10.1.233.0/24" }
+func (h *recordingRouteHandler) AddRoute(context.Context) error {
+	return nil
+}
+func (h *recordingRouteHandler) RemoveRoute() error { return nil }
+func (h *recordingRouteHandler) AddAllowedIPs(peerKey string) error {
+	h.addCh <- peerKey
+	return nil
+}
+func (h *recordingRouteHandler) RemoveAllowedIPs() error { return nil }
 
 func TestGetBestrouteFromStatuses(t *testing.T) {
 	testCases := []struct {
@@ -826,5 +842,52 @@ func TestGetBestrouteFromStatuses(t *testing.T) {
 				t.Errorf("expected routeID %s, got %s", tc.expectedRouteID, chosenRoute)
 			}
 		})
+	}
+}
+
+func TestRouteManager_BrandNewRoutingPeer_AddAllowedIPsBeforeFirstConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	statusRecorder := peer.NewRecorder("https://mgm")
+	handler := &recordingRouteHandler{addCh: make(chan string, 1)}
+	w := NewWatcher(WatcherConfig{
+		Context:        ctx,
+		StatusRecorder: statusRecorder,
+		Handler:        handler,
+	})
+	go w.Start()
+
+	routerPeer := "router-peer"
+	w.handleRouteUpdate(RoutesUpdate{
+		UpdateSerial: 1,
+		Routes: []*route.Route{
+			{
+				ID:          "dolice-resource:route",
+				Network:     netip.MustParsePrefix("10.1.233.0/24"),
+				NetworkType: route.IPv4Network,
+				Peer:        routerPeer,
+			},
+		},
+	})
+
+	if err := statusRecorder.AddPeer(routerPeer, "router.netbird", "100.87.22.246"); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	if err := statusRecorder.UpdatePeerState(peer.State{
+		PubKey:           routerPeer,
+		ConnStatus:       peer.StatusIdle,
+		ConnStatusUpdate: time.Now(),
+	}); err != nil {
+		t.Fatalf("idle UpdatePeerState: %v", err)
+	}
+
+	select {
+	case got := <-handler.addCh:
+		if got != routerPeer {
+			t.Fatalf("AddAllowedIPs peer = %s, want %s", got, routerPeer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for AddAllowedIPs before first connect")
 	}
 }
