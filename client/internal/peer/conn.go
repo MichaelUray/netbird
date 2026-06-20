@@ -258,6 +258,12 @@ type Conn struct {
 	relayActivityCount       atomic.Int32
 	relayActivityWindowStart atomic.Int64 // monotime ns of first count in current window
 
+	// V18.16 (2026-06-20): one-shot latches that emit a single
+	// Info-level decision log per detach cycle. Reset on every
+	// MarkIntentionallyDetached (i.e. at the start of a new cycle).
+	v18_16LoggedBlockedCooldown    atomic.Bool
+	v18_16LoggedBlockedBurstInsuff atomic.Bool
+
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
 	// from onICEFailed / onICEConnected; snapshot-read from
@@ -278,6 +284,8 @@ func (conn *Conn) MarkIntentionallyDetached() {
 	// V18.11: stamp the detach time so AttachICEOnRelayActivity can
 	// enforce a post-detach cooldown window.
 	conn.intentionallyDetachedAt.Store(int64(monotime.Now()))
+	conn.v18_16LoggedBlockedCooldown.Store(false)
+	conn.v18_16LoggedBlockedBurstInsuff.Store(false)
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
@@ -1853,11 +1861,19 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 			if detachedAtNs > 0 {
 				since := monotime.Since(monotime.Time(detachedAtNs))
 				if since < v18_11RelayActivityCooldown {
+					if !conn.v18_16LoggedBlockedCooldown.Swap(true) {
+						conn.Log.Infof("V18.11+V18.16: sub-burst callback blocked by cooldown (count=%d/%d, since detach=%v) — first in cycle",
+							count, v18_13MinBurst, since)
+					}
 					conn.Log.Tracef("V18.11+V18.16: sub-burst callback within cooldown (count=%d/%d, since detach=%v) — bail",
 						count, v18_13MinBurst, since)
 					conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-cooldown-sub-burst")
 					return false
 				}
+			}
+			if !conn.v18_16LoggedBlockedBurstInsuff.Swap(true) {
+				conn.Log.Infof("V18.13+V18.16: burst threshold not yet met (count=%d/%d, post-cooldown) — first in cycle",
+					count, v18_13MinBurst)
 			}
 			conn.Log.Tracef("V18.13 burst: %d/%d callbacks in window, post-cooldown — awaiting sustained traffic",
 				count, v18_13MinBurst)
