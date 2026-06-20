@@ -1792,41 +1792,81 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
 		conn.IsIntentionallyDetached() {
 		now := monotime.Now()
-		detachedAtNs := conn.intentionallyDetachedAt.Load()
-		if detachedAtNs > 0 {
-			since := monotime.Since(monotime.Time(detachedAtNs))
-			if since < v18_11RelayActivityCooldown {
-				conn.Log.Tracef("V18.11 cooldown: skipping AttachICEOnRelayActivity (detached %v ago, cooldown %v)",
-					since, v18_11RelayActivityCooldown)
-				conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-cooldown")
-				return false
-			}
-		}
 
-		// Burst-detection: roll a 30 s sliding window of callback counts.
+		// V18.16 (2026-06-20): burst-check FIRST, cooldown SECOND.
+		// A sustained user flow (≥3 outbound activity callbacks in
+		// 30s, = ≥10s wall-clock at recordOutbound's 5s saveFrequency
+		// throttle) IS real user traffic by definition and should
+		// wake P2P regardless of how recently the detach happened.
+		// Pre-V18.16 order applied V18.11 cooldown first, which
+		// produced a worst-case ~40-45s relay→P2P resume latency
+		// (30s cooldown + ~15s burst accumulation) for the user
+		// reopening a VNC session 5-10s after the previous one's
+		// idle-detach. Production S26 2026-06-19 VNC test.
+		//
+		// Burst window logic remains unchanged from V18.13: a fresh
+		// or expired window starts count=1; an active window
+		// increments. We just consult the result earlier.
 		windowStart := conn.relayActivityWindowStart.Load()
 		if windowStart == 0 || monotime.Since(monotime.Time(windowStart)) > v18_13BurstWindow {
-			// Window expired (or never started) — start a fresh one.
 			conn.relayActivityWindowStart.Store(int64(now))
 			conn.relayActivityCount.Store(1)
-			conn.Log.Tracef("V18.13 burst: starting fresh 30s window, count=1/3")
+			conn.Log.Tracef("V18.13 burst: starting fresh 30s window, count=1/%d", v18_13MinBurst)
 			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-burst-window-fresh")
+			// V18.16: even though we just started the window, fall
+			// through to the cooldown check below so a single
+			// post-detach probe is still logged as blocked-cooldown
+			// (not just blocked-burst-window-fresh) when in cooldown.
+			// Both paths return false; the diag tag distinguishes
+			// "spurious probe inside cooldown" from "first packet of
+			// new window after cooldown expiry".
+			detachedAtNs := conn.intentionallyDetachedAt.Load()
+			if detachedAtNs > 0 {
+				since := monotime.Since(monotime.Time(detachedAtNs))
+				if since < v18_11RelayActivityCooldown {
+					conn.Log.Infof("V18.11+V18.16: first callback of new burst window arrived %v after detach (cooldown %v) — burst counter armed, awaiting sustained traffic",
+						since, v18_11RelayActivityCooldown)
+				}
+			}
 			return false
 		}
+
 		// Within an active window. Increment and check threshold.
 		count := conn.relayActivityCount.Add(1)
-		if count < v18_13MinBurst {
-			conn.Log.Tracef("V18.13 burst: %d/%d callbacks in window — need sustained traffic",
+		if count >= v18_13MinBurst {
+			// V18.16: sustained user traffic detected — cooldown is
+			// irrelevant for this cycle. Reset counters and proceed.
+			conn.relayActivityCount.Store(0)
+			conn.relayActivityWindowStart.Store(0)
+			detachedAtNs := conn.intentionallyDetachedAt.Load()
+			detachedAge := time.Duration(0)
+			if detachedAtNs > 0 {
+				detachedAge = monotime.Since(monotime.Time(detachedAtNs))
+			}
+			conn.Log.Infof("V18.16: sustained user traffic confirmed (>=%d outbound callbacks in 30s, detached %v ago) — proceeding with ICE re-attach regardless of V18.11 cooldown",
+				v18_13MinBurst, detachedAge)
+			// fall through to the post-detach-guard checks
+		} else {
+			// Burst threshold not yet met. Apply V18.11 cooldown as
+			// fallback: a sub-burst flow (1-2 callbacks in 30s) is
+			// indistinguishable from Android system probes; reject it
+			// in cooldown. Outside cooldown, an Info log notes that
+			// the next callback may proceed if the flow sustains.
+			detachedAtNs := conn.intentionallyDetachedAt.Load()
+			if detachedAtNs > 0 {
+				since := monotime.Since(monotime.Time(detachedAtNs))
+				if since < v18_11RelayActivityCooldown {
+					conn.Log.Tracef("V18.11+V18.16: sub-burst callback within cooldown (count=%d/%d, since detach=%v) — bail",
+						count, v18_13MinBurst, since)
+					conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-cooldown-sub-burst")
+					return false
+				}
+			}
+			conn.Log.Tracef("V18.13 burst: %d/%d callbacks in window, post-cooldown — awaiting sustained traffic",
 				count, v18_13MinBurst)
 			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-burst-insufficient")
 			return false
 		}
-		// Threshold reached — sustained user traffic detected.
-		// Reset counters so the next detach cycle starts fresh.
-		conn.relayActivityCount.Store(0)
-		conn.relayActivityWindowStart.Store(0)
-		conn.Log.Infof("V18.13 burst: sustained user traffic confirmed (>=%d outbound callbacks in 30s) — proceeding with ICE re-attach",
-			v18_13MinBurst)
 	}
 
 	// V13.1 RETIRED by V18.1 (2026-06-06): the original V13.1 gate
