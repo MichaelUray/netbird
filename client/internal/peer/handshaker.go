@@ -87,8 +87,17 @@ func NewHandshaker(log *log.Entry, config ConnConfig, signaler *Signaler, ice *W
 		ice:            ice,
 		relay:          relay,
 		metricsStages:  metricsStages,
-		remoteOffersCh: make(chan OfferAnswer),
-		remoteAnswerCh: make(chan OfferAnswer),
+		// V18.16 (2026-06-20): buffer size 4 eliminates the
+		// Open()→Listen() race producing "skipping remote offer
+		// message because receiver not ready" warnings. Between
+		// NewHandshaker and the first iteration of Listen()'s select
+		// loop, any OnRemoteOffer/OnRemoteAnswer would drop with the
+		// unbuffered version. 4 = comfortably more than the typical
+		// 1-3 burst seen in production traces (r1-pve5 2026-06-18:
+		// 6 dropped warnings before recovery). Listen drains the
+		// buffer in FIFO order, preserving handshake serial semantics.
+		remoteOffersCh: make(chan OfferAnswer, 4),
+		remoteAnswerCh: make(chan OfferAnswer, 4),
 	}
 	// assume remote supports ICE until we learn otherwise from received offers
 	h.remoteICESupported.Store(ice != nil)
