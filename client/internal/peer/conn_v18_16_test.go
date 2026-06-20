@@ -126,3 +126,44 @@ func TestConn_V18_16_BurstWindowExpiresResetsCounter(t *testing.T) {
 		t.Fatal("window start should have been updated on expiry")
 	}
 }
+
+// TestConn_V18_16_BurstCountersResetOnRemark verifies the final-review
+// I-1 fix: V18.13 burst counters MUST be reset by MarkIntentionallyDetached
+// so a Clear → Mark cycle within the 30s burst window does not carry
+// stale counts forward. Without the reset, the first user packet of
+// the new cycle would spuriously trip count>=3 on counters left over
+// from the previous cycle, bypassing V18.11 cooldown.
+func TestConn_V18_16_BurstCountersResetOnRemark(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	conn.config.Mode = connectionmode.ModeP2PDynamic
+
+	// Cycle 1: detach + 2 callbacks (burst threshold not yet met).
+	conn.MarkIntentionallyDetached()
+	conn.intentionallyDetachedAt.Store(int64(monotime.Now()))
+	_ = conn.AttachICEOnRelayActivity() // count=1
+	_ = conn.AttachICEOnRelayActivity() // count=2
+	if c := conn.relayActivityCount.Load(); c != 2 {
+		t.Fatalf("setup: expected count=2 after 2 callbacks in cycle 1, got %d", c)
+	}
+
+	// Clear + Mark cycle 2 (simulating a re-detach within the 30s
+	// burst window from cycle 1).
+	conn.ClearIntentionallyDetached()
+	conn.MarkIntentionallyDetached()
+
+	// Burst counter MUST be zero now. If it's not, the very next
+	// callback of cycle 2 would land on count=3 and trip the burst
+	// gate spuriously, bypassing cooldown.
+	if c := conn.relayActivityCount.Load(); c != 0 {
+		t.Fatalf("V18.16 I-1: relayActivityCount must reset on Mark, got %d (stale from cycle 1)", c)
+	}
+	if ws := conn.relayActivityWindowStart.Load(); ws != 0 {
+		t.Fatalf("V18.16 I-1: relayActivityWindowStart must reset on Mark, got %d (stale from cycle 1)", ws)
+	}
+
+	// One callback in cycle 2: count must be 1, not 3.
+	_ = conn.AttachICEOnRelayActivity()
+	if c := conn.relayActivityCount.Load(); c != 1 {
+		t.Fatalf("V18.16 I-1: after Mark-reset, first callback should set count=1, got %d", c)
+	}
+}

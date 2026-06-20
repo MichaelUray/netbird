@@ -286,6 +286,14 @@ func (conn *Conn) MarkIntentionallyDetached() {
 	conn.intentionallyDetachedAt.Store(int64(monotime.Now()))
 	conn.v18_16LoggedBlockedCooldown.Store(false)
 	conn.v18_16LoggedBlockedBurstInsuff.Store(false)
+	// V18.16 (2026-06-20): also reset V18.13 burst counters so a
+	// Clear → Mark cycle within the 30s burst window does not carry
+	// stale counts forward. Without this, the first user packet of
+	// the NEW cycle could trip a count>=3 threshold based on
+	// callbacks from the PREVIOUS cycle, bypassing the V18.11
+	// cooldown spuriously. Final-review I-1 (2026-06-20).
+	conn.relayActivityCount.Store(0)
+	conn.relayActivityWindowStart.Store(0)
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
