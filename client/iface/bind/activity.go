@@ -15,10 +15,29 @@ const (
 	saveFrequency = int64(5 * time.Second)
 )
 
+const (
+	// V18.16 (2026-06-20): inbound-burst gate. recordInboundBurst
+	// fires the onActivity callback only on the K-th packet within
+	// a sliding W-second window. Tuned to distinguish real user
+	// VNC/SSH/HTTP traffic from legacy peer keep-alives + single
+	// Android system probes that survive size+type filters.
+	// Window matches V18.13's outbound burst gate so both directions
+	// share the same UX tuning. Threshold=3 = at least 2 packets of
+	// wire-time activity beyond the first one (which could be an
+	// artifact). Production rationale documented in V18.16 commit.
+	v18_16InboundBurstWindow   = 30 * time.Second
+	v18_16InboundBurstMinBurst = int32(3)
+)
+
 type PeerRecord struct {
 	PublicKey    string
 	Address      netip.AddrPort
 	LastActivity atomic.Int64 // UnixNano timestamp
+
+	// V18.16 (2026-06-20): inbound-burst counters. Drive the
+	// recordInboundBurst edge. Per-peer to avoid global contention.
+	inboundBurstCount       atomic.Int32
+	inboundBurstWindowStart atomic.Int64 // monotime ns of window start
 }
 
 type ActivityRecorder struct {
@@ -148,6 +167,60 @@ func (r *ActivityRecorder) recordOutbound(address netip.AddrPort) {
 		// duplicate events when many goroutines race on the same packet
 		// burst. Callback runs synchronously on the WG send goroutine —
 		// handler MUST be cheap or self-defer to its own goroutine.
+		cb(record.PublicKey)
+	}
+}
+
+// recordInboundBurst is V18.16 Fix 2: the inbound mirror of
+// recordOutbound. Fires onActivity ONLY on the K-th transport packet
+// (>32 B) arriving from this peer within a sliding W-second window.
+//
+// Why not just reuse recordOutbound's semantics on inbound?
+// recordOutbound fires on every saveFrequency edge (1/peer/5s). Legacy
+// pre-0.68 peers send WG keep-alives over Relay every ~25 s that pass
+// the size+type filter; without a burst gate, EVERY keep-alive would
+// wake an intentionally-detached peer. The original V18.4 split moved
+// the recv path away from firing callbacks specifically to avoid this.
+//
+// recordInboundBurst re-introduces an inbound wake edge but gated:
+//   - 3 packets within 30 s of wall clock from the SAME peer
+//   - resets counters on successful wake (next detach cycle starts fresh)
+//
+// A legacy keep-alive cadence of ~25 s sees count=1, window expires
+// before the 2nd keep-alive arrives, count resets to 1 forever — never
+// reaches 3. A sustained user inbound flow (VNC frame updates, SSH
+// stream, HTTP response) easily exceeds the threshold.
+//
+// Caller is the relay-recv path in ice_bind.go:receiveRelayed. Only
+// transport packets (type 4 + size>32 B) are eligible — the caller
+// applies that filter exactly as the send path does.
+func (r *ActivityRecorder) recordInboundBurst(address netip.AddrPort) {
+	r.mu.RLock()
+	record, ok := r.addrToPeer[address]
+	cb := r.onActivity
+	r.mu.RUnlock()
+	if !ok {
+		// Unknown address — peer not registered, no-op. Do NOT log:
+		// receive-path log spam was a real prod issue in V18.4.
+		return
+	}
+
+	now := int64(monotime.Now())
+	windowStart := record.inboundBurstWindowStart.Load()
+	if windowStart == 0 || monotime.Since(monotime.Time(windowStart)) > v18_16InboundBurstWindow {
+		// Window expired (or never started) — start fresh.
+		record.inboundBurstWindowStart.Store(now)
+		record.inboundBurstCount.Store(1)
+		return
+	}
+	count := record.inboundBurstCount.Add(1)
+	if count < v18_16InboundBurstMinBurst {
+		return
+	}
+	// Threshold reached. Reset for the next detach cycle and fire.
+	record.inboundBurstCount.Store(0)
+	record.inboundBurstWindowStart.Store(0)
+	if cb != nil {
 		cb(record.PublicKey)
 	}
 }
