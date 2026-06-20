@@ -381,14 +381,13 @@ func (c *ICEBind) receiveRelayed(buffs [][]byte, sizes []int, eps []wgConn.Endpo
 				// LastActivity bookkeeping for LastActivities()-based
 				// heuristics — unchanged from V18.4.
 				c.activityRecorder.record(ep.AddrPort)
-				// V18.16 (2026-06-20): inbound burst wake. The size
-				// >32 filter is enforced by isTransportPkg's
-				// `n > 32` clause, but mirror it here explicitly so
-				// the intent stays grep-able (same pattern as Send
-				// path at ice_bind.go:198).
-				if sizes[0] > 32 {
-					c.activityRecorder.recordInboundBurst(ep.AddrPort)
-				}
+				// V18.16 (2026-06-20): inbound burst wake. The size>32
+				// filter is already enforced by isTransportPkg above —
+				// no extra gate needed here (in contrast to the Send
+				// path at ice_bind.go:198 where isTransportPkg's
+				// boolean is &&-chained with len(buf)>32 in a single
+				// expression for a different reason).
+				c.activityRecorder.recordInboundBurst(ep.AddrPort)
 			}
 		}
 
