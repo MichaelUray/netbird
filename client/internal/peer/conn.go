@@ -1792,6 +1792,7 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
 		conn.IsIntentionallyDetached() {
 		now := monotime.Now()
+		detachedAtNs := conn.intentionallyDetachedAt.Load()
 
 		// V18.16 (2026-06-20): burst-check FIRST, cooldown SECOND.
 		// A sustained user flow (≥3 outbound activity callbacks in
@@ -1813,14 +1814,12 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 			conn.relayActivityCount.Store(1)
 			conn.Log.Tracef("V18.13 burst: starting fresh 30s window, count=1/%d", v18_13MinBurst)
 			conn.logDiagSnapshot("AttachICEOnRelayActivity-blocked-burst-window-fresh")
-			// V18.16: even though we just started the window, fall
-			// through to the cooldown check below so a single
-			// post-detach probe is still logged as blocked-cooldown
-			// (not just blocked-burst-window-fresh) when in cooldown.
-			// Both paths return false; the diag tag distinguishes
-			// "spurious probe inside cooldown" from "first packet of
-			// new window after cooldown expiry".
-			detachedAtNs := conn.intentionallyDetachedAt.Load()
+			// V18.16: even on a fresh-window first packet, if we're
+			// still in the V18.11 cooldown, emit an Info log so
+			// operators can see the user started talking again
+			// within 30s of detach. Counter is now armed (count=1)
+			// — the next 2 callbacks within 30s will trip the burst
+			// gate and wake P2P regardless of remaining cooldown.
 			if detachedAtNs > 0 {
 				since := monotime.Since(monotime.Time(detachedAtNs))
 				if since < v18_11RelayActivityCooldown {
@@ -1838,7 +1837,6 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 			// irrelevant for this cycle. Reset counters and proceed.
 			conn.relayActivityCount.Store(0)
 			conn.relayActivityWindowStart.Store(0)
-			detachedAtNs := conn.intentionallyDetachedAt.Load()
 			detachedAge := time.Duration(0)
 			if detachedAtNs > 0 {
 				detachedAge = monotime.Since(monotime.Time(detachedAtNs))
@@ -1852,7 +1850,6 @@ func (conn *Conn) AttachICEOnRelayActivity() (attempted bool) {
 			// indistinguishable from Android system probes; reject it
 			// in cooldown. Outside cooldown, an Info log notes that
 			// the next callback may proceed if the flow sustains.
-			detachedAtNs := conn.intentionallyDetachedAt.Load()
 			if detachedAtNs > 0 {
 				since := monotime.Since(monotime.Time(detachedAtNs))
 				if since < v18_11RelayActivityCooldown {
