@@ -142,6 +142,12 @@ type Manager struct {
 	haGroupToPeers      map[route.HAUniqueID][]string // HA group -> peer IDs in the group
 	peerToRoutePrefixes map[string][]netip.Prefix     // peer ID -> routed prefixes from management sync
 	routesMu            sync.RWMutex
+
+	// V18.17 test-only counter: increments on every ActivatePeer call
+	// regardless of outcome. ConnMgr integration tests use this to assert
+	// that the V14/V15 burst-release fall-through actually reached the
+	// lazy manager (= the gate truly released, not just half-wired).
+	activationCounter atomic.Int64
 }
 
 // NewManager creates a new lazy connection manager
@@ -478,6 +484,7 @@ func (m *Manager) RemovePeer(peerID string) {
 // ActivatePeer activates a peer connection when a signal message is received
 // Also activates all peers in the same HA groups as this peer
 func (m *Manager) ActivatePeer(peerID string) (found bool) {
+	m.activationCounter.Add(1)
 	m.managedPeersMu.Lock()
 	defer m.managedPeersMu.Unlock()
 	cfg, mp := m.getPeerForActivation(peerID)
@@ -493,6 +500,15 @@ func (m *Manager) ActivatePeer(peerID string) (found bool) {
 
 	m.activateHAGroupPeers(cfg)
 	return true
+}
+
+// ActivationCountForKey returns the number of ActivatePeer calls
+// observed for THIS process lifetime. V18.17 test-only — used by
+// ConnMgr integration tests to assert the V14/V15 burst release
+// actually reached lazy-mgr. The counter is process-global, not
+// per-key; tests use a single peer per harness so this is sufficient.
+func (m *Manager) ActivationCountForKey(key string) int64 {
+	return m.activationCounter.Load()
 }
 
 func (m *Manager) DeactivatePeer(peerID peerid.ConnID) {

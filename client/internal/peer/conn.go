@@ -443,6 +443,20 @@ func (conn *Conn) ConsumeBurstReleasePending() bool {
 // in conn_mgr.go without leaking the unexported const.
 func OfferBurstThreshold() int32 { return v18_17OfferBurstMinBurst }
 
+// IsBurstReleasePendingLoad reads the v18_17BurstReleasePending flag
+// WITHOUT consuming it. Test-only — production callers must use
+// ConsumeBurstReleasePending (CAS true→false) for one-shot semantics.
+// Used by ConnMgr integration tests to observe the flag state after
+// ActivatePeerForMessage without affecting subsequent dispatch.
+func (conn *Conn) IsBurstReleasePendingLoad() bool {
+	return conn.v18_17BurstReleasePending.Load()
+}
+
+// SetEverConnectedForTest is a test-only setter for the everConnected
+// flag. Used by V18.17 ConnMgr integration tests to drive V14 vs V15
+// gate paths. Production code never calls this directly.
+func (conn *Conn) SetEverConnectedForTest(v bool) { conn.everConnected.Store(v) }
+
 // SwapOfferBurstReleaseLogged atomic-swaps the V18.17 Info-log latch.
 // Returns the PREVIOUS value, so `!SwapOfferBurstReleaseLogged(true)`
 // is true ONLY on the first fire per detach cycle. Used by conn_mgr.go
