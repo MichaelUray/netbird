@@ -55,6 +55,19 @@ const (
 	v18_13MinBurst    = int32(3)
 )
 
+const (
+	// V18.17 (2026-06-21): signal-OFFER burst-release. After N
+	// inbound OFFERs from the same peer within W seconds, the V14
+	// and V15 gates auto-release for that peer. Symmetric to
+	// V18.13/V18.16 transport-burst tuning. Window=30 s, threshold
+	// =3 — same K/W as the existing burst gates so the operator
+	// only has one tuning knob to think about across all three
+	// burst paths (outbound transport, inbound transport, inbound
+	// signal-OFFER).
+	v18_17OfferBurstWindow   = 30 * time.Second
+	v18_17OfferBurstMinBurst = int32(3)
+)
+
 // MetricsRecorder is an interface for recording peer connection metrics
 type MetricsRecorder interface {
 	RecordConnectionStages(
@@ -264,6 +277,27 @@ type Conn struct {
 	v18_16LoggedBlockedCooldown    atomic.Bool
 	v18_16LoggedBlockedBurstInsuff atomic.Bool
 
+	// V18.17 (2026-06-21): signal-OFFER burst counters.
+	// RecordInboundOfferBurst() is called by ConnMgr.ActivatePeerForMessage
+	// inside the V14 and V15 gate branches; when the count reaches
+	// v18_17OfferBurstMinBurst within v18_17OfferBurstWindow, the
+	// gate releases for THIS call and the activation proceeds. Reset
+	// on MarkIntentionallyDetached (Codex R2: same I-1 class as V18.16),
+	// ClearIntentionallyDetached (V14 success case), and ResetOfferBurst()
+	// from the first-everConnected path (V15 success case).
+	inboundOfferBurstCount       atomic.Int32
+	inboundOfferBurstWindowStart atomic.Int64 // monotime ns
+
+	// V18.17 (2026-06-21) Codex R1: one-shot bypass flag for the
+	// downstream V18.10 gate at conn.go:2250-2262. SetBurstReleasePending()
+	// is called when V14/V15 burst threshold releases the OFFER. The
+	// V18.10 gate calls ConsumeBurstReleasePending() (CAS true→false)
+	// and bypasses its intentionallyDetached check when consumed.
+	// Exactly ONE attach gets the bypass per release event; downstream
+	// re-entries (e.g. a CANDIDATE arriving later) still hit V18.10
+	// normally.
+	v18_17BurstReleasePending atomic.Bool
+
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
 	// from onICEFailed / onICEConnected; snapshot-read from
@@ -294,6 +328,16 @@ func (conn *Conn) MarkIntentionallyDetached() {
 	// cooldown spuriously. Final-review I-1 (2026-06-20).
 	conn.relayActivityCount.Store(0)
 	conn.relayActivityWindowStart.Store(0)
+	// V18.17 Codex R2 (2026-06-21): reset OFFER-burst counter on
+	// Mark too. Without this, 2 OFFERs late in cycle N + 1 OFFER
+	// early in cycle N+1 (within 30s of cycle-N window-start) would
+	// trip the threshold spuriously on the FIRST cycle-N+1 OFFER.
+	// Same class as V18.16 I-1 fix for relayActivityCount.
+	conn.inboundOfferBurstCount.Store(0)
+	conn.inboundOfferBurstWindowStart.Store(0)
+	// Also clear any stale release-pending (defensive — should already
+	// be consumed by V18.10 long before another Mark).
+	conn.v18_17BurstReleasePending.Store(false)
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
@@ -314,7 +358,75 @@ func (conn *Conn) IsIntentionallyDetached() bool {
 // Safe to call concurrently. Idempotent.
 func (conn *Conn) ClearIntentionallyDetached() {
 	conn.intentionallyDetached.Store(false)
+	// V18.17: a successful activation closes this cycle — reset
+	// the signal-OFFER burst counter so the next detach cycle
+	// starts fresh.
+	conn.inboundOfferBurstCount.Store(0)
+	conn.inboundOfferBurstWindowStart.Store(0)
+	conn.v18_17BurstReleasePending.Store(false)
 }
+
+// RecordInboundOfferBurst is V18.17: called by ConnMgr.ActivatePeerForMessage
+// each time the V14 or V15 gate would block an inbound signal OFFER from
+// this peer. Returns true when the per-cycle threshold is met for THIS
+// call — caller MUST release the gate and proceed with the activation.
+// Increments + window-bookkeeping are atomic (same pattern as
+// AttachICEOnRelayActivity at conn.go:1815-1850).
+//
+// Threshold semantics: 3 OFFERs within 30 s. A legacy bootstrap-OFFER
+// cadence of ~2-3 min (1 OFFER per cycle) never reaches 3 because the
+// window expires between OFFERs. A peer in active re-attach (retry
+// every 5-10 s) hits the threshold in ~10-15 s wall clock.
+//
+// On threshold-reached the counter resets to 0 so the next detach
+// cycle starts fresh.
+func (conn *Conn) RecordInboundOfferBurst() (release bool) {
+	now := monotime.Now()
+	windowStart := conn.inboundOfferBurstWindowStart.Load()
+	if windowStart == 0 || monotime.Since(monotime.Time(windowStart)) > v18_17OfferBurstWindow {
+		conn.inboundOfferBurstWindowStart.Store(int64(now))
+		conn.inboundOfferBurstCount.Store(1)
+		return false
+	}
+	count := conn.inboundOfferBurstCount.Add(1)
+	if count < v18_17OfferBurstMinBurst {
+		return false
+	}
+	conn.inboundOfferBurstCount.Store(0)
+	conn.inboundOfferBurstWindowStart.Store(0)
+	return true
+}
+
+// ResetOfferBurst is V18.17: zero the OFFER-burst counter without
+// requiring a full ClearIntentionallyDetached. Called from the V15
+// first-everConnected path so a successfully-bootstrapped peer
+// doesn't carry stale counts into the next detach cycle.
+func (conn *Conn) ResetOfferBurst() {
+	conn.inboundOfferBurstCount.Store(0)
+	conn.inboundOfferBurstWindowStart.Store(0)
+}
+
+// SetBurstReleasePending arms the one-shot V18.10 bypass flag. Called
+// by ConnMgr.ActivatePeerForMessage immediately after V14 or V15 gate
+// releases the OFFER. The downstream V18.10 gate (AttachICEOnRemoteOffer
+// at conn.go:2250-2262) consumes this exactly once via
+// ConsumeBurstReleasePending. Codex R1 (2026-06-21).
+func (conn *Conn) SetBurstReleasePending() {
+	conn.v18_17BurstReleasePending.Store(true)
+}
+
+// ConsumeBurstReleasePending atomically reads-and-clears the V18.10
+// bypass flag. Returns true exactly once per SetBurstReleasePending
+// (CompareAndSwap true→false). Subsequent calls return false until
+// the next SetBurstReleasePending. Used by V18.10 gate to skip the
+// intentionallyDetached check for exactly ONE attach per release event.
+func (conn *Conn) ConsumeBurstReleasePending() bool {
+	return conn.v18_17BurstReleasePending.CompareAndSwap(true, false)
+}
+
+// OfferBurstThreshold exposes v18_17OfferBurstMinBurst for logging
+// in conn_mgr.go without leaking the unexported const.
+func OfferBurstThreshold() int32 { return v18_17OfferBurstMinBurst }
 
 // EverConnected returns true if this Conn has ever completed at least
 // one full configureConnection (P2P or relay). Used by the lazy-mode
