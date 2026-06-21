@@ -345,6 +345,7 @@ func (conn *Conn) MarkIntentionallyDetached() {
 	// Also clear any stale release-pending (defensive — should already
 	// be consumed by V18.10 long before another Mark).
 	conn.v18_17BurstReleasePending.Store(false)
+	conn.v18_17LoggedBurstRelease.Store(false)
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
@@ -371,6 +372,7 @@ func (conn *Conn) ClearIntentionallyDetached() {
 	conn.inboundOfferBurstCount.Store(0)
 	conn.inboundOfferBurstWindowStart.Store(0)
 	conn.v18_17BurstReleasePending.Store(false)
+	conn.v18_17LoggedBurstRelease.Store(false)
 }
 
 // RecordInboundOfferBurst is V18.17: called by ConnMgr.ActivatePeerForMessage
@@ -2244,9 +2246,21 @@ func (conn *Conn) AttachICEFrom(src AttachICESource) error {
 	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
 		src == AttachICESourceSignal &&
 		conn.IsIntentionallyDetached() {
-		conn.Log.Tracef("V18.10 gate: skipping signal-driven AttachICE while intentionally detached (p2p-dynamic lazy)")
-		conn.logDiagSnapshot("AttachICEFrom-blocked-signal-intentionally-detached")
-		return nil
+		// V18.17 Codex R1 (2026-06-21): one-shot bypass. When V14
+		// or V15 burst-release armed v18_17BurstReleasePending,
+		// consume it (CAS true→false) and skip the gate THIS call.
+		// Without this, V18.17's V14/V15 release would still
+		// dead-lock here because intentionallyDetached is still set.
+		if conn.ConsumeBurstReleasePending() {
+			if !conn.SwapOfferBurstReleaseLogged(true) {
+				conn.Log.Infof("V18.10+V18.17: AttachICEFrom bypassing intentionally-detached gate (OFFER-burst release consumed)")
+			}
+			// fall through to attach
+		} else {
+			conn.Log.Tracef("V18.10 gate: skipping signal-driven AttachICE while intentionally detached (p2p-dynamic lazy)")
+			conn.logDiagSnapshot("AttachICEFrom-blocked-signal-intentionally-detached")
+			return nil
+		}
 	}
 	// Phase 3.7j: clear the intentional-detach marker here (clear-point #1).
 	// Signal-driven ICE re-attach is the explicit counterpart to an
@@ -2392,9 +2406,21 @@ func (conn *Conn) AttachICEOnRemoteOffer(minCooldown time.Duration) error {
 	// then a subsequent legitimate signal cycle resumes naturally.
 	if conn.config.Mode == connectionmode.ModeP2PDynamic &&
 		conn.IsIntentionallyDetached() {
-		conn.Log.Tracef("V18.10 gate: skipping AttachICEOnRemoteOffer while intentionally detached (p2p-dynamic lazy)")
-		conn.logDiagSnapshot("AttachICEOnRemoteOffer-blocked-intentionally-detached")
-		return nil
+		// V18.17 Codex R1 (2026-06-21): one-shot bypass. Same logic
+		// as the AttachICEFrom gate above — ConsumeBurstReleasePending
+		// is one-shot, so consuming here means AttachICEFrom won't
+		// also consume it (or vice versa). Whichever attach path fires
+		// first for this OFFER cycle takes the bypass.
+		if conn.ConsumeBurstReleasePending() {
+			if !conn.SwapOfferBurstReleaseLogged(true) {
+				conn.Log.Infof("V18.10+V18.17: AttachICEOnRemoteOffer bypassing intentionally-detached gate (OFFER-burst release consumed)")
+			}
+			// fall through to attach
+		} else {
+			conn.Log.Tracef("V18.10 gate: skipping AttachICEOnRemoteOffer while intentionally detached (p2p-dynamic lazy)")
+			conn.logDiagSnapshot("AttachICEOnRemoteOffer-blocked-intentionally-detached")
+			return nil
+		}
 	}
 	// Symmetric with the other Attach-paths: clear the intentional-detach
 	// marker since a remote OFFER is an explicit re-engage signal.
