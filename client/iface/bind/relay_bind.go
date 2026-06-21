@@ -102,7 +102,12 @@ func (s *RelayBindJS) Send(bufs [][]byte, ep conn.Endpoint) error {
 	return nil
 }
 
-func (b *RelayBindJS) SetEndpoint(fakeIP netip.Addr, conn net.Conn) {
+// SetEndpoint registers a relay-path fake-IP endpoint mapping.
+// armer is V18.19 (2026-06-21): JS RelayBind currently ignores the
+// armer (no sender-side wake-intent on JS path); accepted for
+// interface parity with ICEBind.
+func (b *RelayBindJS) SetEndpoint(fakeIP netip.Addr, conn net.Conn, armer WakeIntentArmer) {
+	_ = armer
 	b.endpointsMu.Lock()
 	b.endpoints[fakeIP] = conn
 	b.endpointsMu.Unlock()

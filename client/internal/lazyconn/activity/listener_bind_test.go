@@ -31,7 +31,7 @@ func newMockEndpointManager() *mockEndpointManager {
 	}
 }
 
-func (m *mockEndpointManager) SetEndpoint(fakeIP netip.Addr, conn net.Conn) {
+func (m *mockEndpointManager) SetEndpoint(fakeIP netip.Addr, conn net.Conn, _ bind.WakeIntentArmer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.endpoints[fakeIP] = conn

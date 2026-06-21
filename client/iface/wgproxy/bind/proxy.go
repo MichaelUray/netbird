@@ -17,7 +17,13 @@ import (
 )
 
 type Bind interface {
-	SetEndpoint(addr netip.Addr, conn net.Conn)
+	// SetEndpoint registers a relay-path fake-IP mapping.
+	// V18.19 (2026-06-21): armer is bind.WakeIntentArmer (pass nil to
+	// opt-out). ProxyBind currently passes nil here — the wgproxy/bind
+	// path is the legacy relay proxy and the V18.19 wake-intent wiring
+	// from peer.Conn lands via the lazyconn BindListener path. The arg
+	// stays on the interface for parity with EndpointManager.
+	SetEndpoint(addr netip.Addr, conn net.Conn, armer bind.WakeIntentArmer)
 	RemoveEndpoint(addr netip.Addr)
 	ReceiveFromEndpoint(ctx context.Context, ep *bind.Endpoint, buf []byte)
 }
@@ -86,7 +92,10 @@ func (p *ProxyBind) Work() {
 		return
 	}
 
-	p.bind.SetEndpoint(p.wgRelayedEndpoint.Addr(), p.remoteConn)
+	// V18.19 (2026-06-21): legacy relay-proxy path passes nil armer —
+	// the wake-intent wiring is plumbed via the lazyconn BindListener
+	// path (which owns the peer.Conn handle).
+	p.bind.SetEndpoint(p.wgRelayedEndpoint.Addr(), p.remoteConn, nil)
 
 	p.pausedCond.L.Lock()
 	p.paused = false

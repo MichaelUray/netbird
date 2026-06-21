@@ -30,6 +30,19 @@ func (rc receiverCreator) CreateReceiverFn(pc wgConn.BatchReader, conn *net.UDPC
 	return rc.iceBind.createReceiverFn(pc, conn, rxOffload, msgPool)
 }
 
+// WakeIntentArmer is V18.19 (2026-06-21): the minimal interface that
+// `peer.Conn` (and any future caller) implements so the bind layer can
+// notify it of real user payload destined for that peer. The bind
+// layer does NOT import the peer package — it just calls this method
+// when the V18.6 size>32 filter passes. The implementation in peer.Conn
+// sets atomic state and dispatches a guard event; signal emission stays
+// on the peer-package goroutine.
+//
+// Codex layer-separation amendment C (2026-06-21).
+type WakeIntentArmer interface {
+	ArmLocalWakeIntent(payloadSize int)
+}
+
 // ICEBind is a bind implementation with two main features:
 // 1. filter out STUN messages and handle them
 // 2. forward the received packets to the WireGuard interface from the relayed connection
@@ -45,8 +58,18 @@ type ICEBind struct {
 	address      wgaddr.Address
 	mtu          uint16
 
-	endpoints   map[netip.Addr]net.Conn
-	endpointsMu sync.Mutex
+	endpoints map[netip.Addr]net.Conn
+	// V18.19 (2026-06-21): parallel map indexed by the same fake-IP
+	// keys as `endpoints`. Set by SetEndpoint; cleared by RemoveEndpoint.
+	// Looked up in Send to fire ArmLocalWakeIntent for the destination
+	// peer when the V18.6 size>32 filter passes.
+	//
+	// Maintained under the same endpointsMu as `endpoints` to keep the
+	// invariant: every entry in `endpoints` either has a matching
+	// `endpointsWakeArmer` entry (when caller registered an armer) or
+	// no entry (when the caller chose not to opt-in).
+	endpointsWakeArmer map[netip.Addr]WakeIntentArmer
+	endpointsMu        sync.Mutex
 	recvChan    chan recvMessage
 	// every time when Close() is called (i.e. BindUpdate()) we need to close exit from the receiveRelayed and create a
 	// new closed channel. With the closedChanMu we can safely close the channel and create a new one
@@ -64,16 +87,17 @@ type ICEBind struct {
 func NewICEBind(transportNet transport.Net, filterFn udpmux.FilterFn, address wgaddr.Address, mtu uint16) *ICEBind {
 	b, _ := wgConn.NewStdNetBind().(*wgConn.StdNetBind)
 	ib := &ICEBind{
-		StdNetBind:       b,
-		transportNet:     transportNet,
-		filterFn:         filterFn,
-		address:          address,
-		mtu:              mtu,
-		endpoints:        make(map[netip.Addr]net.Conn),
-		recvChan:         make(chan recvMessage, 1),
-		closedChan:       make(chan struct{}),
-		closed:           true,
-		activityRecorder: NewActivityRecorder(),
+		StdNetBind:         b,
+		transportNet:       transportNet,
+		filterFn:           filterFn,
+		address:            address,
+		mtu:                mtu,
+		endpoints:          make(map[netip.Addr]net.Conn),
+		endpointsWakeArmer: make(map[netip.Addr]WakeIntentArmer),
+		recvChan:           make(chan recvMessage, 1),
+		closedChan:         make(chan struct{}),
+		closed:             true,
+		activityRecorder:   NewActivityRecorder(),
 	}
 
 	rc := receiverCreator{
@@ -128,9 +152,15 @@ func (s *ICEBind) GetICEMux() (*udpmux.UniversalUDPMuxDefault, error) {
 	return s.udpMux, nil
 }
 
-func (b *ICEBind) SetEndpoint(fakeIP netip.Addr, conn net.Conn) {
+// SetEndpoint registers a relay-path fake-IP endpoint mapping.
+// armer is V18.19 (2026-06-21): pass non-nil to opt this peer into
+// sender-side local wake intent. Pass nil to retain pre-V18.19 behavior.
+func (b *ICEBind) SetEndpoint(fakeIP netip.Addr, conn net.Conn, armer WakeIntentArmer) {
 	b.endpointsMu.Lock()
 	b.endpoints[fakeIP] = conn
+	if armer != nil {
+		b.endpointsWakeArmer[fakeIP] = armer
+	}
 	b.endpointsMu.Unlock()
 }
 
@@ -139,6 +169,7 @@ func (b *ICEBind) RemoveEndpoint(fakeIP netip.Addr) {
 	defer b.endpointsMu.Unlock()
 
 	delete(b.endpoints, fakeIP)
+	delete(b.endpointsWakeArmer, fakeIP)
 }
 
 func (b *ICEBind) ReceiveFromEndpoint(ctx context.Context, ep *Endpoint, buf []byte) {
@@ -154,9 +185,28 @@ func (b *ICEBind) ReceiveFromEndpoint(ctx context.Context, ep *Endpoint, buf []b
 func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	b.endpointsMu.Lock()
 	conn, ok := b.endpoints[ep.DstIP()]
+	wakeArmer := b.endpointsWakeArmer[ep.DstIP()]
 	b.endpointsMu.Unlock()
 	if !ok {
 		return b.StdNetBind.Send(bufs, ep)
+	}
+
+	// V18.19 (2026-06-21): sender-side Local Wake Intent. Fire for ANY
+	// ok-path send (direct-ICE pair OR relay-path fake-IP) when the
+	// V18.6 size>32 filter passes. This is BROADER than V18.13's
+	// recordOutbound below, which only handles *Endpoint direct-ICE
+	// pairs via ep.(*Endpoint) — relay-path packets bypass V18.13 entirely.
+	//
+	// Layer separation (Codex amendment C): wakeArmer is an interface;
+	// the bind layer never imports peer. The implementation in peer.Conn
+	// sets atomic state and dispatches a guard event asynchronously.
+	if wakeArmer != nil {
+		for _, buf := range bufs {
+			if isTransportPkg([][]byte{buf}, len(buf)) && len(buf) > 32 {
+				wakeArmer.ArmLocalWakeIntent(len(buf))
+				break
+			}
+		}
 	}
 
 	// Phase 3.7l (Fix-D D2a): record outbound activity on the relay-send

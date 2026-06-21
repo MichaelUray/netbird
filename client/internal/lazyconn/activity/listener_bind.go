@@ -87,7 +87,13 @@ func deriveFakeIP(wgIface WgInterface, allowedIPs []netip.Prefix) (netip.Addr, e
 
 func (d *BindListener) setupLazyConn() error {
 	d.lazyConn = newLazyConnWithLabel(d.peerCfg.PublicKey)
-	d.bind.SetEndpoint(d.fakeIP, d.lazyConn)
+	// V18.19 (2026-06-21): nil armer for now — the lazyconn package
+	// cannot import the peer package, so wiring the peer.Conn through
+	// here requires either a callback hook plumbed via lazyconn.PeerConfig
+	// or a setter API on BindListener invoked from conn_mgr.go after
+	// the listener is created. Phase 2 keeps the bind-layer plumbing
+	// in place; Phase 3 will wire the actual armer end-to-end.
+	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, nil)
 
 	endpoint := &net.UDPAddr{
 		IP:   d.fakeIP.AsSlice(),
@@ -107,7 +113,13 @@ func (d *BindListener) setupLazyConn() error {
 // call concurrently with ReadPackets — bind.SetEndpoint and
 // wgIface.UpdatePeer are themselves idempotent.
 func (d *BindListener) refreshEndpoint() error {
-	d.bind.SetEndpoint(d.fakeIP, d.lazyConn)
+	// V18.19 (2026-06-21): nil armer for now — the lazyconn package
+	// cannot import the peer package, so wiring the peer.Conn through
+	// here requires either a callback hook plumbed via lazyconn.PeerConfig
+	// or a setter API on BindListener invoked from conn_mgr.go after
+	// the listener is created. Phase 2 keeps the bind-layer plumbing
+	// in place; Phase 3 will wire the actual armer end-to-end.
+	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, nil)
 
 	endpoint := &net.UDPAddr{
 		IP:   d.fakeIP.AsSlice(),
