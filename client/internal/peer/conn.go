@@ -59,13 +59,24 @@ const (
 	// V18.17 (2026-06-21): signal-OFFER burst-release. After N
 	// inbound OFFERs from the same peer within W seconds, the V14
 	// and V15 gates auto-release for that peer. Symmetric to
-	// V18.13/V18.16 transport-burst tuning. Window=30 s, threshold
-	// =3 — same K/W as the existing burst gates so the operator
-	// only has one tuning knob to think about across all three
-	// burst paths (outbound transport, inbound transport, inbound
-	// signal-OFFER).
+	// V18.13/V18.16 transport-burst tuning. Window=30 s.
+	//
+	// V18.18 (2026-06-21): threshold lowered from 3 → 2 after the
+	// Round-3 live repro on dk20+S21 showed that the sender side's
+	// own outbound-OFFER guard rate-limits to ~2 OFFERs per ~30s
+	// window (S21 sent 2 OFFERs in 26s, V18.17 threshold=3 never
+	// fired). Threshold=2 is still safe against legacy keep-alive
+	// cadence (~2-3 min per cycle), because the 30 s window expires
+	// between successive single OFFERs. Per-peer counter prevents
+	// cross-peer aggregation.
+	//
+	// Trade-off: 2 spurious signal-OFFERs from the same peer within
+	// 30s could now trigger a release. Production traces of NetworkMap
+	// churn (multiple peers signaled simultaneously) show distinct
+	// peer-keys per OFFER — counter is per-Conn, so cross-peer storms
+	// can't aggregate. Acceptable.
 	v18_17OfferBurstWindow   = 30 * time.Second
-	v18_17OfferBurstMinBurst = int32(3)
+	v18_17OfferBurstMinBurst = int32(2)
 )
 
 // MetricsRecorder is an interface for recording peer connection metrics

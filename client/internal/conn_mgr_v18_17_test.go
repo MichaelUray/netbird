@@ -85,7 +85,7 @@ func TestConnMgr_V18_17_V14_3rdOfferReachesAttachAndConsumesFlag(t *testing.T) {
 
 	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
 
-	// 1st OFFER: V14 blocks.
+	// 1st OFFER: V14 blocks (V18.18 threshold=2, count=1 < 2).
 	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
 	if conn.IsBurstReleasePendingLoad() {
 		t.Fatal("V14: 1st OFFER must NOT arm release-pending")
@@ -94,28 +94,19 @@ func TestConnMgr_V18_17_V14_3rdOfferReachesAttachAndConsumesFlag(t *testing.T) {
 		t.Fatalf("V14: 1st OFFER must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
 	}
 
-	// 2nd OFFER: same.
-	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
-	if conn.IsBurstReleasePendingLoad() {
-		t.Fatal("V14: 2nd OFFER must NOT arm release-pending")
-	}
-	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
-		t.Fatalf("V14: 2nd OFFER must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
-	}
-
-	// 3rd OFFER: V14+V18.17 releases. Fall-through reaches ActivatePeer
-	// AND consumes the flag (Clear or V18.10).
+	// 2nd OFFER: V14+V18.17 releases (V18.18 threshold=2). Fall-through
+	// reaches ActivatePeer AND consumes the flag (Clear or V18.10).
 	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
 	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount+1 {
-		t.Fatalf("V14+V18.17: 3rd OFFER MUST reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount+1)
+		t.Fatalf("V14+V18.17: 2nd OFFER MUST reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount+1)
 	}
 	if conn.IsBurstReleasePendingLoad() {
-		t.Fatal("V14+V18.17: 3rd OFFER must NOT leave flag armed — either Clear or V18.10 must have consumed it in the same call")
+		t.Fatal("V14+V18.17: 2nd OFFER must NOT leave flag armed — either Clear or V18.10 must have consumed it in the same call")
 	}
 }
 
 // TestConnMgr_V18_17_V15_3rdOfferReachesAttachAndConsumesFlag — same
-// invariant for V15 cold-boot path.
+// invariant for V15 cold-boot path. V18.18: 2nd OFFER triggers (not 3rd).
 func TestConnMgr_V18_17_V15_3rdOfferReachesAttachAndConsumesFlag(t *testing.T) {
 	cm, conn := newV18_17TestHarness(t, connectionmode.ModeP2PDynamic)
 	conn.SetEverConnectedForTest(false)
@@ -124,22 +115,22 @@ func TestConnMgr_V18_17_V15_3rdOfferReachesAttachAndConsumesFlag(t *testing.T) {
 
 	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
 
-	for i := 1; i <= 2; i++ {
-		cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
-		if conn.IsBurstReleasePendingLoad() {
-			t.Fatalf("V15: OFFER #%d must NOT arm release-pending", i)
-		}
-		if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
-			t.Fatalf("V15: OFFER #%d must NOT reach lazyConnMgr.ActivatePeer", i)
-		}
+	// 1st OFFER: V15 blocks (count=1 < 2).
+	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+	if conn.IsBurstReleasePendingLoad() {
+		t.Fatal("V15: 1st OFFER must NOT arm release-pending")
+	}
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V15: 1st OFFER must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
 	}
 
+	// 2nd OFFER: V15+V18.17 releases.
 	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
 	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount+1 {
-		t.Fatalf("V15+V18.17: 3rd OFFER MUST reach lazyConnMgr.ActivatePeer")
+		t.Fatalf("V15+V18.17: 2nd OFFER MUST reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount+1)
 	}
 	if conn.IsBurstReleasePendingLoad() {
-		t.Fatal("V15+V18.17: 3rd OFFER must NOT leave flag armed")
+		t.Fatal("V15+V18.17: 2nd OFFER must NOT leave flag armed")
 	}
 }
 
