@@ -2,7 +2,6 @@ package peer
 
 import (
 	"testing"
-	"time"
 
 	"github.com/netbirdio/netbird/monotime"
 )
@@ -152,5 +151,3 @@ func TestConn_V18_17_BurstReleasePending_OneShot(t *testing.T) {
 		t.Fatal("Consume must return false on second call (flag was consumed)")
 	}
 }
-
-var _ = time.Second // keep import alive even if unused in later edits

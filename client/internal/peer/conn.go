@@ -289,7 +289,8 @@ type Conn struct {
 	inboundOfferBurstWindowStart atomic.Int64 // monotime ns
 
 	// V18.17 (2026-06-21) Codex R1: one-shot bypass flag for the
-	// downstream V18.10 gate at conn.go:2250-2262. SetBurstReleasePending()
+	// downstream V18.10 gate at conn.go:2220 (AttachICEFrom) and
+	// conn.go:2369 (AttachICEOnRemoteOffer). SetBurstReleasePending()
 	// is called when V14/V15 burst threshold releases the OFFER. The
 	// V18.10 gate calls ConsumeBurstReleasePending() (CAS true→false)
 	// and bypasses its intentionallyDetached check when consumed.
@@ -371,7 +372,12 @@ func (conn *Conn) ClearIntentionallyDetached() {
 // this peer. Returns true when the per-cycle threshold is met for THIS
 // call — caller MUST release the gate and proceed with the activation.
 // Increments + window-bookkeeping are atomic (same pattern as
-// AttachICEOnRelayActivity at conn.go:1815-1850).
+// AttachICEOnRelayActivity at conn.go:1939-1967).
+//
+// Concurrency: this method is NOT safe under concurrent same-Conn callers
+// (read→branch→store on windowStart). Production safety relies on the
+// engine.syncMsgMux serialising all ActivatePeerForMessage invocations
+// (see engine.go:1853-1872). If that contract changes, wrap this in mu.
 //
 // Threshold semantics: 3 OFFERs within 30 s. A legacy bootstrap-OFFER
 // cadence of ~2-3 min (1 OFFER per cycle) never reaches 3 because the
@@ -408,8 +414,9 @@ func (conn *Conn) ResetOfferBurst() {
 
 // SetBurstReleasePending arms the one-shot V18.10 bypass flag. Called
 // by ConnMgr.ActivatePeerForMessage immediately after V14 or V15 gate
-// releases the OFFER. The downstream V18.10 gate (AttachICEOnRemoteOffer
-// at conn.go:2250-2262) consumes this exactly once via
+// releases the OFFER. The downstream V18.10 gate (AttachICEFrom at
+// conn.go:2220 and AttachICEOnRemoteOffer at conn.go:2369) consumes
+// this exactly once via
 // ConsumeBurstReleasePending. Codex R1 (2026-06-21).
 func (conn *Conn) SetBurstReleasePending() {
 	conn.v18_17BurstReleasePending.Store(true)
