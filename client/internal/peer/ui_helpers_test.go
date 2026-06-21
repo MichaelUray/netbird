@@ -22,7 +22,13 @@ func TestIsLegacyPeer(t *testing.T) {
 		{"v0.51.2", true},
 		{"a0.51.2", true},
 		{"0.51", true},
-		{"0.52.0", false},
+		// V18.32 (2026-06-21): raised ceiling from 0.52.0 to 0.54.0 after
+		// live confirmation that 0.53.0 BG-routers race the same way
+		// (dolice/lethbridge/lunzamsee). 0.52.0 and 0.53.0 now legacy.
+		{"0.52.0", true},
+		{"0.53.0", true},
+		{"0.53.99", true},
+		{"0.54.0", false},
 		{"0.55.0", false},
 		{"1.0.0", false},
 		{"not-a-version", false},

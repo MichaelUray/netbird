@@ -18,14 +18,30 @@ import (
 //
 //   - Elmira v0.51.2 (heute 413× WARNs on AWOam)
 //
-// Hardware-test pending against Lethbridge v0.53.0, dolice-bg-r1
-// v0.53.0, LunzAmSee-nr-r1 v0.53.0. If those also race, raise the
-// ceiling to "0.54.0" or "0.55.0". We do NOT preemptively widen to
-// "0.60.0" since the upstream commit fixing the bug at a specific
-// version is not known — our own branch still has the same
-// agent-nil-return pattern, so we cannot assume any modern version
-// is automatically immune.
-var legacyCandidateRecvCeiling = version.Must(version.NewVersion("0.52.0"))
+// 2026-06-21 V18.32 raised to "0.54.0" after live hardware
+// confirmation that v0.53.0 BG-routers race the same way:
+//
+//   - User-reported S26 → 10.1.233.51 (Dolice LAN) unreachable
+//   - dk20 → 10.1.233.51 (also via dolice-bg-r1) unreachable
+//   - dk20 client.log shows OFFER/ANSWER exchange succeeds with
+//     dolice-bg-r1 v0.53.0 + "WireGuard handshake timed out"
+//     within 10 s, then "Required key not available" on kernel-WG
+//   - Same symptom pattern as Elmira v0.51.2: signalling looks
+//     healthy, ICE candidates exchange, but the post-establishment
+//     handshake never completes because remote candidate frames
+//     arrived before remote's pion agent was bootstrapped
+//
+// 0.54.0 (exclusive) covers 0.51.x / 0.52.x / 0.53.x — exactly the
+// set of legacy versions our fleet still has in production
+// (BG-routers we cannot easily firmware-update remotely). Plain
+// 0.54.0 and above are not (yet) known to race.
+//
+// We do NOT preemptively widen further (e.g. 0.60.0) since the
+// upstream commit fixing the bug at a specific version is not
+// known — our own branch still has the same agent-nil-return
+// pattern, so we cannot assume any modern version is automatically
+// immune.
+var legacyCandidateRecvCeiling = version.Must(version.NewVersion("0.54.0"))
 
 // isLegacyICECandidateRecv returns true if the remote peer's
 // NetBird version is in the range known to drop ICE candidates

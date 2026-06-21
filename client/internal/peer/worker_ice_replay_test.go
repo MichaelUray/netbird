@@ -100,8 +100,14 @@ func TestIsLegacyICECandidateRecv_Versions(t *testing.T) {
 		{"v0.51.2", true, "Codex v4 explicit prefix-trim test"},
 		{"0.51.0", true, "below ceiling"},
 		{"0.51.99", true, "below ceiling"},
-		{"0.52.0", false, "ceiling exclusive"},
-		{"0.53.0", false, "Lethbridge — initial NOT in scope, hardware-test pending"},
+		// V18.32 (2026-06-21): ceiling raised 0.52.0 → 0.54.0 after
+		// dolice-bg-r1 v0.53.0 confirmed racing in production
+		// (OFFER/ANSWER exchange OK, WG handshake timeout 10s,
+		// "Required key not available" on kernel-WG).
+		{"0.52.0", true, "now legacy (raised ceiling)"},
+		{"0.53.0", true, "dolice / lethbridge / lunzamsee — confirmed racing 2026-06-21"},
+		{"0.53.99", true, "covers all 0.53.x patch releases"},
+		{"0.54.0", false, "new ceiling exclusive"},
 		{"0.59.13", false, "ared-park/antiesenhofen — assumed modern"},
 		{"0.60.4", false, "MarlCreek/Stocking-BG — assumed modern"},
 		{"0.67.1", false, "ctb59-n — modern"},
