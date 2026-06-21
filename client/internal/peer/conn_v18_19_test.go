@@ -148,3 +148,30 @@ func TestConn_V18_19_ArmIntent_BudgetRefreshOnReArmAfterExpiry(t *testing.T) {
 		t.Fatal("first Consume after re-arm MUST succeed (fresh budget)")
 	}
 }
+
+// TestConn_V18_19_LatchResetsBetweenCycles verifies that after Mark
+// clears the v18_19LoggedArmIntent latch, the NEXT ArmLocalWakeIntent
+// in the new cycle emits Info (not Trace) — i.e. the per-cycle Info-log
+// cardinality contract is honored across detach cycles. This is the
+// invariant Phase 3 log-grep relies on for operator-observability.
+func TestConn_V18_19_LatchResetsBetweenCycles(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	// Cycle 1.
+	conn.ArmLocalWakeIntent(148)
+	if !conn.v18_19LoggedArmIntent.Load() {
+		t.Fatal("setup: latch must be set after first arm in cycle 1")
+	}
+
+	// End cycle 1 → start cycle 2.
+	conn.MarkIntentionallyDetached()
+	if conn.v18_19LoggedArmIntent.Load() {
+		t.Fatal("Mark must reset the latch")
+	}
+
+	// First arm in cycle 2 must re-set the latch (= Info log emits).
+	conn.ArmLocalWakeIntent(148)
+	if !conn.v18_19LoggedArmIntent.Load() {
+		t.Fatal("first arm in cycle 2 must re-set the latch (per-cycle Info contract)")
+	}
+}

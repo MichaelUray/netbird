@@ -544,6 +544,12 @@ func (conn *Conn) SwapOfferBurstReleaseLogged(new bool) bool {
 // existing Conn event channel; until then, the next regular guard tick
 // observes the intent on its own cadence.
 //
+// Fresh-arm classification + budget reset is gated by CompareAndSwap on
+// localWakeIntentUntil so a concurrent ConsumeWakeOfferBudget cannot
+// have its budget increment silently erased by a racing Arm. Only the
+// goroutine that wins the "expired → fresh" transition resets the
+// budget; losers extend the deadline without touching the budget.
+//
 // payloadSize parameter is logged for diagnostics only — not used for
 // state. The bind-layer caller has already enforced the V18.6 size
 // filter, so any call here implies real payload.
@@ -551,12 +557,29 @@ func (conn *Conn) ArmLocalWakeIntent(payloadSize int) {
 	now := int64(monotime.Now())
 	deadline := now + int64(v18_19WakeIntentWindow)
 
-	// If previous intent had expired, this is a fresh arm — reset budget.
+	// Fresh-arm classification + budget reset is gated by CAS so a
+	// concurrent ConsumeWakeOfferBudget cannot have its budget increment
+	// silently erased by a racing Arm. Only the goroutine that wins the
+	// "expired → fresh" transition resets the budget; losers extend the
+	// deadline without touching the budget.
+	//
+	// Code-review Important #1 (2026-06-21): without this CAS gating,
+	// the plan's "hard cap ≤ v18_19WakeBudget" invariant could be
+	// violated by 1 OFFER under concurrent Arm + Consume interleave.
 	prev := conn.localWakeIntentUntil.Load()
 	if prev == 0 || prev <= now {
-		conn.wakeOfferBudgetUsed.Store(0)
+		// Try to claim the fresh-arm transition. If CAS succeeds, WE
+		// reset budget. If it fails, another goroutine already won.
+		if conn.localWakeIntentUntil.CompareAndSwap(prev, deadline) {
+			conn.wakeOfferBudgetUsed.Store(0)
+		} else {
+			// Lost the race — only extend deadline, do not reset budget.
+			conn.localWakeIntentUntil.Store(deadline)
+		}
+	} else {
+		// Intent already active — just extend the deadline.
+		conn.localWakeIntentUntil.Store(deadline)
 	}
-	conn.localWakeIntentUntil.Store(deadline)
 
 	// Info log ONCE per detach cycle on the first arm.
 	if !conn.v18_19LoggedArmIntent.Swap(true) {
