@@ -79,6 +79,29 @@ const (
 	v18_17OfferBurstMinBurst = int32(2)
 )
 
+const (
+	// V18.19 (2026-06-21): sender-side Local Wake Intent.
+	// When real user payload (>32 B, transport type) destined for peer X
+	// is observed by the WG send path, ArmLocalWakeIntent stamps a
+	// 20-second window. While active, the sender's bootstrap-OFFER guard
+	// (conn.go:onGuardEvent / shouldSkipBootstrapOffer) may release its
+	// "wait for remote OFFER" hold and send up to v18_19WakeBudget wake
+	// OFFERs per peer per window. Filter is reused from V18.6
+	// (size > 32 && transport type) at the bind layer.
+	//
+	// Window=20s aligns with typical user-driven ping bursts. Budget=3
+	// allows OFFER #1 immediate, then 2 retries via guard cadence within
+	// the window. Receiver-side V18.18 threshold=2 means 2 OFFERs in 30s
+	// are sufficient — the 3rd is a safety margin for signal-loss.
+	//
+	// Per-peer counters prevent cross-peer aggregation. Reset on BOTH
+	// MarkIntentionallyDetached AND ClearIntentionallyDetached (Codex
+	// amendment 2026-06-21) so stale intent from a prior cycle does not
+	// survive into a new idle cycle.
+	v18_19WakeIntentWindow = 20 * time.Second
+	v18_19WakeBudget       = int32(3)
+)
+
 // MetricsRecorder is an interface for recording peer connection metrics
 type MetricsRecorder interface {
 	RecordConnectionStages(
@@ -316,6 +339,26 @@ type Conn struct {
 	// (full reset wiring added in Task 4).
 	v18_17LoggedBurstRelease atomic.Bool
 
+	// V18.19 (2026-06-21): sender-side Local Wake Intent state.
+	// See const block above for full rationale.
+	//
+	// localWakeIntentUntil holds the monotime ns deadline. Zero means
+	// no active intent. Set by ArmLocalWakeIntent (called from
+	// ice_bind.go Send path in Phase 2). Checked by IsLocalWakeIntentActive
+	// and ConsumeWakeOfferBudget. Reset by Mark/Clear.
+	localWakeIntentUntil atomic.Int64
+
+	// wakeOfferBudgetUsed counts consumed wake-OFFER slots within the
+	// current intent window. Resets to 0 on each fresh ArmLocalWakeIntent
+	// (after the previous window expired) AND on Mark/Clear.
+	wakeOfferBudgetUsed atomic.Int32
+
+	// v18_19LoggedArmIntent is the per-detach-cycle Info-log latch. Emit
+	// the "intent armed" Info ONCE per cycle on the first arm; subsequent
+	// arms within the same cycle log at Trace. Reset by Mark/Clear (same
+	// pattern as V18.16 / V18.17 latches).
+	v18_19LoggedArmIntent atomic.Bool
+
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
 	// from onICEFailed / onICEConnected; snapshot-read from
@@ -357,6 +400,12 @@ func (conn *Conn) MarkIntentionallyDetached() {
 	// be consumed by V18.10 long before another Mark).
 	conn.v18_17BurstReleasePending.Store(false)
 	conn.v18_17LoggedBurstRelease.Store(false)
+	// V18.19 reset (Codex amendment 2026-06-21): wake-intent state MUST NOT
+	// survive a new detach cycle. A new outbound payload after detach
+	// must re-arm intent through the standard ArmLocalWakeIntent call site.
+	conn.localWakeIntentUntil.Store(0)
+	conn.wakeOfferBudgetUsed.Store(0)
+	conn.v18_19LoggedArmIntent.Store(false)
 }
 
 // IsIntentionallyDetached returns true while the most recent ICE detach
@@ -384,6 +433,12 @@ func (conn *Conn) ClearIntentionallyDetached() {
 	conn.inboundOfferBurstWindowStart.Store(0)
 	conn.v18_17BurstReleasePending.Store(false)
 	conn.v18_17LoggedBurstRelease.Store(false)
+	// V18.19 reset (Codex amendment 2026-06-21): wake-intent state MUST NOT
+	// survive a new detach cycle. A new outbound payload after detach
+	// must re-arm intent through the standard ArmLocalWakeIntent call site.
+	conn.localWakeIntentUntil.Store(0)
+	conn.wakeOfferBudgetUsed.Store(0)
+	conn.v18_19LoggedArmIntent.Store(false)
 }
 
 // RecordInboundOfferBurst is V18.17: called by ConnMgr.ActivatePeerForMessage
@@ -475,6 +530,78 @@ func (conn *Conn) SetEverConnectedForTest(v bool) { conn.everConnected.Store(v) 
 // Stub for Task 2; full latch field + reset hooks added in Task 4.
 func (conn *Conn) SwapOfferBurstReleaseLogged(new bool) bool {
 	return conn.v18_17LoggedBurstRelease.Swap(new)
+}
+
+// ArmLocalWakeIntent is V18.19 sender-side: called from the WG send path
+// (ice_bind.go in Phase 2) when real user payload destined for this peer
+// is observed. Sets localWakeIntentUntil to now + window AND resets the
+// budget if the previous intent had expired.
+//
+// CRITICAL layer-separation invariant (Codex amendment C 2026-06-21):
+// this method MUST NOT directly call any signal-emission path
+// (handshaker.SendOffer, ICE attach, etc.). It only sets atomic state.
+// Phase 3 will add an asynchronous kick to onGuardEvent via the
+// existing Conn event channel; until then, the next regular guard tick
+// observes the intent on its own cadence.
+//
+// payloadSize parameter is logged for diagnostics only — not used for
+// state. The bind-layer caller has already enforced the V18.6 size
+// filter, so any call here implies real payload.
+func (conn *Conn) ArmLocalWakeIntent(payloadSize int) {
+	now := int64(monotime.Now())
+	deadline := now + int64(v18_19WakeIntentWindow)
+
+	// If previous intent had expired, this is a fresh arm — reset budget.
+	prev := conn.localWakeIntentUntil.Load()
+	if prev == 0 || prev <= now {
+		conn.wakeOfferBudgetUsed.Store(0)
+	}
+	conn.localWakeIntentUntil.Store(deadline)
+
+	// Info log ONCE per detach cycle on the first arm.
+	if !conn.v18_19LoggedArmIntent.Swap(true) {
+		conn.Log.Infof("V18.19: arming local wake intent (payload=%d B, window=%v, budget=%d)",
+			payloadSize, v18_19WakeIntentWindow, v18_19WakeBudget)
+	} else {
+		conn.Log.Tracef("V18.19: re-arming local wake intent within cycle (payload=%d B)", payloadSize)
+	}
+}
+
+// ConsumeWakeOfferBudget is V18.19 sender-side: called from the sender
+// bootstrap-OFFER guard (conn.go:onGuardEvent / shouldSkipBootstrapOffer
+// in Phase 3). Returns true if there is an active intent AND budget
+// remains; atomically increments the used counter. Subsequent calls
+// past the budget OR after intent expiry return false.
+//
+// Used by the guard to override its normal "wait for remote OFFER" hold
+// for exactly v18_19WakeBudget wake-OFFER opportunities per peer per
+// intent window.
+func (conn *Conn) ConsumeWakeOfferBudget() bool {
+	now := int64(monotime.Now())
+	deadline := conn.localWakeIntentUntil.Load()
+	if deadline == 0 || deadline <= now {
+		return false
+	}
+	// Increment first, check after (atomic) to avoid race with another
+	// goroutine consuming the last slot. Add returns the new value.
+	used := conn.wakeOfferBudgetUsed.Add(1)
+	if used > v18_19WakeBudget {
+		// Overflow — roll back so the counter doesn't grow unboundedly
+		// across many failed consumes within the window.
+		conn.wakeOfferBudgetUsed.Add(-1)
+		return false
+	}
+	return true
+}
+
+// IsLocalWakeIntentActive returns true when the V18.19 intent window
+// has not yet expired. Diagnostic-only (does not consume budget).
+func (conn *Conn) IsLocalWakeIntentActive() bool {
+	deadline := conn.localWakeIntentUntil.Load()
+	if deadline == 0 {
+		return false
+	}
+	return deadline > int64(monotime.Now())
 }
 
 // EverConnected returns true if this Conn has ever completed at least
