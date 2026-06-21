@@ -274,27 +274,45 @@ func TestConn_V18_30_ReArmAfterClear_RestoresGuardOverride(t *testing.T) {
 	}
 }
 
-// TestConn_V18_30_RemoteOfflineOverride_ConsumesBudget verifies that the
-// V18.30 remote-offline gate (conn.go:1583) also respects the wake-intent
-// budget — exactly like the bootstrap-skip gate at conn.go:1562. Without
-// this override, kernel-mode senders whose mgmt-view sees the remote as
-// !RemoteLiveOnline (lagging heartbeat) would have their cold-boot wake
-// silently skipped at the second guard gate even after V18.30's
-// listener_udp.go + manager.onPeerActivity post-AttachICE re-arm.
-func TestConn_V18_30_RemoteOfflineOverride_ConsumesBudget(t *testing.T) {
+// TestConn_V18_30_RemoteOfflineOverride_NoBudgetConsume verifies that the
+// V18.30 remote-offline gate uses the no-cost IsLocalWakeIntentActive
+// check rather than ConsumeWakeOfferBudget. The bootstrap-skip gate
+// directly ABOVE (conn.go:1562) already consumes a budget slot in the
+// same guard tick, so double-consuming would halve the effective
+// 3-OFFER budget. Live test 2026-06-21 18:23 UTC reproduced the
+// halved-budget behaviour on dk20 → S26 cold-boot.
+func TestConn_V18_30_RemoteOfflineOverride_NoBudgetConsume(t *testing.T) {
 	conn := newMarkerTestConn(t)
 	conn.ArmLocalWakeIntent(0)
 
-	before := conn.wakeOfferBudgetUsed.Load()
-
-	// Direct ConsumeWakeOfferBudget call models the gate's decision
-	// when RemoteServerLivenessKnown && !RemoteLiveOnline.
+	// Simulate the bootstrap-skip override consuming one slot above.
 	if !conn.ConsumeWakeOfferBudget() {
-		t.Fatal("V18.30: remote-offline override must consume budget when intent armed")
+		t.Fatal("setup: bootstrap-skip override must succeed first")
+	}
+	bootstrapUsed := conn.wakeOfferBudgetUsed.Load()
+	if bootstrapUsed != 1 {
+		t.Fatalf("setup: budget after bootstrap consume must be 1, got %d", bootstrapUsed)
 	}
 
-	after := conn.wakeOfferBudgetUsed.Load()
-	if after != before+1 {
-		t.Fatalf("V18.30: budget must increment, got %d→%d", before, after)
+	// V18.30 remote-offline check must NOT consume an additional slot.
+	if !conn.IsLocalWakeIntentActive() {
+		t.Fatal("V18.30: remote-offline check must pass while intent active")
+	}
+	afterCheck := conn.wakeOfferBudgetUsed.Load()
+	if afterCheck != bootstrapUsed {
+		t.Fatalf("V18.30: IsLocalWakeIntentActive must NOT consume budget, got %d→%d",
+			bootstrapUsed, afterCheck)
+	}
+
+	// All v18_19WakeBudget OFFERs should remain available across guard
+	// ticks: each tick consumes ONE slot at the bootstrap-skip gate,
+	// V18.30 only confirms intent is still active.
+	for i := int32(2); i <= v18_19WakeBudget; i++ {
+		if !conn.ConsumeWakeOfferBudget() {
+			t.Fatalf("V18.30: budget slot %d must be available (no double-consume)", i)
+		}
+		if !conn.IsLocalWakeIntentActive() {
+			t.Fatalf("V18.30: intent must remain active across slot %d", i)
+		}
 	}
 }

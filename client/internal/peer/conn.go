@@ -1589,11 +1589,23 @@ func (conn *Conn) onGuardEvent() {
 				// reach the peer even if the mgmt-server's last
 				// NetworkMap update says it's offline. The mgmt-view
 				// lags real connectivity (heartbeat-based) and a peer
-				// recently online may still be reachable. The V18.19
-				// budget (3 OFFERs per 20 s) caps the spam risk to
-				// "honestly offline" peers.
-				if conn.ConsumeWakeOfferBudget() {
-					conn.Log.Infof("V18.30: remote-offline override — local wake intent active, consuming wake-OFFER budget")
+				// recently online may still be reachable.
+				//
+				// Uses IsLocalWakeIntentActive (no-cost check) instead
+				// of ConsumeWakeOfferBudget because the bootstrap-skip
+				// override at conn.go:1562 ABOVE has already consumed a
+				// budget slot in this same guard tick — double-consume
+				// halves the effective wake-budget (3 → 1.5 OFFERs).
+				// V18.19's bootstrap-skip override is the authoritative
+				// rate-limiter; once it passes, V18.30's gate just needs
+				// to confirm the intent window is still open.
+				//
+				// For everConnected=true peers (where bootstrap-skip is
+				// not entered) the guard's own MaxInterval backoff
+				// provides natural rate-limiting on top of the 20 s
+				// intent window.
+				if conn.IsLocalWakeIntentActive() {
+					conn.Log.Infof("V18.30: remote-offline override — local wake intent active")
 					conn.logDiagSnapshot("guard-v18_30-remote-offline-override")
 					// fall through to send-offer below
 				} else {
