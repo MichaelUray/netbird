@@ -67,6 +67,18 @@ func (d *UDPListener) ReadPackets() readResult {
 			continue
 		}
 		d.peerCfg.Log.Infof("activity detected")
+		// V18.30 (2026-06-21): kernel-mode counterpart to V18.19's ICEBind.Send
+		// hook. wireguard.ko routes outbound user payload (handshake-init or
+		// transport) to this UDP socket — its activity-edge IS the sender-side
+		// wake signal we need. Arm the local wake intent so the
+		// shouldSkipBootstrapOffer guard opens for OFFER #2..N and the
+		// receiver-side V18.18 burst threshold is satisfied.
+		//
+		// Nil-safety mirrors listener_bind.go: WakeArmer may be nil in tests
+		// that construct lazyconn.PeerConfig directly without a peer.Conn.
+		if d.peerCfg.WakeArmer != nil {
+			d.peerCfg.WakeArmer.ArmLocalWakeIntent(n)
+		}
 		result = readActivity
 		break
 	}
