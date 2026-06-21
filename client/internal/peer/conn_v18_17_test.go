@@ -151,3 +151,29 @@ func TestConn_V18_17_BurstReleasePending_OneShot(t *testing.T) {
 		t.Fatal("Consume must return false on second call (flag was consumed)")
 	}
 }
+
+// TestConn_V18_17_V14GateReleasesAfterOfferBurst is a Conn-level test
+// that exercises the threshold accessor on a peer that IS lazy-detached.
+// (Full integration through ConnMgr is in conn_mgr_v18_17_test.go.)
+func TestConn_V18_17_V14GateReleasesAfterOfferBurst(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	conn.MarkIntentionallyDetached()
+	// Simulate everConnected=true (V14 precondition).
+	conn.everConnected.Store(true)
+
+	if !conn.IsLazyDetached() {
+		t.Fatal("setup: conn must report IsLazyDetached=true")
+	}
+
+	// First 2 OFFERs: V14 gate still blocks (counter < threshold).
+	if r := conn.RecordInboundOfferBurst(); r {
+		t.Fatal("V14: 1st OFFER must NOT release gate")
+	}
+	if r := conn.RecordInboundOfferBurst(); r {
+		t.Fatal("V14: 2nd OFFER must NOT release gate")
+	}
+	// 3rd OFFER: release gate.
+	if r := conn.RecordInboundOfferBurst(); !r {
+		t.Fatal("V14: 3rd OFFER MUST release gate")
+	}
+}

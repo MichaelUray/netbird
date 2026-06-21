@@ -299,6 +299,12 @@ type Conn struct {
 	// normally.
 	v18_17BurstReleasePending atomic.Bool
 
+	// V18.17: one-shot latch — emit a single Info-level log per
+	// detach cycle when the OFFER-burst threshold is reached. Reset
+	// on MarkIntentionallyDetached and ClearIntentionallyDetached
+	// (full reset wiring added in Task 4).
+	v18_17LoggedBurstRelease atomic.Bool
+
 	// Phase 3.7l Fix-D Phase 1: per-peer tracking of "same srflx port
 	// across consecutive ICE failures". Mutated under its own mutex
 	// from onICEFailed / onICEConnected; snapshot-read from
@@ -434,6 +440,15 @@ func (conn *Conn) ConsumeBurstReleasePending() bool {
 // OfferBurstThreshold exposes v18_17OfferBurstMinBurst for logging
 // in conn_mgr.go without leaking the unexported const.
 func OfferBurstThreshold() int32 { return v18_17OfferBurstMinBurst }
+
+// SwapOfferBurstReleaseLogged atomic-swaps the V18.17 Info-log latch.
+// Returns the PREVIOUS value, so `!SwapOfferBurstReleaseLogged(true)`
+// is true ONLY on the first fire per detach cycle. Used by conn_mgr.go
+// to bound the Info log to one line per cycle per peer.
+// Stub for Task 2; full latch field + reset hooks added in Task 4.
+func (conn *Conn) SwapOfferBurstReleaseLogged(new bool) bool {
+	return conn.v18_17LoggedBurstRelease.Swap(new)
+}
 
 // EverConnected returns true if this Conn has ever completed at least
 // one full configureConnection (P2P or relay). Used by the lazy-mode

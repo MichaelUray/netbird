@@ -561,8 +561,40 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 	// has never been P2P-up must still react to legitimate remote-
 	// initiated negotiation.
 	if conn.IsLazyDetached() {
-		conn.Log.Tracef("V14 gate: ignoring inbound signal %s (intentionally-detached + everConnected, lazy-mode anti-spam)", msgType)
-		return
+		// V18.17 (2026-06-21): asymmetric dead-lock escape hatch.
+		// When ONLY this peer's signal-OFFER msg arrives (a real
+		// wake-up trigger from remote), count it against the
+		// per-peer OFFER-burst gate. After 3 OFFERs in 30 s the
+		// remote has clearly retried — release this gate ONCE so
+		// the activation proceeds. Non-OFFER msgs (CANDIDATE /
+		// ANSWER / MODE) still hit the original anti-spam reject
+		// — those are mid-session and have no semantics outside
+		// an active ICE/handshake context.
+		//
+		// Production case (Round-3 test 2026-06-20): dk20 + S21
+		// both fully Idle, S21 → dk20 single-side ping. dk20
+		// V14-gated all 30 OFFERs from S21 → 0/30 success. With
+		// V18.17 the 3rd OFFER releases the gate, normal activation
+		// proceeds, ICE re-attaches within 10-15 s.
+		//
+		// Codex R1 (2026-06-21): the downstream AttachICEOnRemoteOffer
+		// has its own V18.10 gate (conn.go:2376) that ALSO blocks on
+		// intentionallyDetached. Calling SetBurstReleasePending here
+		// arms a one-shot flag that V18.10 consumes via
+		// CompareAndSwap(true,false), bypassing the gate for exactly
+		// ONE attach. Without this, V18.17 would still dead-lock
+		// downstream.
+		if msgType == sProto.Body_OFFER && conn.RecordInboundOfferBurst() {
+			conn.SetBurstReleasePending()
+			if !conn.SwapOfferBurstReleaseLogged(true) {
+				conn.Log.Infof("V14+V18.17: OFFER-burst threshold reached (>=%d in 30s) — releasing gate + arming V18.10 bypass",
+					peer.OfferBurstThreshold())
+			}
+			// fall through: the rest of ActivatePeerForMessage proceeds.
+		} else {
+			conn.Log.Tracef("V14 gate: ignoring inbound signal %s (intentionally-detached + everConnected, lazy-mode anti-spam)", msgType)
+			return
+		}
 	}
 
 	// V15 strict-lazy cold-boot gate (2026-06-04): in p2p-dynamic mode,
