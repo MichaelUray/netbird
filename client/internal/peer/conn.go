@@ -970,6 +970,7 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 
 	conn.currentConnPriority = priority
 	conn.everConnected.Store(true)
+	conn.ResetOfferBurst() // V18.17: clear OFFER-burst on first-ever-connected
 	conn.statusICE.SetConnected()
 	conn.updateIceState(iceConnInfo, updateTime)
 	conn.doOnConnected(iceConnInfo.RosenpassPubKey, iceConnInfo.RosenpassAddr, updateTime)
@@ -1143,6 +1144,7 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 	conn.rosenpassRemoteKey = rci.rosenpassPubKey
 	conn.currentConnPriority = conntype.Relay
 	conn.everConnected.Store(true)
+	conn.ResetOfferBurst() // V18.17: clear OFFER-burst on first-ever-connected
 	conn.statusRelay.SetConnected()
 	conn.setRelayedProxy(wgProxy)
 	conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, updateTime)

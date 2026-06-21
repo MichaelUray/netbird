@@ -622,8 +622,21 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 	if e.mode == connectionmode.ModeP2PDynamic &&
 		msgType == sProto.Body_OFFER &&
 		!conn.EverConnected() {
-		conn.Log.Tracef("V15 gate: ignoring inbound OFFER (cold-boot, never-connected; strict-lazy: wait for local outbound traffic)")
-		return
+		// V18.17 (2026-06-21): same auto-release pattern as V14
+		// above. Counter is SHARED with V14 — a peer that bounces
+		// between gates within the same window still benefits.
+		// Codex R1: also SetBurstReleasePending for V18.10 bypass.
+		if conn.RecordInboundOfferBurst() {
+			conn.SetBurstReleasePending()
+			if !conn.SwapOfferBurstReleaseLogged(true) {
+				conn.Log.Infof("V15+V18.17: cold-boot OFFER-burst threshold reached (>=%d in 30s) — releasing gate + arming V18.10 bypass",
+					peer.OfferBurstThreshold())
+			}
+			// fall through
+		} else {
+			conn.Log.Tracef("V15 gate: ignoring inbound OFFER (cold-boot, never-connected; strict-lazy: wait for local outbound traffic)")
+			return
+		}
 	}
 
 	// V17.4 stuck-recovery removed by V18.3 (2026-06-09): with V14

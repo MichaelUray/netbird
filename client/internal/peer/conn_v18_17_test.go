@@ -177,3 +177,27 @@ func TestConn_V18_17_V14GateReleasesAfterOfferBurst(t *testing.T) {
 		t.Fatal("V14: 3rd OFFER MUST release gate")
 	}
 }
+
+// TestConn_V18_17_V15GateCounterSharedWithV14 verifies that the V15
+// path (cold-boot, never-connected) shares the SAME counter as V14
+// (no double-counting). A peer that hits V15 gate 3 times in 30s
+// also gets the OFFER-burst release.
+func TestConn_V18_17_V15GateCounterSharedWithV14(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	// V15 precondition: !everConnected and lazy mode
+	// (newMarkerTestConn already sets the mode correctly)
+	if conn.EverConnected() {
+		t.Fatal("setup: conn must report EverConnected=false (V15 precondition)")
+	}
+
+	// Same accessor → same gate release at the 3rd call.
+	if r := conn.RecordInboundOfferBurst(); r {
+		t.Fatal("V15: 1st OFFER must NOT release gate")
+	}
+	if r := conn.RecordInboundOfferBurst(); r {
+		t.Fatal("V15: 2nd OFFER must NOT release gate")
+	}
+	if r := conn.RecordInboundOfferBurst(); !r {
+		t.Fatal("V15: 3rd OFFER MUST release gate (shared counter with V14)")
+	}
+}
