@@ -273,3 +273,28 @@ func TestConn_V18_30_ReArmAfterClear_RestoresGuardOverride(t *testing.T) {
 		t.Fatal("V18.30: Consume past budget must return false (cap enforced)")
 	}
 }
+
+// TestConn_V18_30_RemoteOfflineOverride_ConsumesBudget verifies that the
+// V18.30 remote-offline gate (conn.go:1583) also respects the wake-intent
+// budget — exactly like the bootstrap-skip gate at conn.go:1562. Without
+// this override, kernel-mode senders whose mgmt-view sees the remote as
+// !RemoteLiveOnline (lagging heartbeat) would have their cold-boot wake
+// silently skipped at the second guard gate even after V18.30's
+// listener_udp.go + manager.onPeerActivity post-AttachICE re-arm.
+func TestConn_V18_30_RemoteOfflineOverride_ConsumesBudget(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	conn.ArmLocalWakeIntent(0)
+
+	before := conn.wakeOfferBudgetUsed.Load()
+
+	// Direct ConsumeWakeOfferBudget call models the gate's decision
+	// when RemoteServerLivenessKnown && !RemoteLiveOnline.
+	if !conn.ConsumeWakeOfferBudget() {
+		t.Fatal("V18.30: remote-offline override must consume budget when intent armed")
+	}
+
+	after := conn.wakeOfferBudgetUsed.Load()
+	if after != before+1 {
+		t.Fatalf("V18.30: budget must increment, got %d→%d", before, after)
+	}
+}

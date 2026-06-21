@@ -1581,12 +1581,29 @@ func (conn *Conn) onGuardEvent() {
 	if conn.config.Mode == connectionmode.ModeP2PDynamic {
 		if state, err := conn.statusRecorder.GetPeer(conn.config.Key); err == nil {
 			if state.RemoteServerLivenessKnown && !state.RemoteLiveOnline {
-				// REVERT 2026-06-02: 30s-grace-bypass entfernt.
-				// Original Verhalten wiederhergestellt: wenn mgmt-server sagt
-				// remote offline, KEIN Bootstrap-Offer — lazy-mode-konform.
-				conn.Log.Tracef("guard: skip offer (remote peer offline, p2p-dynamic)")
-				conn.logDiagSnapshot("guard-skip-remote-offline")
-				return
+				// V18.30 (2026-06-21): local wake intent override —
+				// when the user has demonstrated send-intent (kernel-WG
+				// outbound payload triggered UDPListener-activity-edge
+				// in listener_udp.go, manager.onPeerActivity re-armed
+				// the wake intent post-AttachICE) we MUST still try to
+				// reach the peer even if the mgmt-server's last
+				// NetworkMap update says it's offline. The mgmt-view
+				// lags real connectivity (heartbeat-based) and a peer
+				// recently online may still be reachable. The V18.19
+				// budget (3 OFFERs per 20 s) caps the spam risk to
+				// "honestly offline" peers.
+				if conn.ConsumeWakeOfferBudget() {
+					conn.Log.Infof("V18.30: remote-offline override — local wake intent active, consuming wake-OFFER budget")
+					conn.logDiagSnapshot("guard-v18_30-remote-offline-override")
+					// fall through to send-offer below
+				} else {
+					// REVERT 2026-06-02: 30s-grace-bypass entfernt.
+					// Original Verhalten wiederhergestellt: wenn mgmt-server sagt
+					// remote offline, KEIN Bootstrap-Offer — lazy-mode-konform.
+					conn.Log.Tracef("guard: skip offer (remote peer offline, p2p-dynamic)")
+					conn.logDiagSnapshot("guard-skip-remote-offline")
+					return
+				}
 			}
 		}
 		// Codex hardening audit: also skip when the guard is firing
