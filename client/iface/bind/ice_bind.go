@@ -197,12 +197,20 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 	// recordOutbound below, which only handles *Endpoint direct-ICE
 	// pairs via ep.(*Endpoint) — relay-path packets bypass V18.13 entirely.
 	//
+	// V18.20 (2026-06-21): also arm on WG handshake-initiation (type=1,
+	// 148 bytes). Cold-boot scenario: never-connected lazy peer has no
+	// session key, so user payload cannot be encrypted as type=4 transport.
+	// wireguard-go sends type=1 handshake-init first; without this branch
+	// the wake-intent never arms and the bootstrap-OFFER guard remains
+	// stuck. Type=2 (response) and type=3 (cookie) are receiver-side and
+	// excluded. Type=4 keepalive is exactly 32 bytes — excluded by n>32.
+	//
 	// Layer separation (Codex amendment C): wakeArmer is an interface;
 	// the bind layer never imports peer. The implementation in peer.Conn
 	// sets atomic state and dispatches a guard event asynchronously.
 	if wakeArmer != nil {
 		for _, buf := range bufs {
-			if isTransportPkg([][]byte{buf}, len(buf)) && len(buf) > 32 {
+			if isWakeIntentPkg(buf) {
 				wakeArmer.ArmLocalWakeIntent(len(buf))
 				break
 			}
@@ -468,6 +476,31 @@ func isTransportPkg(buffers [][]byte, n int) bool {
 
 	// Check if packetType matches known WireGuard message types
 	if packetType == 4 && n > 32 {
+		return true
+	}
+	return false
+}
+
+// isWakeIntentPkg returns true for WG frames that represent real outbound
+// user intent: type=4 transport (>32 B, excludes keepalive) OR type=1
+// handshake-initiation (148 B, cold-boot path when no session key yet).
+//
+// V18.20 (2026-06-21): added type=1 because V18.19 missed the cold-boot
+// dead-lock: never-connected lazy peer means wireguard-go sends type=1
+// BEFORE any type=4 traffic — without type=1 the wake-intent never arms.
+//
+// Excluded: type=2 (handshake-response, receiver-side), type=3 (cookie-reply,
+// defensive), type=4 keepalive (exactly 32 B, not real intent).
+func isWakeIntentPkg(buf []byte) bool {
+	if len(buf) < 4 {
+		return false
+	}
+	packetType := binary.LittleEndian.Uint32(buf[:4])
+	n := len(buf)
+	if packetType == 4 && n > 32 {
+		return true
+	}
+	if packetType == 1 && n >= 148 {
 		return true
 	}
 	return false
