@@ -87,13 +87,14 @@ func deriveFakeIP(wgIface WgInterface, allowedIPs []netip.Prefix) (netip.Addr, e
 
 func (d *BindListener) setupLazyConn() error {
 	d.lazyConn = newLazyConnWithLabel(d.peerCfg.PublicKey)
-	// V18.19 (2026-06-21): nil armer for now — the lazyconn package
-	// cannot import the peer package, so wiring the peer.Conn through
-	// here requires either a callback hook plumbed via lazyconn.PeerConfig
-	// or a setter API on BindListener invoked from conn_mgr.go after
-	// the listener is created. Phase 2 keeps the bind-layer plumbing
-	// in place; Phase 3 will wire the actual armer end-to-end.
-	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, nil)
+	// V18.19 (2026-06-21): Phase 3 wires the wake-intent armer end-to-end.
+	// peerCfg.WakeArmer is populated by conn_mgr.go (AddPeerConn /
+	// AddActivePeers / resetPeersToLazyIdle / ExcludePeer) with the
+	// owning *peer.Conn, which satisfies bind.WakeIntentArmer via
+	// Phase 1's ArmLocalWakeIntent method. May be nil in unit tests
+	// that construct lazyconn.PeerConfig directly without a peer.Conn —
+	// the bind layer treats nil as opt-out.
+	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, d.peerCfg.WakeArmer)
 
 	endpoint := &net.UDPAddr{
 		IP:   d.fakeIP.AsSlice(),
@@ -113,13 +114,11 @@ func (d *BindListener) setupLazyConn() error {
 // call concurrently with ReadPackets — bind.SetEndpoint and
 // wgIface.UpdatePeer are themselves idempotent.
 func (d *BindListener) refreshEndpoint() error {
-	// V18.19 (2026-06-21): nil armer for now — the lazyconn package
-	// cannot import the peer package, so wiring the peer.Conn through
-	// here requires either a callback hook plumbed via lazyconn.PeerConfig
-	// or a setter API on BindListener invoked from conn_mgr.go after
-	// the listener is created. Phase 2 keeps the bind-layer plumbing
-	// in place; Phase 3 will wire the actual armer end-to-end.
-	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, nil)
+	// V18.19 (2026-06-21): Phase 3 — re-install the armer alongside the
+	// fake-IP. Same nil-safety as setupLazyConn applies: a refreshed
+	// listener inherits the WakeArmer that was set at construction time
+	// (PeerConfig.WakeArmer; populated by conn_mgr.go with *peer.Conn).
+	d.bind.SetEndpoint(d.fakeIP, d.lazyConn, d.peerCfg.WakeArmer)
 
 	endpoint := &net.UDPAddr{
 		IP:   d.fakeIP.AsSlice(),

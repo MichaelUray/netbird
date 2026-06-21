@@ -175,3 +175,54 @@ func TestConn_V18_19_LatchResetsBetweenCycles(t *testing.T) {
 		t.Fatal("first arm in cycle 2 must re-set the latch (per-cycle Info contract)")
 	}
 }
+
+// TestConn_V18_19_GuardOverride_ConsumesBudget verifies the Phase 3
+// guard-override decision tree: when shouldSkipBootstrapOffer would
+// otherwise return (remote p2p-dynamic AND never-connected) but the
+// local wake intent is armed, ConsumeWakeOfferBudget atomically claims
+// one slot, allowing the OFFER to be sent.
+//
+// We exercise the decision tree directly (without driving through
+// onGuardEvent) because the full guard call chain requires statusRecorder
+// + handshaker + Signaler stubs that the marker-test harness does not
+// provide. The override's correctness reduces to: shouldSkip=true AND
+// ConsumeWakeOfferBudget=true ⇒ proceed; budget counter increments.
+func TestConn_V18_19_GuardOverride_ConsumesBudget(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	conn.ArmLocalWakeIntent(148)
+
+	before := conn.wakeOfferBudgetUsed.Load()
+
+	// Simulate the guard's override-check decision:
+	if !conn.ConsumeWakeOfferBudget() {
+		t.Fatal("expected Consume to succeed with active intent + fresh budget")
+	}
+
+	after := conn.wakeOfferBudgetUsed.Load()
+	if after != before+1 {
+		t.Fatalf("expected budget to increment by 1, got %d→%d", before, after)
+	}
+
+	if !conn.IsLocalWakeIntentActive() {
+		t.Fatal("intent must remain active after a single Consume (window not expired)")
+	}
+}
+
+// TestConn_V18_19_GuardOverride_FallsThroughWhenNoIntent verifies that
+// without an armed intent, ConsumeWakeOfferBudget returns false (= the
+// guard falls through to its original skip-return behaviour). This is
+// the safety property: the override never sends OFFERs on its own, it
+// only un-gates the existing send path when the local side has demand.
+func TestConn_V18_19_GuardOverride_FallsThroughWhenNoIntent(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	if conn.IsLocalWakeIntentActive() {
+		t.Fatal("setup: intent must be inactive")
+	}
+	if conn.ConsumeWakeOfferBudget() {
+		t.Fatal("ConsumeWakeOfferBudget MUST return false without armed intent")
+	}
+	if c := conn.wakeOfferBudgetUsed.Load(); c != 0 {
+		t.Fatalf("budget must not increment when intent inactive, got %d", c)
+	}
+}

@@ -398,6 +398,10 @@ func (e *ConnMgr) SetExcludeList(ctx context.Context, peerIDs map[string]bool) {
 			AllowedIPs: peerConn.WgConfig().AllowedIps,
 			PeerConnID: peerConn.ConnID(),
 			Log:        peerConn.Log,
+			// V18.19 (2026-06-21): exclude path — *peer.Conn satisfies
+			// bind.WakeIntentArmer; bind-layer Send will fire
+			// ArmLocalWakeIntent on real user payload.
+			WakeArmer: peerConn,
 		}
 		excludedPeers = append(excludedPeers, lazyPeerCfg)
 	}
@@ -463,6 +467,11 @@ func (e *ConnMgr) AddPeerConn(ctx context.Context, peerKey string, conn *peer.Co
 		AllowedIPs: conn.WgConfig().AllowedIps,
 		PeerConnID: conn.ConnID(),
 		Log:        conn.Log,
+		// V18.19 (2026-06-21): AddPeerConn path — wire the *peer.Conn
+		// as the bind.WakeIntentArmer so the bind layer can fire
+		// ArmLocalWakeIntent on real user payload destined for this
+		// peer (size>32 filter applied at bind-layer in Phase 2).
+		WakeArmer: conn,
 	}
 	excluded, err := e.lazyConnMgr.AddPeer(lazyPeerCfg)
 	if err != nil {
@@ -992,6 +1001,10 @@ func (e *ConnMgr) addPeersToLazyConnManager() error {
 			AllowedIPs: peerConn.WgConfig().AllowedIps,
 			PeerConnID: peerConn.ConnID(),
 			Log:        peerConn.Log,
+			// V18.19 (2026-06-21): AddActivePeers path — same wiring
+			// as AddPeerConn so initial-sync peers also benefit from
+			// sender-side local wake intent.
+			WakeArmer: peerConn,
 		}
 		lazyPeerCfgs = append(lazyPeerCfgs, lazyPeerCfg)
 	}
@@ -1040,6 +1053,9 @@ func (e *ConnMgr) resetPeersToLazyIdle(ctx context.Context) error {
 			AllowedIPs: peerConn.WgConfig().AllowedIps,
 			PeerConnID: peerConn.ConnID(),
 			Log:        peerConn.Log,
+			// V18.19 (2026-06-21): resetPeersToLazyIdle path — preserve
+			// the WakeArmer wiring through mode-change full-reopen.
+			WakeArmer: peerConn,
 		}
 		excluded, err := e.lazyConnMgr.AddPeer(lazyPeerCfg)
 		if err != nil {

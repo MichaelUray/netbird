@@ -1546,9 +1546,28 @@ func (conn *Conn) onGuardEvent() {
 	// this), and we still bootstrap when local user traffic triggers
 	// the local lazy manager (manager.onPeerActivity -> AttachICE).
 	if conn.shouldSkipBootstrapOffer() {
-		conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy/p2p-dynamic AND never connected; wait for remote OFFER or local activity)")
-		conn.logDiagSnapshot("guard-skip-bootstrap-offer")
-		return
+		// V18.19 (2026-06-21) override: if local user payload armed
+		// the wake-intent on this Conn (via ICEBind.Send →
+		// ArmLocalWakeIntent in Phase 2) AND we still have budget,
+		// send the OFFER anyway. The intent proves the local side
+		// genuinely wants to talk to this peer — exactly the case
+		// where the bootstrap-skip would otherwise strand us waiting
+		// for a remote OFFER that never comes (both peers idle on
+		// p2p-dynamic).
+		//
+		// ConsumeWakeOfferBudget atomically claims one slot of the 3
+		// OFFERs allowed per 20 s intent window (v18_19WakeBudget /
+		// v18_19WakeIntentWindow). When budget is exhausted, fall
+		// through to the original skip behaviour.
+		if conn.ConsumeWakeOfferBudget() {
+			conn.Log.Infof("V18.19: bootstrap-skip override — local wake intent active, consuming wake-OFFER budget")
+			conn.logDiagSnapshot("guard-v18_19-bootstrap-override")
+			// fall through to send-offer below
+		} else {
+			conn.Log.Tracef("guard: skip offer (remote peer is p2p-lazy/p2p-dynamic AND never connected; wait for remote OFFER or local activity)")
+			conn.logDiagSnapshot("guard-skip-bootstrap-offer")
+			return
+		}
 	}
 
 	// Suppress reconnect-offers under p2p-dynamic when the management
@@ -1595,6 +1614,21 @@ func (conn *Conn) onGuardEvent() {
 			conn.handshaker != nil && conn.handshaker.readICEListener() == nil {
 			if state, err := conn.statusRecorder.GetPeer(conn.config.Key); err == nil {
 				if !state.IceBackoffSuspended && state.IceBackoffFailures == 0 {
+					// V18.19 (2026-06-21) override: same logic as the
+					// bootstrap-skip gate above — if local payload has
+					// armed the wake-intent and budget remains, send the
+					// OFFER to re-engage ICE rather than waiting for the
+					// next real outbound packet. This shortcuts the
+					// "wait for ConnMgr.ActivatePeer → AttachICE" path
+					// when the user has already shown send-intent (the
+					// payload that armed the intent has likely already
+					// hit the wire; we just want ICE back up).
+					if conn.ConsumeWakeOfferBudget() {
+						conn.Log.Infof("V18.19: ice-detached-inactivity override — local wake intent active, consuming wake-OFFER budget")
+						conn.logDiagSnapshot("guard-v18_19-detached-override")
+						// fall through to send-offer below
+						goto sendOffer
+					}
 					conn.Log.Tracef("guard: skip offer (ICE detached for inactivity, p2p-dynamic; will re-attach on real traffic)")
 					conn.logDiagSnapshot("guard-skip-ice-detached-inactivity")
 					return
@@ -1602,6 +1636,7 @@ func (conn *Conn) onGuardEvent() {
 			}
 		}
 	}
+sendOffer:
 	conn.dumpState.SendOffer()
 	if err := conn.handshaker.SendOffer(); err != nil {
 		conn.Log.Errorf("failed to send offer: %v", err)
