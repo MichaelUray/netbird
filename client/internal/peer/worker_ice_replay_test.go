@@ -107,6 +107,11 @@ func TestIsLegacyICECandidateRecv_Versions(t *testing.T) {
 		{"0.52.0", true, "now legacy (raised ceiling)"},
 		{"0.53.0", true, "dolice / lethbridge / lunzamsee — confirmed racing 2026-06-21"},
 		{"0.53.99", true, "covers all 0.53.x patch releases"},
+		// V18.32 Codex follow-up 2026-06-21: pin suffix normalization
+		// + tagged form so future ParseAgentVersion changes don't
+		// silently miss real-world dolice variants.
+		{"0.53.0-dirty", true, "dirty-suffix-strip — still legacy"},
+		{"v0.53.0", true, "tagged form — still legacy"},
 		{"0.54.0", false, "new ceiling exclusive"},
 		{"0.59.13", false, "ared-park/antiesenhofen — assumed modern"},
 		{"0.60.4", false, "MarlCreek/Stocking-BG — assumed modern"},

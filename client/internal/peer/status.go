@@ -109,8 +109,11 @@ type State struct {
 	// reported by the management server via RemotePeerConfig.AgentVersion,
 	// mirrored here through UpdatePeerRemoteMeta. Empty until the first
 	// mgmt-server peer-config sync arrives. UIs combine this with
-	// IsLegacyPeer() to render a [Legacy] tag for peers <0.52 that
-	// pre-date the ICE-init-race fix and other compatibility hardening.
+	// IsLegacyPeer() to render a [Legacy] tag for peers below the
+	// legacyCandidateRecvCeiling (currently <0.54 per V18.32 2026-06-21)
+	// that suffer the ICE-init-race and other compatibility issues.
+	// See client/internal/peer/version_legacy.go for the ceiling and
+	// the empirical evidence trail.
 	//
 	// Monotone: an empty value from a later mgmt-sync never overwrites
 	// a known version (see UpdatePeerRemoteMeta — partial-sync guard).

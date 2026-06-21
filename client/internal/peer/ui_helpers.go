@@ -32,7 +32,8 @@ func IsLegacyPeer(agentVersion string) bool {
 // Priority:
 //  1. No effective mode known yet   -> NONE
 //  2. Modes match                   -> NONE
-//  3. Peer is legacy (<0.52)        -> LEGACY_PEER
+//  3. Peer is legacy (<0.54 per
+//     V18.32; see version_legacy.go)  -> LEGACY_PEER
 //  4. Peer is modern, configured
 //     mode known                    -> SERVER_OVERRIDE
 //  5. Everything else (e.g. agent

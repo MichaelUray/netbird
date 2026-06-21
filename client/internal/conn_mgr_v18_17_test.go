@@ -296,3 +296,51 @@ func TestConnMgr_V18_31_V15_LegacyVersionStrictDrops(t *testing.T) {
 	}
 }
 
+
+// TestConnMgr_V18_31_V15_UnknownVersionStrictDrops — V15 cold-boot path
+// with empty AgentVersion. Symmetric to V14_UnknownVersionStrictDrops,
+// covers the conservative-deny invariant on the cold-boot branch too.
+// Added per Codex follow-up review 2026-06-21 (optional Part-1 symmetry).
+func TestConnMgr_V18_31_V15_UnknownVersionStrictDrops(t *testing.T) {
+	cm, conn := newV18_17TestHarnessWithVersion(t, connectionmode.ModeP2PDynamic, "")
+	conn.SetEverConnectedForTest(false)
+	conn.ClearIntentionallyDetached()
+	ctx := context.Background()
+
+	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
+
+	for i := 1; i <= 5; i++ {
+		cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+		if conn.IsBurstReleasePendingLoad() {
+			t.Fatalf("V18.31: V15 OFFER #%d from unknown-version remote MUST NOT arm release-pending", i)
+		}
+	}
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V18.31: V15 unknown-version OFFERs must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
+	}
+}
+
+// TestConnMgr_V18_31_V14_NumericLazyAwareReleases — positive integration
+// case with a NUMERIC lazy-aware version (not the dev-shortcut path).
+// Pins the >= 0.65.0 boundary at the integration layer so a future
+// refactor that accidentally requires the dev marker is caught.
+// Added per Codex follow-up review 2026-06-21 (optional Part-1 mutation
+// resilience).
+func TestConnMgr_V18_31_V14_NumericLazyAwareReleases(t *testing.T) {
+	cm, conn := newV18_17TestHarnessWithVersion(t, connectionmode.ModeP2PDynamic, "0.65.0")
+	ctx := context.Background()
+
+	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
+
+	// 1st OFFER: V14 blocks (V18.18 threshold=2, count=1 < 2).
+	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V14 numeric: 1st OFFER must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
+	}
+
+	// 2nd OFFER: V14+V18.17 releases (lazy-aware via numeric version).
+	cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount+1 {
+		t.Fatalf("V14+V18.17 numeric: 2nd OFFER MUST reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount+1)
+	}
+}
