@@ -593,7 +593,15 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		// CompareAndSwap(true,false), bypassing the gate for exactly
 		// ONE attach. Without this, V18.17 would still dead-lock
 		// downstream.
-		if msgType == sProto.Body_OFFER && conn.RecordInboundOfferBurst() {
+		// V18.31 (2026-06-21): V14+V18.17 burst-release only honoured for
+		// lazy-aware remote peers (NetBird >= 0.65.0 or dev/CI build).
+		// Pre-lazy peers (0.53.0 / 0.59.13 / 0.60.4 in our fleet) blast
+		// eager bootstrap-OFFER retries on every NetworkMap update —
+		// counting that as "burst" would let them re-establish a tunnel
+		// after our side intentionally detached, defeating lazy-mode.
+		// Lazy-aware peers retain V18.17 recovery (Round-3 dk20↔S21
+		// scenario from 2026-06-20).
+		if msgType == sProto.Body_OFFER && conn.IsRemotePeerLazyAware() && conn.RecordInboundOfferBurst() {
 			conn.SetBurstReleasePending()
 			if !conn.SwapOfferBurstReleaseLogged(true) {
 				conn.Log.Infof("V14+V18.17: OFFER-burst threshold reached (>=%d in 30s) — releasing gate + arming V18.10 bypass",
@@ -635,7 +643,13 @@ func (e *ConnMgr) ActivatePeerForMessage(ctx context.Context, conn *peer.Conn, m
 		// above. Counter is SHARED with V14 — a peer that bounces
 		// between gates within the same window still benefits.
 		// Codex R1: also SetBurstReleasePending for V18.10 bypass.
-		if conn.RecordInboundOfferBurst() {
+		//
+		// V18.31 (2026-06-21): gate the burst-release on lazy-aware
+		// remote-version. Pre-lazy peers (< 0.65.0) blast bootstrap
+		// OFFERs on NetworkMap update — their "burst" is spam, not
+		// recovery. With this check, S21/S26 cold-boot no longer
+		// inherits eager connections from 0.53.0 BG-routers.
+		if conn.IsRemotePeerLazyAware() && conn.RecordInboundOfferBurst() {
 			conn.SetBurstReleasePending()
 			if !conn.SwapOfferBurstReleaseLogged(true) {
 				conn.Log.Infof("V15+V18.17: cold-boot OFFER-burst threshold reached (>=%d in 30s) — releasing gate + arming V18.10 bypass",

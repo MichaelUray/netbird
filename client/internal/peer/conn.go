@@ -10,12 +10,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/go-version"
 	"github.com/pion/ice/v4"
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/iface/wgproxy"
+	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/peer/conntype"
 	"github.com/netbirdio/netbird/client/internal/peer/dispatcher"
@@ -638,6 +640,66 @@ func (conn *Conn) IsLocalWakeIntentActive() bool {
 // Safe to call concurrently.
 func (conn *Conn) EverConnected() bool {
 	return conn.everConnected.Load()
+}
+
+// v18_31LazyAwareCeiling is the NetBird agent-version threshold above
+// which we trust the remote peer to honour lazy-mode semantics on its
+// side (i.e. NOT send eager bootstrap-OFFERs unless local user traffic
+// genuinely demands the connection). Below this ceiling the peer is
+// considered pre-lazy and its OFFERs are treated as spam by the V18.31
+// strict-drop check, regardless of how many arrive within the V18.17
+// burst window.
+//
+// 0.65.0 chosen because that's where upstream NetBird introduced the
+// `shouldSkipBootstrapOffer` honour-mode (clients started gating their
+// own bootstrap-OFFER emission on `p2p-dynamic`). Earlier releases
+// (0.53.0 / 0.59.13 / 0.60.4 BG-routers in our fleet) blast bootstrap
+// OFFERs unconditionally — they cannot benefit from V18.17 recovery
+// because they wouldn't be deliberately retrying in the first place;
+// they're just spamming the bus on every NetworkMap update.
+var v18_31LazyAwareCeiling = mustParseVersion("0.65.0")
+
+func mustParseVersion(s string) *version.Version {
+	v, err := version.NewVersion(s)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// IsRemotePeerLazyAware returns true when the remote peer's reported
+// NetBird agent-version is at or above v18_31LazyAwareCeiling, OR when
+// the remote is a dev/CI build (which shares our source tree and thus
+// honours every gate we honour). Returns false on empty/unknown version
+// (conservative deny — pre-lazy peers and partial-sync states get
+// strict-drop, never burst-release).
+//
+// Used by V18.31 (2026-06-21) in conn_mgr.go to gate both V14+V18.17
+// and V15+V18.17 burst-release paths: pre-lazy senders can no longer
+// drag a V18.x receiver out of lazy-idle by blasting eager bootstrap
+// OFFERs (the observed S21/S26-on-connect "7 P2P + 2 Relay immediately"
+// behaviour in production).
+//
+// Safe to call concurrently. Conservative — when the StatusRecorder
+// hasn't received a mgmt-peer-config sync yet for this peer the method
+// returns false (drop), which delays first-time connects by exactly
+// one signal round-trip — acceptable trade-off vs spurious connections.
+func (conn *Conn) IsRemotePeerLazyAware() bool {
+	state, err := conn.statusRecorder.GetPeer(conn.config.Key)
+	if err != nil {
+		return false
+	}
+	if state.AgentVersion == "" {
+		return false
+	}
+	if lazyconn.IsDevOrCIBuild(state.AgentVersion) {
+		return true
+	}
+	parsed, ok := lazyconn.ParseAgentVersion(state.AgentVersion)
+	if !ok {
+		return false
+	}
+	return parsed.GreaterThanOrEqual(v18_31LazyAwareCeiling)
 }
 
 // IsLazyDetached reports whether this connection is currently in the

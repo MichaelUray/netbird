@@ -316,3 +316,90 @@ func TestConn_V18_30_RemoteOfflineOverride_NoBudgetConsume(t *testing.T) {
 		}
 	}
 }
+
+// V18.31 (2026-06-21) — IsRemotePeerLazyAware tests.
+//
+// Gate-decision predicate for V14+V18.17 and V15+V18.17 burst-release.
+// Returns false for pre-lazy peers (< 0.65.0) so their eager bootstrap
+// OFFER retries don't get promoted to "burst-recovery" by V18.17.
+
+func TestConn_V18_31_IsRemotePeerLazyAware_EmptyVersionDenies(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	// Default state: AgentVersion=""
+	if conn.IsRemotePeerLazyAware() {
+		t.Fatal("V18.31: empty AgentVersion must return false (conservative deny)")
+	}
+}
+
+func TestConn_V18_31_IsRemotePeerLazyAware_LegacyVersionDenies(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	for _, v := range []string{"0.53.0", "0.59.13", "0.60.4", "0.64.99"} {
+		if err := conn.statusRecorder.AddPeer(conn.config.Key, "", ""); err != nil && err.Error() != "peer already exists" {
+			// peer might already be added by prior loop iteration; fall through
+		}
+		if err := conn.statusRecorder.UpdatePeerRemoteMeta(conn.config.Key, RemoteMeta{
+			AgentVersion: v,
+		}); err != nil {
+			t.Fatalf("setup: UpdatePeerRemoteMeta(%q): %v", v, err)
+		}
+		if conn.IsRemotePeerLazyAware() {
+			t.Fatalf("V18.31: version %q must return false (pre-lazy, < 0.65.0)", v)
+		}
+	}
+}
+
+func TestConn_V18_31_IsRemotePeerLazyAware_LazyVersionAllows(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	for _, v := range []string{"0.65.0", "0.65.1", "0.68.0", "0.71.4", "1.0.0"} {
+		if err := conn.statusRecorder.AddPeer(conn.config.Key, "", ""); err != nil && err.Error() != "peer already exists" {
+			// peer might already be added by prior loop iteration; fall through
+		}
+		if err := conn.statusRecorder.UpdatePeerRemoteMeta(conn.config.Key, RemoteMeta{
+			AgentVersion: v,
+		}); err != nil {
+			t.Fatalf("setup: UpdatePeerRemoteMeta(%q): %v", v, err)
+		}
+		if !conn.IsRemotePeerLazyAware() {
+			t.Fatalf("V18.31: version %q must return true (lazy-aware, >= 0.65.0)", v)
+		}
+	}
+}
+
+func TestConn_V18_31_IsRemotePeerLazyAware_DevBuildAllows(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	for _, v := range []string{
+		"0.0.0-dev-deadbeef",
+		"0.68.0-dev-v18.30-fixup3-7b7d8a587",
+		"0.68.0-ci-1234567",
+		"development",
+	} {
+		if err := conn.statusRecorder.AddPeer(conn.config.Key, "", ""); err != nil && err.Error() != "peer already exists" {
+			// peer might already be added by prior loop iteration; fall through
+		}
+		if err := conn.statusRecorder.UpdatePeerRemoteMeta(conn.config.Key, RemoteMeta{
+			AgentVersion: v,
+		}); err != nil {
+			t.Fatalf("setup: UpdatePeerRemoteMeta(%q): %v", v, err)
+		}
+		if !conn.IsRemotePeerLazyAware() {
+			t.Fatalf("V18.31: dev/CI build %q must return true (shares source-tree, honours all gates)", v)
+		}
+	}
+}
+
+func TestConn_V18_31_IsRemotePeerLazyAware_UnparseableDenies(t *testing.T) {
+	conn := newMarkerTestConn(t)
+	for _, v := range []string{"abc123", "0", "not-a-version"} {
+		if err := conn.statusRecorder.AddPeer(conn.config.Key, "", ""); err != nil && err.Error() != "peer already exists" {
+			// peer might already be added by prior loop iteration; fall through
+		}
+		if err := conn.statusRecorder.UpdatePeerRemoteMeta(conn.config.Key, RemoteMeta{
+			AgentVersion: v,
+		}); err != nil {
+			t.Fatalf("setup: UpdatePeerRemoteMeta(%q): %v", v, err)
+		}
+		if conn.IsRemotePeerLazyAware() {
+			t.Fatalf("V18.31: unparseable %q must return false", v)
+		}
+	}
+}
