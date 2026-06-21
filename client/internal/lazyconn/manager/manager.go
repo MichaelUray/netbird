@@ -834,6 +834,24 @@ func (m *Manager) onPeerActivity(peerConnID peerid.ConnID) {
 		// real user packet would already find the guard in hourly
 		// mode -- defeating p2p-dynamic's "fast P2P recovery" promise.
 		conn.NotifyGuardActivity()
+
+		// V18.30 (2026-06-21): re-arm sender-side local wake intent
+		// AFTER AttachICEFrom because it invokes ClearIntentionallyDetached
+		// (conn.go:2479) which wipes localWakeIntentUntil (conn.go:439).
+		// The activity-edge arm in listener_udp.go fires BEFORE this
+		// AttachICEFrom call and would otherwise be erased before the
+		// bootstrap-OFFER guard's first tick. With this re-arm, the
+		// guard's shouldSkipBootstrapOffer override (conn.go:1562) sees
+		// the active intent and lets OFFER #2..N through, breaking the
+		// V18.18 receiver-side burst-gate symmetry that would otherwise
+		// dead-lock kernel-mode-sender cold-boot scenarios.
+		//
+		// Userspace clients (V18.19 via ICEBind.Send) re-arm on every
+		// subsequent user-payload Send, so they self-heal without this
+		// post-AttachICE call. Kernel-mode clients only get one activity
+		// edge per cold-boot — without re-arm, V18.30's listener_udp
+		// arm is silently erased.
+		conn.ArmLocalWakeIntent(0)
 	}
 }
 

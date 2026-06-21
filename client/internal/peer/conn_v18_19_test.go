@@ -226,3 +226,50 @@ func TestConn_V18_19_GuardOverride_FallsThroughWhenNoIntent(t *testing.T) {
 		t.Fatalf("budget must not increment when intent inactive, got %d", c)
 	}
 }
+
+// TestConn_V18_30_ReArmAfterClear_RestoresGuardOverride is the regression
+// guard for the V18.30 kernel-mode-sender path: in the lazy-mgr's
+// onPeerActivity (manager.go:onPeerActivity), AttachICEFrom invokes
+// ClearIntentionallyDetached (conn.go:2479) which wipes
+// localWakeIntentUntil to 0. The first arm (in listener_udp.go) happens
+// BEFORE this clear and is therefore erased. V18.30's fix re-arms AFTER
+// AttachICEFrom. This test asserts that re-arming on an expired/cleared
+// state restores ConsumeWakeOfferBudget == true with a fresh budget.
+func TestConn_V18_30_ReArmAfterClear_RestoresGuardOverride(t *testing.T) {
+	conn := newMarkerTestConn(t)
+
+	// Phase 1: first arm (listener_udp.go).
+	conn.ArmLocalWakeIntent(1)
+	if !conn.IsLocalWakeIntentActive() {
+		t.Fatal("setup: first arm must activate intent")
+	}
+
+	// Phase 2: AttachICEFrom → ClearIntentionallyDetached → wipes intent.
+	conn.ClearIntentionallyDetached()
+	if conn.IsLocalWakeIntentActive() {
+		t.Fatal("ClearIntentionallyDetached must wipe wake intent (precondition)")
+	}
+	if conn.ConsumeWakeOfferBudget() {
+		t.Fatal("ConsumeWakeOfferBudget must return false after Clear (precondition for V18.30 fix)")
+	}
+
+	// Phase 3: V18.30 re-arm in manager.onPeerActivity post-AttachICE.
+	conn.ArmLocalWakeIntent(0)
+
+	if !conn.IsLocalWakeIntentActive() {
+		t.Fatal("V18.30: re-arm after Clear must re-activate intent")
+	}
+	if c := conn.wakeOfferBudgetUsed.Load(); c != 0 {
+		t.Fatalf("V18.30: re-arm must reset budget to 0, got %d", c)
+	}
+
+	// Guard-bypass loop: budget allows v18_19WakeBudget OFFERs.
+	for i := int32(1); i <= v18_19WakeBudget; i++ {
+		if !conn.ConsumeWakeOfferBudget() {
+			t.Fatalf("V18.30: Consume #%d after re-arm must succeed (budget=%d)", i, v18_19WakeBudget)
+		}
+	}
+	if conn.ConsumeWakeOfferBudget() {
+		t.Fatal("V18.30: Consume past budget must return false (cap enforced)")
+	}
+}
