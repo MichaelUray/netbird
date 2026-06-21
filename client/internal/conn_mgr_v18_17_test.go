@@ -46,6 +46,21 @@ func newV18_17TestConn(t *testing.T, peerKey string) *peer.Conn {
 	if err := recorder.AddPeer(peerKey, "", ""); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
+	// V18.31 (2026-06-21) prerequisite for the V14+V18.17 / V15+V18.17
+	// burst-release tests: the gate now requires the remote peer to be
+	// lazy-aware (>= 0.65.0 or dev/CI build). Without an AgentVersion on
+	// the StatusRecorder the gate treats the peer as pre-lazy and
+	// strict-drops every OFFER — the exact behaviour V18.31 introduced,
+	// but it makes the V18.17 positive-path tests assert against a peer
+	// that V18.31 *correctly* refuses to release for. Set a lazy-aware
+	// agent version here so the V18.17 invariant is exercised. The
+	// negative case (pre-lazy version → strict-drop) has its own
+	// dedicated tests in conn_v18_19_test.go and conn_mgr_v18_31_test.go.
+	if err := recorder.UpdatePeerRemoteMeta(peerKey, peer.RemoteMeta{
+		AgentVersion: "0.68.0-dev-v18-test",
+	}); err != nil {
+		t.Fatalf("UpdatePeerRemoteMeta: %v", err)
+	}
 	return conn
 }
 
@@ -167,3 +182,117 @@ func TestConnMgr_V18_17_OneShotConsume(t *testing.T) {
 		t.Fatal("second Consume must return false — flag is one-shot")
 	}
 }
+
+// V18.31 negative integration tests (Codex review 2026-06-21) — verify
+// that the burst-release path is *strict-drop* for pre-lazy and unknown
+// remote versions even after 2+ OFFERs land within the burst window.
+// The lazy-aware case is covered by the existing positive tests above.
+
+func newV18_17TestHarnessWithVersion(t *testing.T, mode connectionmode.Mode, agentVersion string) (*ConnMgr, *peer.Conn) {
+	t.Helper()
+
+	cm := newConnMgrWithLazyMgr(t)
+	cm.mode = mode
+
+	recorder := peer.NewRecorder("https://mgm")
+	swWatcher := guard.NewSRWatcher(nil, nil, nil, ice.Config{})
+
+	cfg := peer.ConnConfig{
+		Key:      peerKeyAlphaV18_17,
+		LocalKey: "RRHf3Ma6z6mdLbriAJbqhX7+nM/B71lgw2+91q3LfhU=",
+		WgConfig: peer.WgConfig{
+			RemoteKey:  peerKeyAlphaV18_17,
+			AllowedIps: []netip.Prefix{netip.MustParsePrefix("100.64.0.5/32")},
+		},
+		Mode: connectionmode.ModeP2PDynamic,
+	}
+	sd := peer.ServiceDependencies{
+		StatusRecorder:     recorder,
+		SrWatcher:          swWatcher,
+		PeerConnDispatcher: dispatcher.NewConnectionDispatcher(),
+	}
+	conn, err := peer.NewConn(cfg, sd)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	if err := recorder.AddPeer(peerKeyAlphaV18_17, "", ""); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	// Set the AgentVersion the caller wants (e.g. "0.53.0" or "" for unknown).
+	if agentVersion != "" {
+		if err := recorder.UpdatePeerRemoteMeta(peerKeyAlphaV18_17, peer.RemoteMeta{
+			AgentVersion: agentVersion,
+		}); err != nil {
+			t.Fatalf("UpdatePeerRemoteMeta(%q): %v", agentVersion, err)
+		}
+	}
+	// Replicate the V14 precondition wiring used by newV18_17TestHarness.
+	conn.MarkIntentionallyDetached()
+	conn.SetEverConnectedForTest(true)
+	if added := cm.peerStore.AddPeerConn(peerKeyAlphaV18_17, conn); !added {
+		t.Fatalf("peer already exists in store unexpectedly")
+	}
+	return cm, conn
+}
+
+// TestConnMgr_V18_31_V14_LegacyVersionStrictDrops asserts that the
+// V14+V18.17 path does NOT release for a pre-lazy remote (0.53.0 — our
+// fleet's BG-routers). Even after 2 OFFERs in the burst window, the gate
+// stays closed: no ActivatePeer, no burst-release flag.
+func TestConnMgr_V18_31_V14_LegacyVersionStrictDrops(t *testing.T) {
+	cm, conn := newV18_17TestHarnessWithVersion(t, connectionmode.ModeP2PDynamic, "0.53.0")
+	ctx := context.Background()
+
+	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
+
+	for i := 1; i <= 5; i++ {
+		cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+		if conn.IsBurstReleasePendingLoad() {
+			t.Fatalf("V18.31: OFFER #%d from pre-lazy (0.53.0) MUST NOT arm release-pending", i)
+		}
+	}
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V18.31: pre-lazy OFFERs must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
+	}
+}
+
+// TestConnMgr_V18_31_V14_UnknownVersionStrictDrops — same invariant for
+// the empty/unknown AgentVersion case (conservative-deny by V18.31).
+func TestConnMgr_V18_31_V14_UnknownVersionStrictDrops(t *testing.T) {
+	cm, conn := newV18_17TestHarnessWithVersion(t, connectionmode.ModeP2PDynamic, "")
+	ctx := context.Background()
+
+	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
+
+	for i := 1; i <= 5; i++ {
+		cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+		if conn.IsBurstReleasePendingLoad() {
+			t.Fatalf("V18.31: OFFER #%d from unknown-version remote MUST NOT arm release-pending", i)
+		}
+	}
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V18.31: unknown-version OFFERs must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
+	}
+}
+
+// TestConnMgr_V18_31_V15_LegacyVersionStrictDrops — V15 cold-boot path
+// (everConnected=false) must also strict-drop pre-lazy spam.
+func TestConnMgr_V18_31_V15_LegacyVersionStrictDrops(t *testing.T) {
+	cm, conn := newV18_17TestHarnessWithVersion(t, connectionmode.ModeP2PDynamic, "0.60.4")
+	conn.SetEverConnectedForTest(false)
+	conn.ClearIntentionallyDetached()
+	ctx := context.Background()
+
+	preCount := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17)
+
+	for i := 1; i <= 5; i++ {
+		cm.ActivatePeerForMessage(ctx, conn, sProto.Body_OFFER)
+		if conn.IsBurstReleasePendingLoad() {
+			t.Fatalf("V18.31: V15 OFFER #%d from pre-lazy (0.60.4) MUST NOT arm release-pending", i)
+		}
+	}
+	if got := cm.lazyConnMgr.ActivationCountForKey(peerKeyAlphaV18_17); got != preCount {
+		t.Fatalf("V18.31: V15 pre-lazy OFFERs must NOT reach lazyConnMgr.ActivatePeer (count %d, want %d)", got, preCount)
+	}
+}
+
