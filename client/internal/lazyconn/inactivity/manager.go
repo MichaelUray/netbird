@@ -3,6 +3,7 @@ package inactivity
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,18 @@ type Manager struct {
 	// inert (peers register but no channel ever fires).
 	iceTimeout   time.Duration
 	relayTimeout time.Duration
+
+	// mu guards interestedPeers and firstSeenAt. Writers (AddPeer,
+	// RemovePeer) take a write lock; checkStats takes a read lock
+	// long enough to snapshot the two maps into local copies, then
+	// iterates the snapshots without holding the lock. The
+	// snapshot pattern keeps the critical section short and avoids
+	// holding mu across iface.LastActivities() / log.Infof calls.
+	// Map values (*lazyconn.PeerConfig) are stable across the
+	// snapshot lifetime because AddPeer never overwrites an
+	// existing key and RemovePeer just unmaps without freeing the
+	// struct.
+	mu sync.RWMutex
 
 	interestedPeers map[string]*lazyconn.PeerConfig
 
@@ -184,6 +197,9 @@ func (m *Manager) AddPeer(peerCfg *lazyconn.PeerConfig) {
 		return
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if _, exists := m.interestedPeers[peerCfg.PublicKey]; exists {
 		return
 	}
@@ -197,6 +213,9 @@ func (m *Manager) RemovePeer(peer string) {
 	if m == nil {
 		return
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	pi, ok := m.interestedPeers[peer]
 	if !ok {
@@ -282,8 +301,25 @@ func (m *Manager) checkStats() (iceIdle, relayIdle map[string]struct{}, err erro
 	iceIdle = make(map[string]struct{})
 	relayIdle = make(map[string]struct{})
 
+	// Snapshot the two state maps under RLock so writers
+	// (AddPeer/RemovePeer) cannot mutate them mid-iteration. We
+	// release the lock before any logging / channel work so this
+	// hot path stays bounded — the snapshot is a shallow copy
+	// (map values are *lazyconn.PeerConfig pointers, stable for
+	// the snapshot's lifetime).
+	m.mu.RLock()
+	interestedSnap := make(map[string]*lazyconn.PeerConfig, len(m.interestedPeers))
+	for k, v := range m.interestedPeers {
+		interestedSnap[k] = v
+	}
+	firstSeenSnap := make(map[string]monotime.Time, len(m.firstSeenAt))
+	for k, v := range m.firstSeenAt {
+		firstSeenSnap[k] = v
+	}
+	m.mu.RUnlock()
+
 	checkTime := time.Now()
-	for peerID, peerCfg := range m.interestedPeers {
+	for peerID, peerCfg := range interestedSnap {
 		lastActive, ok := lastActivities[peerID]
 		if !ok {
 			// No ActivityRecorder entry yet — no WG endpoint was
@@ -296,7 +332,7 @@ func (m *Manager) checkStats() (iceIdle, relayIdle map[string]struct{}, err erro
 			// applies uniformly:
 			//   Phase-1 (iceTimeout=0): fires relayIdle after relayTimeout.
 			//   Phase-2 (iceTimeout>0): fires iceIdle, then relayIdle.
-			seen, seenOK := m.firstSeenAt[peerID]
+			seen, seenOK := firstSeenSnap[peerID]
 			if !seenOK {
 				// Defensive: matches the existing no-sync
 				// convention shared with interestedPeers. Skip
