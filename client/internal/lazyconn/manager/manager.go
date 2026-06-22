@@ -703,6 +703,16 @@ func (m *Manager) removePeer(peerID string) {
 	m.activityManager.RemovePeer(cfg.Log, cfg.PeerConnID)
 	delete(m.managedPeers, peerID)
 	delete(m.managedPeersByConnID, cfg.PeerConnID)
+
+	// H3: drop the peer's per-peer route-prefix entry. UpdateRouteHAMap
+	// would rebuild this wholesale on its next call, but absent a fresh
+	// route update the entry leaks until then. Lock-ordering: callers
+	// (RemovePeer / loop in ExcludePeer) already hold managedPeersMu;
+	// routesMu is taken as the inner lock here, matching the
+	// AddPeer -> shouldActivateNewPeer path elsewhere in this file.
+	m.routesMu.Lock()
+	delete(m.peerToRoutePrefixes, cfg.PublicKey)
+	m.routesMu.Unlock()
 }
 
 func (m *Manager) close() {
@@ -718,6 +728,9 @@ func (m *Manager) close() {
 	m.routesMu.Lock()
 	m.peerToHAGroups = make(map[string][]route.HAUniqueID)
 	m.haGroupToPeers = make(map[route.HAUniqueID][]string)
+	// H3: reset peerToRoutePrefixes so a re-used Manager doesn't carry
+	// stale entries past close().
+	m.peerToRoutePrefixes = make(map[string][]netip.Prefix)
 	m.routesMu.Unlock()
 
 	log.Infof("lazy connection manager closed")
