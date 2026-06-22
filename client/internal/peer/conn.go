@@ -684,6 +684,43 @@ func mustParseVersion(s string) *version.Version {
 // hasn't received a mgmt-peer-config sync yet for this peer the method
 // returns false (drop), which delays first-time connects by exactly
 // one signal round-trip — acceptable trade-off vs spurious connections.
+//
+// THREAT-MODEL CAVEAT (H2, 2026-06-22 — Codex review):
+//
+// The dev/CI shortcut at line 695 (lazyconn.IsDevOrCIBuild) trusts the
+// REMOTE-supplied AgentVersion string, which is propagated through the
+// management server's RemotePeerConfig without cryptographic binding to
+// the peer's WireGuard identity. A malicious peer (or a compromised
+// mgmt-server feed) could therefore advertise "dev-deadbeef" / "ci-x" /
+// "0.0.0-dev-x" / "9.9.9-dev-x" and bypass v18_31LazyAwareCeiling, even
+// at AgentVersion values well below 0.65.0.
+//
+// Codex 2026-06-22 v2 review classified this as a SOFT-GATE concern
+// (burst-release / lazy-aware framing) rather than an AuthZ blocker for
+// the controlled MichaelUray fleet — the gate decides anti-spam
+// burst behaviour, not access control. We accept the risk for the
+// internal fleet because:
+//
+//  1. All peers in our fleet are under the same admin (MichaelUray);
+//     adversarial AgentVersion strings would have to come from a
+//     compromised mgmt-server, which has many higher-value attack
+//     surfaces than this soft-gate.
+//  2. The worst outcome of a forged dev/CI tag is burst-release of a
+//     bootstrap OFFER that the receiver would have strict-dropped — a
+//     short-lived eager re-attach cycle, not unauthorised access.
+//
+// For an UPSTREAM PR this shortcut MUST be replaced with an explicit
+// capability-bit on the signal-protocol wire (e.g. a `LazyAware bool`
+// in the OFFER envelope) so the receiver does not depend on the
+// remote-supplied version string at all. That refactor is tracked as
+// future-work and is intentionally OUT OF SCOPE for the V18.x sprint.
+//
+// The current behaviour (both happy-path AND known adversarial bypasses)
+// is locked by TestConn_IsRemotePeerLazyAware_DevShortcut in
+// conn_h2_dev_shortcut_test.go. The pairing is INTENTIONAL: a future
+// capability-bit refactor MUST remove the dev/CI shortcut here AND the
+// adversarial cases in that test in a SINGLE change, so the threat-model
+// migration is reflected in test history.
 func (conn *Conn) IsRemotePeerLazyAware() bool {
 	state, err := conn.statusRecorder.GetPeer(conn.config.Key)
 	if err != nil {
