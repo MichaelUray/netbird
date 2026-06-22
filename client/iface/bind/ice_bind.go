@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"sync"
 
@@ -152,13 +153,41 @@ func (s *ICEBind) GetICEMux() (*udpmux.UniversalUDPMuxDefault, error) {
 	return s.udpMux, nil
 }
 
+// isNilArmer reports whether a WakeIntentArmer interface value is
+// either an untyped nil or a typed-nil whose dynamic value is the nil
+// value of a nil-able kind. Without this kind-aware check, a typed-nil
+// (e.g. `var c *peer.Conn` wrapped in WakeIntentArmer) passes a plain
+// armer != nil test, lands in endpointsWakeArmer, and panics in the
+// Send path when ArmLocalWakeIntent is called on a nil receiver that
+// reads atomic fields.
+//
+// H5 (2026-06-22, Codex review).
+func isNilArmer(armer WakeIntentArmer) bool {
+	if armer == nil {
+		return true
+	}
+	v := reflect.ValueOf(armer)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface,
+		reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	}
+	return false
+}
+
 // SetEndpoint registers a relay-path fake-IP endpoint mapping.
 // armer is V18.19 (2026-06-21): pass non-nil to opt this peer into
 // sender-side local wake intent. Pass nil to retain pre-V18.19 behavior.
+//
+// H5 (2026-06-22): use isNilArmer to also reject typed-nil interface
+// values. A bare `armer != nil` check passes a `var c *peer.Conn`
+// wrapped in the interface; the Send path would later panic on the
+// nil receiver. The kind-aware helper covers all nil-able reflect
+// kinds (Chan, Func, Interface, Map, Ptr, Slice).
 func (b *ICEBind) SetEndpoint(fakeIP netip.Addr, conn net.Conn, armer WakeIntentArmer) {
 	b.endpointsMu.Lock()
 	b.endpoints[fakeIP] = conn
-	if armer != nil {
+	if !isNilArmer(armer) {
 		b.endpointsWakeArmer[fakeIP] = armer
 	}
 	b.endpointsMu.Unlock()
