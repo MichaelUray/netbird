@@ -63,6 +63,21 @@ const (
 	// instead of 2-3 minutes.
 	networkChangeGracePeriod = 60 * time.Second
 	networkChangeRetryDelay  = 2 * time.Second
+
+	// V18.34 (2026-06-23): how long without a fresh failure before the
+	// failure history is considered stale and reset on the next
+	// failure. 15 min is comfortably longer than typical NAT-rebinding
+	// intervals (~5 min) but short enough that a user who comes back
+	// to their phone after a coffee break sees fresh-start ICE
+	// behaviour instead of inheriting a multi-minute exponential delay
+	// from yesterday's failure history.
+	//
+	// Why "time since last failure" and not "time since last success":
+	// the relevant signal is staleness of the failure data. A peer
+	// that has been failing for 2 h then stops failing for 15 min has
+	// likely had its NAT mapping recycled or the remote side restored.
+	// A peer last connected 1 h ago but failed 5 min ago is not stale.
+	idleResetThreshold = 15 * time.Minute
 )
 
 // iceBackoffState tracks per-peer ICE-failure backoff in p2p-dynamic
@@ -81,6 +96,13 @@ type iceBackoffState struct {
 	// feed the long-term exponential `bo` state. Reset by markSuccess
 	// and Reset, like `failures`.
 	postSuccessFailures int
+
+	// V18.34 (2026-06-23): timestamp of the most recent
+	// markFailure* call. Zero value = no failure since the last
+	// markSuccess/Reset. Used by maybeIdleReset to determine whether
+	// the existing failure history is stale enough to discard. Read +
+	// written only under s.mu.
+	lastFailureAt time.Time
 }
 
 // BackoffSnapshot is a read-only view used by the status output.
@@ -106,6 +128,35 @@ func buildBackoff(maxBackoff time.Duration) *backoff.ExponentialBackOff {
 	bo.MaxElapsedTime = 0
 	bo.Reset()
 	return bo
+}
+
+// maybeIdleReset clears the failure history if no failure has been
+// registered for idleResetThreshold. Caller must hold s.mu. The `now`
+// parameter is passed in so caller and helper share a single time
+// reading per transition — avoids subtle skew between this decision
+// and the subsequent lastFailureAt stamp / nextRetry computation.
+//
+// V18.34 (2026-06-23). Semantically equivalent to a network-change
+// event: lastResetAt is bumped so the next markFailure path picks
+// the networkChangeRetryDelay grace branch rather than the long
+// exponential — that's the "fresh context" assumption (after a long
+// idle, NAT mappings have likely been recycled, give the peer a
+// short-delay retry chance before falling back to exponential).
+func (s *iceBackoffState) maybeIdleReset(now time.Time) {
+	if s.lastFailureAt.IsZero() {
+		return // no failure history to reset
+	}
+	if now.Sub(s.lastFailureAt) < idleResetThreshold {
+		return // recent failure — keep history intact
+	}
+	s.failures = 0
+	s.postSuccessFailures = 0
+	s.bo.Reset()
+	s.lastResetAt = now
+	// s.suspended stays as-is. If it was true with nextRetry in the
+	// past, IsSuspended() already returns false. The new failure
+	// about to be registered will set it true again with a fresh
+	// short delay.
 }
 
 func (s *iceBackoffState) IsSuspended() bool {
@@ -163,18 +214,23 @@ func (s *iceBackoffState) markFailurePostSuccessDrop() time.Duration {
 	if s.maxBackoff == 0 {
 		return 0
 	}
+	// V18.34: drop stale failure history before recording the new failure.
+	now := time.Now()
+	s.maybeIdleReset(now)
+
 	s.failures++
 	s.postSuccessFailures++
+	s.lastFailureAt = now
 
 	// Network-change grace still wins (same logic as markFailure).
 	var delay time.Duration
-	if !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod {
+	if !s.lastResetAt.IsZero() && now.Sub(s.lastResetAt) < networkChangeGracePeriod {
 		delay = networkChangeRetryDelay
 	} else {
 		delay = postSuccessDropDelayFor(s.postSuccessFailures)
 	}
 
-	s.nextRetry = time.Now().Add(delay)
+	s.nextRetry = now.Add(delay)
 	s.suspended = true
 	return delay
 }
@@ -206,16 +262,21 @@ func (s *iceBackoffState) markFailureWithSeverity(postSuccessDrop bool) time.Dur
 	if s.maxBackoff == 0 {
 		return 0
 	}
+	// V18.34: drop stale failure history before recording the new failure.
+	now := time.Now()
+	s.maybeIdleReset(now)
+
 	s.failures++
+	s.lastFailureAt = now
 
 	var delay time.Duration
-	if !s.lastResetAt.IsZero() && time.Since(s.lastResetAt) < networkChangeGracePeriod {
+	if !s.lastResetAt.IsZero() && now.Sub(s.lastResetAt) < networkChangeGracePeriod {
 		delay = networkChangeRetryDelay
 	} else {
 		delay = s.bo.NextBackOff()
 	}
 
-	s.nextRetry = time.Now().Add(delay)
+	s.nextRetry = now.Add(delay)
 	s.suspended = true
 	return delay
 }
@@ -249,6 +310,8 @@ func (s *iceBackoffState) markSuccess() {
 	s.suspended = false
 	s.bo.Reset()
 	s.lastResetAt = time.Now()
+	// V18.34: zero failure-history clock so next failure cycle starts fresh.
+	s.lastFailureAt = time.Time{}
 }
 
 // Reset is the hard reset triggered by interface-change or mode-push.
@@ -263,6 +326,8 @@ func (s *iceBackoffState) Reset() {
 	s.suspended = false
 	s.bo.Reset()
 	s.lastResetAt = time.Now()
+	// V18.34: zero failure-history clock so next failure cycle starts fresh.
+	s.lastFailureAt = time.Time{}
 }
 
 // activityOverrideMinInterval bounds how often relay-state activity
